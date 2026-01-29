@@ -1,0 +1,114 @@
+Velr Beta Test License v1.0
+
+Copyright (c) 2025 velr.ai and Cartesian Coordinates AB.
+All rights reserved.
+
+IMPORTANT: THIS IS A TEMPORARY, FREE BETA TEST LICENSE. IT IS PROVIDED
+SOLELY TO ALLOW EVALUATION AND BETA TESTING.
+
+1. Definitions
+
+"Software" means the Velr database, related libraries, tools, and any
+accompanying files made available by velr.ai and 
+Cartesian Coordinates AB ("Licensor") under this License.
+
+"Beta Test Period" means the period starting when you first download,
+access, or otherwise obtain the Software and ending on the earliest of:
+  (a) twelve (12) months after that date;
+  (b) the date Licensor publicly announces the end of the beta program
+      for the Software; or
+  (c) the date you enter into a separate written license agreement for
+      the Software with Licensor.
+
+"Evaluation Use" means internal evaluation, testing, experimentation,
+and non-commercial research, including providing feedback to Licensor
+about the Software.
+
+"Commercial Purpose" means any use of the Software:
+  (a) in or for the operation of a business, service, or product that
+      generates revenue or other commercial advantage;
+  (b) in production or customer-facing systems or workloads;
+  (c) to provide services to third parties for a fee or other
+      consideration; or
+  (d) as part of any offering, product, or service that is distributed
+      or made available to third parties (whether or not for a fee).
+
+2. Grant of License (Beta / Evaluation Only)
+
+Subject to the terms of this License, Licensor grants you ("Licensee")
+a limited, non-exclusive, non-transferable, revocable license to:
+
+  (a) download, install, and use the Software; and
+  (b) modify the Software for your own internal purposes,
+
+solely for Evaluation Use during the Beta Test Period.
+
+This License is provided free of charge solely to facilitate beta
+testing and evaluation. Licensor reserves the right to offer future
+versions of the Software under different commercial or open source
+terms.
+
+3. Non-Commercial and Non-Production Use Only
+
+You may not use the Software, or any derivative works of the Software,
+for any Commercial Purpose or in any production environment.
+
+If you wish to use the Software for any Commercial Purpose, or after
+the Beta Test Period has ended, you must obtain a separate commercial
+license or other written agreement from Licensor.
+
+4. Redistribution
+
+You may not distribute, sublicense, sell, lease, or otherwise make the
+Software or any derivative works available to third parties, except as
+explicitly permitted in a separate written agreement with Licensor.
+
+5. Feedback
+
+You may provide feedback, suggestions, or ideas about the Software
+("Feedback"). You grant Licensor a perpetual, irrevocable, worldwide,
+royalty-free license to use, disclose, modify, and incorporate Feedback
+into Licensor's products and services without restriction and without
+any obligation or attribution to you.
+
+6. Ownership
+
+This License does not transfer any ownership rights. The Software is
+licensed, not sold. All rights not expressly granted in this License
+are reserved by Licensor.
+
+7. No Warranty (Pre-Release Software)
+
+THE SOFTWARE IS PRE-RELEASE, EXPERIMENTAL, AND PROVIDED "AS IS" AND
+"AS AVAILABLE", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AND TITLE.
+
+8. Limitation of Liability
+
+IN NO EVENT SHALL LICENSOR OR ITS CONTRIBUTORS BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE, EVEN IF ADVISED
+OF THE POSSIBILITY OF SUCH DAMAGES.
+
+9. Term and Termination
+
+This License is effective on the date you first obtain the Software and
+automatically expires at the end of the Beta Test Period, unless
+replaced or superseded by a separate written agreement with Licensor.
+
+Licensor may also terminate this License at any time, with or without
+cause, by providing notice (including via public announcement) or by
+disabling access to the Software.
+
+Upon termination or expiration of this License, you must stop using the
+Software and destroy any copies you control. Provisions relating to
+ownership, Feedback, disclaimers, and limitations of liability shall
+survive termination or expiration.
+
+10. Governing Law
+
+This License shall be governed by and construed in accordance with the
+laws of the jurisdiction where Licensor is established, without regard
+to conflict of laws principles.
