@@ -1,11 +1,16 @@
 [package]
 name = "velr"
-version = "0.1.0"
+version = "0.1.39"
 edition = "2021"
 
-# No build script / native linking needed with libloading
-# links = "velr"
-# build = "build.rs"
+description = "Velr embedded property-graph database (Rust driver, beta)"
+license-file = "LICENSE"
+readme = "README.md"
+homepage = "https://velr.ai"
+repository = "https://github.com/velr-ai/velr-rust-driver"
+documentation = "https://docs.rs/velr"
+keywords = ["database", "embedded", "sqlite", "graph"]
+categories = ["database"]
 
 include = ["src/**", "prebuilt/**", "Cargo.toml", "LICENSE*", "README.md"]
 
