@@ -1,7 +1,11 @@
 #![allow(unsafe_code)]
 
-mod sys; // <-- your generated sys.rs
+mod api;
+mod runtime;
+mod sys;
+
 use std::{
+    cell::Cell,
     ffi::{CStr, CString},
     fmt,
     marker::PhantomData,
@@ -9,7 +13,30 @@ use std::{
     ptr::NonNull,
     rc::Rc,
 };
+
 use sys as ffi;
+
+// -----------------------------------------------------------------------------
+// Threading model
+//
+// 1) Velr (the connection) is Send + !Sync.
+//    - ✅ You may MOVE a connection to another thread.
+//      Example: spawn a worker thread and move the connection into it.
+//    - ❌ You may NOT share a single connection across threads concurrently.
+//      Example: Arc<Velr> won't compile
+//
+// 2) In-flight / borrowing objects are !Send + !Sync:
+//    ExecTables, TableResult, RowIter, VelrTx, ExecTablesTx, VelrSavepoint.
+//    - ❌ You may not move these to another thread.
+//    - ❌ You may not share these across threads.
+//
+// Practical implications:
+// - ✅ Many connections across many threads is fine (open one connection per thread).
+// - ✅ You can move a connection between threads (e.g., create in main, move into worker).
+// - ❌ You cannot run concurrent operations on the SAME connection across threads.
+//
+// If you need parallelism, open multiple connections and/or use a pool.
+// -----------------------------------------------------------------------------
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -40,12 +67,21 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+fn velr_api() -> Result<&'static api::Api> {
+    Ok(&runtime::runtime()?.api)
+}
+
 unsafe fn take_err(p: *mut c_char) -> String {
     if p.is_null() {
         return String::new();
     }
     let s = CStr::from_ptr(p).to_string_lossy().into_owned();
-    ffi::velr_string_free(p);
+
+    // Free via runtime API (best-effort; if runtime isn't available, leak rather than crash).
+    if let Ok(a) = velr_api() {
+        (a.velr_string_free)(p);
+    }
+
     s
 }
 
@@ -54,7 +90,9 @@ fn rc_to_result(rc: ffi::velr_code, err: *mut c_char) -> Result<()> {
     if code == ffi::velr_code::VELR_OK as i32 {
         // usually err is null on OK, but be defensive
         if !err.is_null() {
-            unsafe { ffi::velr_string_free(err) };
+            if let Ok(a) = velr_api() {
+                unsafe { (a.velr_string_free)(err) };
+            }
         }
         Ok(())
     } else {
@@ -84,16 +122,20 @@ impl<'a> CellRef<'a> {
     }
 }
 
-// -------------------------- Velr --------------------------
+// -------------------------- Velr (Connection) --------------------------
+//
+// Velr is Send + !Sync (movable, not shareable).
+//
 
 pub struct Velr {
     db: NonNull<ffi::velr_db>,
-    // make !Send + !Sync like rusqlite::Connection
-    _nosend: PhantomData<Rc<()>>,
+    _not_sync: PhantomData<Cell<()>>, // Send + !Sync
 }
 
 impl Velr {
     pub fn open(path: Option<&str>) -> Result<Self> {
+        let a = velr_api()?; // ensure runtime is loaded
+
         let mut out_db: *mut ffi::velr_db = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
 
@@ -108,21 +150,25 @@ impl Velr {
             }
         };
 
-        let rc = unsafe { ffi::velr_open(path_ptr, &mut out_db, &mut err) };
+        let rc = unsafe { (a.velr_open)(path_ptr, &mut out_db, &mut err) };
         rc_to_result(rc, err)?;
+
         let nn = NonNull::new(out_db).ok_or_else(|| {
             Error::new(
                 ffi::velr_code::VELR_EERR as i32,
                 "velr_open returned null db",
             )
         })?;
+
         Ok(Self {
             db: nn,
-            _nosend: PhantomData,
+            _not_sync: PhantomData,
         })
     }
 
     pub fn exec<'db>(&'db self, cypher: &str) -> Result<ExecTables<'db>> {
+        let a = velr_api()?;
+
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "cypher contains NUL"))?;
 
@@ -130,9 +176,10 @@ impl Velr {
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc = unsafe {
-            ffi::velr_exec_start(self.db.as_ptr(), cy.as_ptr(), &mut out_stream, &mut err)
+            (a.velr_exec_start)(self.db.as_ptr(), cy.as_ptr(), &mut out_stream, &mut err)
         };
         rc_to_result(rc, err)?;
+
         let nn = NonNull::new(out_stream).ok_or_else(|| {
             Error::new(
                 ffi::velr_code::VELR_EERR as i32,
@@ -148,13 +195,16 @@ impl Velr {
     }
 
     pub fn exec_one(&self, cypher: &str) -> Result<TableResult> {
+        let a = velr_api()?;
+
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "cypher contains NUL"))?;
+
         let mut out_table: *mut ffi::velr_table = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc =
-            unsafe { ffi::velr_exec_one(self.db.as_ptr(), cy.as_ptr(), &mut out_table, &mut err) };
+            unsafe { (a.velr_exec_one)(self.db.as_ptr(), cy.as_ptr(), &mut out_table, &mut err) };
         rc_to_result(rc, err)?;
         TableResult::from_raw(out_table)
     }
@@ -168,16 +218,21 @@ impl Velr {
     }
 
     pub fn begin_tx(&self) -> Result<VelrTx<'_>> {
+        let a = velr_api()?;
+
         let mut out_tx: *mut ffi::velr_tx = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe { ffi::velr_tx_begin(self.db.as_ptr(), &mut out_tx, &mut err) };
+
+        let rc = unsafe { (a.velr_tx_begin)(self.db.as_ptr(), &mut out_tx, &mut err) };
         rc_to_result(rc, err)?;
+
         let nn = NonNull::new(out_tx).ok_or_else(|| {
             Error::new(
                 ffi::velr_code::VELR_EERR as i32,
                 "velr_tx_begin returned null tx",
             )
         })?;
+
         Ok(VelrTx {
             tx: Some(nn),
             _db: PhantomData,
@@ -208,20 +263,27 @@ impl Velr {
 
 impl Drop for Velr {
     fn drop(&mut self) {
-        unsafe { ffi::velr_close(self.db.as_ptr()) };
+        if let Ok(a) = velr_api() {
+            unsafe { (a.velr_close)(self.db.as_ptr()) };
+        }
     }
 }
 
 // -------------------------- ExecTables --------------------------
+//
+// In-flight type: !Send + !Sync (thread-affine).
+//
 
 pub struct ExecTables<'db> {
     stream: Option<NonNull<ffi::velr_stream>>,
     _db: PhantomData<&'db Velr>,
-    _nosend: PhantomData<Rc<()>>,
+    _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
 
 impl<'db> ExecTables<'db> {
     pub fn next_table(&mut self) -> Result<Option<TableResult>> {
+        let a = velr_api()?;
+
         let Some(stream) = self.stream else {
             return Ok(None);
         };
@@ -231,13 +293,12 @@ impl<'db> ExecTables<'db> {
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc = unsafe {
-            ffi::velr_stream_next_table(stream.as_ptr(), &mut out_table, &mut has, &mut err)
+            (a.velr_stream_next_table)(stream.as_ptr(), &mut out_table, &mut has, &mut err)
         };
         rc_to_result(rc, err)?;
 
         if has == 0 {
-            // auto-close stream at EOF to match “resource finished” semantics
-            unsafe { ffi::velr_exec_close(stream.as_ptr()) };
+            unsafe { (a.velr_exec_close)(stream.as_ptr()) };
             self.stream = None;
             return Ok(None);
         }
@@ -249,33 +310,41 @@ impl<'db> ExecTables<'db> {
 impl Drop for ExecTables<'_> {
     fn drop(&mut self) {
         if let Some(st) = self.stream.take() {
-            unsafe { ffi::velr_exec_close(st.as_ptr()) };
+            if let Ok(a) = velr_api() {
+                unsafe { (a.velr_exec_close)(st.as_ptr()) };
+            }
         }
     }
 }
 
 // -------------------------- TableResult --------------------------
+//
+// In-flight type: !Send + !Sync (thread-affine).
+//
 
 pub struct TableResult {
     table: NonNull<ffi::velr_table>,
     col_names: Vec<String>,
     col_count: usize,
-    _nosend: PhantomData<Rc<()>>,
+    _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
 
 impl TableResult {
     fn from_raw(ptr: *mut ffi::velr_table) -> Result<Self> {
+        let a = velr_api()?;
+
         let table = NonNull::new(ptr)
             .ok_or_else(|| Error::new(ffi::velr_code::VELR_EERR as i32, "null table"))?;
-        let col_count = unsafe { ffi::velr_table_column_count(table.as_ptr()) };
+
+        let col_count = unsafe { (a.velr_table_column_count)(table.as_ptr()) };
 
         let mut names = Vec::with_capacity(col_count);
         for i in 0..col_count {
             let mut p: *const u8 = std::ptr::null();
             let mut len: usize = 0;
-            let rc = unsafe { ffi::velr_table_column_name(table.as_ptr(), i, &mut p, &mut len) };
 
-            // column_name doesn't provide out_err; treat non-OK as argument/state error
+            let rc = unsafe { (a.velr_table_column_name)(table.as_ptr(), i, &mut p, &mut len) };
+
             if rc as i32 != ffi::velr_code::VELR_OK as i32 {
                 return Err(Error::new(
                     rc as i32,
@@ -284,10 +353,10 @@ impl TableResult {
             }
 
             let bytes = unsafe { std::slice::from_raw_parts(p, len) };
-            let s = std::str::from_utf8(bytes)
-                .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "column name not utf-8"))?
-                .to_string();
-            names.push(s);
+            let s = std::str::from_utf8(bytes).map_err(|_| {
+                Error::new(ffi::velr_code::VELR_EUTF as i32, "column name not utf-8")
+            })?;
+            names.push(s.to_string());
         }
 
         Ok(Self {
@@ -307,14 +376,18 @@ impl TableResult {
     }
 
     pub fn rows<'t>(&'t mut self) -> Result<RowIter<'t>> {
+        let a = velr_api()?;
+
         let mut out_rows: *mut ffi::velr_rows = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe { ffi::velr_table_rows_open(self.table.as_ptr(), &mut out_rows, &mut err) };
+
+        let rc = unsafe { (a.velr_table_rows_open)(self.table.as_ptr(), &mut out_rows, &mut err) };
         rc_to_result(rc, err)?;
 
         let nn = NonNull::new(out_rows).ok_or_else(|| {
             Error::new(ffi::velr_code::VELR_EERR as i32, "rows_open returned null")
         })?;
+
         Ok(RowIter {
             rows: Some(nn),
             col_count: self.col_count,
@@ -356,13 +429,14 @@ impl TableResult {
 
     #[cfg(feature = "arrow-ipc")]
     pub fn to_arrow_ipc_file(&mut self) -> Result<Vec<u8>> {
-        // Use malloc + velr_free path to keep FFI simple
+        let a = velr_api()?;
+
         let mut ptr: *mut u8 = std::ptr::null_mut();
         let mut len: usize = 0;
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc = unsafe {
-            ffi::velr_table_ipc_file_malloc(self.table.as_ptr(), &mut ptr, &mut len, &mut err)
+            (a.velr_table_ipc_file_malloc)(self.table.as_ptr(), &mut ptr, &mut len, &mut err)
         };
         rc_to_result(rc, err)?;
 
@@ -371,25 +445,30 @@ impl TableResult {
         }
 
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-        unsafe { ffi::velr_free(ptr, len) };
+        unsafe { (a.velr_free)(ptr, len) };
         Ok(bytes)
     }
 }
 
 impl Drop for TableResult {
     fn drop(&mut self) {
-        unsafe { ffi::velr_table_close(self.table.as_ptr()) };
+        if let Ok(a) = velr_api() {
+            unsafe { (a.velr_table_close)(self.table.as_ptr()) };
+        }
     }
 }
 
 // -------------------------- RowIter --------------------------
+//
+// In-flight type: !Send + !Sync (thread-affine).
+//
 
 pub struct RowIter<'t> {
     rows: Option<NonNull<ffi::velr_rows>>,
     col_count: usize,
     buf: Vec<ffi::velr_cell>,
     _table: PhantomData<&'t mut TableResult>,
-    _nosend: PhantomData<Rc<()>>,
+    _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
 
 impl<'t> RowIter<'t> {
@@ -397,6 +476,8 @@ impl<'t> RowIter<'t> {
     where
         F: for<'row> FnOnce(&[CellRef<'row>]) -> Result<()>,
     {
+        let a = velr_api()?;
+
         let Some(rows) = self.rows else {
             return Ok(false);
         };
@@ -405,7 +486,7 @@ impl<'t> RowIter<'t> {
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc = unsafe {
-            ffi::velr_rows_next(
+            (a.velr_rows_next)(
                 rows.as_ptr(),
                 self.buf.as_mut_ptr(),
                 self.buf.len(),
@@ -422,8 +503,6 @@ impl<'t> RowIter<'t> {
             return Err(Error::new(rc, msg));
         }
 
-        // Build borrowed CellRef slice for this callback only.
-        // IMPORTANT: TEXT/JSON pointers remain valid until the next velr_rows_next call.
         let mut scratch: Vec<CellRef<'_>> = Vec::with_capacity(written);
         for c in self.buf.iter().take(written) {
             let cell = match c.ty {
@@ -451,17 +530,22 @@ impl<'t> RowIter<'t> {
 impl Drop for RowIter<'_> {
     fn drop(&mut self) {
         if let Some(r) = self.rows.take() {
-            unsafe { ffi::velr_rows_close(r.as_ptr()) };
+            if let Ok(a) = velr_api() {
+                unsafe { (a.velr_rows_close)(r.as_ptr()) };
+            }
         }
     }
 }
 
 // -------------------------- Transactions --------------------------
+//
+// In-flight type: !Send + !Sync (thread-affine).
+//
 
 pub struct VelrTx<'db> {
     tx: Option<NonNull<ffi::velr_tx>>,
     _db: PhantomData<&'db Velr>,
-    _nosend: PhantomData<Rc<()>>,
+    _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
 
 impl<'db> VelrTx<'db> {
@@ -471,6 +555,8 @@ impl<'db> VelrTx<'db> {
     }
 
     pub fn exec<'tx>(&'tx self, cypher: &str) -> Result<ExecTablesTx<'tx>> {
+        let a = velr_api()?;
+
         let tx = self.ptr()?;
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "cypher contains NUL"))?;
@@ -479,7 +565,7 @@ impl<'db> VelrTx<'db> {
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc =
-            unsafe { ffi::velr_tx_exec_start(tx.as_ptr(), cy.as_ptr(), &mut out_stream, &mut err) };
+            unsafe { (a.velr_tx_exec_start)(tx.as_ptr(), cy.as_ptr(), &mut out_stream, &mut err) };
         rc_to_result(rc, err)?;
 
         let nn = NonNull::new(out_stream).ok_or_else(|| {
@@ -488,6 +574,7 @@ impl<'db> VelrTx<'db> {
                 "tx_exec_start returned null stream",
             )
         })?;
+
         Ok(ExecTablesTx {
             stream: Some(nn),
             _tx: PhantomData,
@@ -496,7 +583,6 @@ impl<'db> VelrTx<'db> {
     }
 
     pub fn exec_one(&self, cypher: &str) -> Result<TableResult> {
-        // FFI doesn’t expose velr_tx_exec_one; implement via stream like your Rust driver.
         let mut st = self.exec(cypher)?;
         let first = match st.next_table()? {
             Some(t) => t,
@@ -525,34 +611,45 @@ impl<'db> VelrTx<'db> {
     }
 
     pub fn commit(mut self) -> Result<()> {
+        let a = velr_api()?;
+
         let tx = self
             .tx
             .take()
             .ok_or_else(|| Error::new(ffi::velr_code::VELR_ESTATE as i32, "tx already consumed"))?;
+
         let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe { ffi::velr_tx_commit(tx.as_ptr(), &mut err) };
+        let rc = unsafe { (a.velr_tx_commit)(tx.as_ptr(), &mut err) };
         rc_to_result(rc, err)
     }
 
     pub fn rollback(mut self) -> Result<()> {
+        let a = velr_api()?;
+
         let tx = self
             .tx
             .take()
             .ok_or_else(|| Error::new(ffi::velr_code::VELR_ESTATE as i32, "tx already consumed"))?;
+
         let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe { ffi::velr_tx_rollback(tx.as_ptr(), &mut err) };
+        let rc = unsafe { (a.velr_tx_rollback)(tx.as_ptr(), &mut err) };
         rc_to_result(rc, err)
     }
 
     pub fn savepoint<'tx>(&'tx self) -> Result<VelrSavepoint<'tx>> {
+        let a = velr_api()?;
+
         let tx = self.ptr()?;
         let mut out_sp: *mut ffi::velr_sp = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe { ffi::velr_tx_savepoint(tx.as_ptr(), &mut out_sp, &mut err) };
+
+        let rc = unsafe { (a.velr_tx_savepoint)(tx.as_ptr(), &mut out_sp, &mut err) };
         rc_to_result(rc, err)?;
+
         let nn = NonNull::new(out_sp).ok_or_else(|| {
             Error::new(ffi::velr_code::VELR_EERR as i32, "savepoint returned null")
         })?;
+
         Ok(VelrSavepoint {
             sp: Some(nn),
             _tx: PhantomData,
@@ -561,6 +658,8 @@ impl<'db> VelrTx<'db> {
     }
 
     pub fn savepoint_named<'tx>(&'tx self, name: &str) -> Result<VelrSavepoint<'tx>> {
+        let a = velr_api()?;
+
         let tx = self.ptr()?;
         let cname = CString::new(name).map_err(|_| {
             Error::new(
@@ -568,18 +667,22 @@ impl<'db> VelrTx<'db> {
                 "savepoint name contains NUL",
             )
         })?;
+
         let mut out_sp: *mut ffi::velr_sp = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
+
         let rc = unsafe {
-            ffi::velr_tx_savepoint_named(tx.as_ptr(), cname.as_ptr(), &mut out_sp, &mut err)
+            (a.velr_tx_savepoint_named)(tx.as_ptr(), cname.as_ptr(), &mut out_sp, &mut err)
         };
         rc_to_result(rc, err)?;
+
         let nn = NonNull::new(out_sp).ok_or_else(|| {
             Error::new(
                 ffi::velr_code::VELR_EERR as i32,
                 "savepoint_named returned null",
             )
         })?;
+
         Ok(VelrSavepoint {
             sp: Some(nn),
             _tx: PhantomData,
@@ -588,6 +691,8 @@ impl<'db> VelrTx<'db> {
     }
 
     pub fn rollback_to(&self, name: &str) -> Result<()> {
+        let a = velr_api()?;
+
         let tx = self.ptr()?;
         let cname = CString::new(name).map_err(|_| {
             Error::new(
@@ -595,8 +700,9 @@ impl<'db> VelrTx<'db> {
                 "savepoint name contains NUL",
             )
         })?;
+
         let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe { ffi::velr_tx_rollback_to(tx.as_ptr(), cname.as_ptr(), &mut err) };
+        let rc = unsafe { (a.velr_tx_rollback_to)(tx.as_ptr(), cname.as_ptr(), &mut err) };
         rc_to_result(rc, err)
     }
 
@@ -626,21 +732,28 @@ impl<'db> VelrTx<'db> {
 impl Drop for VelrTx<'_> {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
-            unsafe { ffi::velr_tx_close(tx.as_ptr()) };
+            if let Ok(a) = velr_api() {
+                unsafe { (a.velr_tx_close)(tx.as_ptr()) };
+            }
         }
     }
 }
 
 // -------------------------- ExecTablesTx --------------------------
+//
+// In-flight type: !Send + !Sync (thread-affine).
+//
 
 pub struct ExecTablesTx<'tx> {
     stream: Option<NonNull<ffi::velr_stream_tx>>,
     _tx: PhantomData<&'tx VelrTx<'tx>>,
-    _nosend: PhantomData<Rc<()>>,
+    _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
 
 impl ExecTablesTx<'_> {
     pub fn next_table(&mut self) -> Result<Option<TableResult>> {
+        let a = velr_api()?;
+
         let Some(stream) = self.stream else {
             return Ok(None);
         };
@@ -650,12 +763,12 @@ impl ExecTablesTx<'_> {
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc = unsafe {
-            ffi::velr_stream_tx_next_table(stream.as_ptr(), &mut out_table, &mut has, &mut err)
+            (a.velr_stream_tx_next_table)(stream.as_ptr(), &mut out_table, &mut has, &mut err)
         };
         rc_to_result(rc, err)?;
 
         if has == 0 {
-            unsafe { ffi::velr_exec_tx_close(stream.as_ptr()) };
+            unsafe { (a.velr_exec_tx_close)(stream.as_ptr()) };
             self.stream = None;
             return Ok(None);
         }
@@ -667,41 +780,52 @@ impl ExecTablesTx<'_> {
 impl Drop for ExecTablesTx<'_> {
     fn drop(&mut self) {
         if let Some(st) = self.stream.take() {
-            unsafe { ffi::velr_exec_tx_close(st.as_ptr()) };
+            if let Ok(a) = velr_api() {
+                unsafe { (a.velr_exec_tx_close)(st.as_ptr()) };
+            }
         }
     }
 }
 
 // -------------------------- Savepoints --------------------------
+//
+// In-flight type: !Send + !Sync (thread-affine).
+//
 
 pub struct VelrSavepoint<'tx> {
     sp: Option<NonNull<ffi::velr_sp>>,
     _tx: PhantomData<&'tx VelrTx<'tx>>,
-    _nosend: PhantomData<Rc<()>>,
+    _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
 
 impl VelrSavepoint<'_> {
     pub fn release(mut self) -> Result<()> {
+        let a = velr_api()?;
+
         let sp = self.sp.take().ok_or_else(|| {
             Error::new(
                 ffi::velr_code::VELR_ESTATE as i32,
                 "savepoint already consumed",
             )
         })?;
+
         let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe { ffi::velr_sp_release(sp.as_ptr(), &mut err) };
+        let rc = unsafe { (a.velr_sp_release)(sp.as_ptr(), &mut err) };
         rc_to_result(rc, err)
     }
 
     pub fn rollback(mut self) -> Result<()> {
+        let a = velr_api()?;
+
         let sp = self.sp.take().ok_or_else(|| {
             Error::new(
                 ffi::velr_code::VELR_ESTATE as i32,
                 "savepoint already consumed",
             )
         })?;
+
         let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe { ffi::velr_sp_rollback(sp.as_ptr(), &mut err) };
+        let rc = unsafe { (a.velr_sp_rollback)(sp.as_ptr(), &mut err) };
         rc_to_result(rc, err)
     }
 }
@@ -709,7 +833,9 @@ impl VelrSavepoint<'_> {
 impl Drop for VelrSavepoint<'_> {
     fn drop(&mut self) {
         if let Some(sp) = self.sp.take() {
-            unsafe { ffi::velr_sp_close(sp.as_ptr()) };
+            if let Ok(a) = velr_api() {
+                unsafe { (a.velr_sp_close)(sp.as_ptr()) };
+            }
         }
     }
 }
@@ -742,9 +868,10 @@ mod arrow_bind {
         col_names: Vec<String>,
         arrays: Vec<Box<dyn Array>>,
     ) -> Result<()> {
+        let a = super::velr_api()?;
         bind_arrow_common(
             |logical_ptr, schemas_pp, arrays_pp, names_ptr, n, err| unsafe {
-                ffi::velr_bind_arrow(db, logical_ptr, schemas_pp, arrays_pp, names_ptr, n, err)
+                (a.velr_bind_arrow)(db, logical_ptr, schemas_pp, arrays_pp, names_ptr, n, err)
             },
             logical,
             col_names,
@@ -758,9 +885,10 @@ mod arrow_bind {
         col_names: Vec<String>,
         arrays: Vec<Box<dyn Array>>,
     ) -> Result<()> {
+        let a = super::velr_api()?;
         bind_arrow_common(
             |logical_ptr, schemas_pp, arrays_pp, names_ptr, n, err| unsafe {
-                ffi::velr_tx_bind_arrow(tx, logical_ptr, schemas_pp, arrays_pp, names_ptr, n, err)
+                (a.velr_tx_bind_arrow)(tx, logical_ptr, schemas_pp, arrays_pp, names_ptr, n, err)
             },
             logical,
             col_names,
@@ -800,7 +928,6 @@ mod arrow_bind {
 
         let logical_c = cstring(logical, "logical")?;
 
-        // Export schemas (by ref) + arrays (ownership transferred via ptr::read in FFI)
         let mut schemas: Vec<ArrowSchema> = Vec::with_capacity(col_names.len());
         let mut array_cs: Vec<ManuallyDrop<ArrowArray>> = Vec::with_capacity(col_names.len());
         let mut schema_ptrs: Vec<*const ArrowSchema> = Vec::with_capacity(col_names.len());
@@ -812,12 +939,10 @@ mod arrow_bind {
             let schema = export_field_to_c(&field);
             schemas.push(schema);
 
-            // export_array_to_c consumes the Box<dyn Array>
             let a = ManuallyDrop::new(export_array_to_c(arr));
             array_cs.push(a);
         }
 
-        // pointers must be built after vectors are finalized
         for i in 0..col_names.len() {
             schema_ptrs.push(&schemas[i] as *const ArrowSchema);
             array_ptrs.push((&*array_cs[i]) as *const ArrowArray);
@@ -847,9 +972,10 @@ mod arrow_bind {
         col_names: Vec<String>,
         chunks_per_col: Vec<Vec<Box<dyn Array>>>,
     ) -> Result<()> {
+        let a = super::velr_api()?;
         bind_chunks_common(
             |logical_ptr, cols_ptr, names_ptr, n, err| unsafe {
-                ffi::velr_bind_arrow_chunks(db, logical_ptr, cols_ptr, names_ptr, n, err)
+                (a.velr_bind_arrow_chunks)(db, logical_ptr, cols_ptr, names_ptr, n, err)
             },
             logical,
             col_names,
@@ -863,9 +989,10 @@ mod arrow_bind {
         col_names: Vec<String>,
         chunks_per_col: Vec<Vec<Box<dyn Array>>>,
     ) -> Result<()> {
+        let a = super::velr_api()?;
         bind_chunks_common(
             |logical_ptr, cols_ptr, names_ptr, n, err| unsafe {
-                ffi::velr_tx_bind_arrow_chunks(tx, logical_ptr, cols_ptr, names_ptr, n, err)
+                (a.velr_tx_bind_arrow_chunks)(tx, logical_ptr, cols_ptr, names_ptr, n, err)
             },
             logical,
             col_names,
@@ -904,9 +1031,6 @@ mod arrow_bind {
 
         let logical_c = cstring(logical, "logical")?;
 
-        // For each column:
-        // - export per-chunk schema+array
-        // - store stable pointer arrays
         let mut all_schema_storage: Vec<Vec<ArrowSchema>> = Vec::with_capacity(col_names.len());
         let mut all_array_storage: Vec<Vec<ManuallyDrop<ArrowArray>>> =
             Vec::with_capacity(col_names.len());
@@ -943,7 +1067,6 @@ mod arrow_bind {
             all_array_ptrs.push(ap);
         }
 
-        // Build velr_arrow_chunks array referencing the per-column pointer vectors
         let mut cols_desc: Vec<ffi::velr_arrow_chunks> = Vec::with_capacity(col_names.len());
         for i in 0..col_names.len() {
             cols_desc.push(ffi::velr_arrow_chunks {
@@ -953,7 +1076,6 @@ mod arrow_bind {
             });
         }
 
-        // Column-name views
         let mut name_views: Vec<ffi::velr_strview> = Vec::with_capacity(col_names.len());
         for name in &col_names {
             let b = name.as_bytes();

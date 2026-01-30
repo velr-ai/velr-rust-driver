@@ -28,7 +28,7 @@ velr = { version = "0.1", features = ["arrow-ipc"] }
 
 ## Quick start
 
-```rust
+```rust,no_run
 use velr::{Velr, CellRef};
 
 fn main() -> velr::Result<()> {
@@ -83,7 +83,7 @@ while let Some(mut table) = stream.next_table()? {
 
 ## Transactions and savepoints
 
-```rust
+```rust,no_run
 let db = Velr::open(None)?;
 
 let tx = db.begin_tx()?;
@@ -110,7 +110,7 @@ With `features = ["arrow-ipc"]` you can:
 * Bind Arrow arrays as a logical table (`bind_arrow`, `bind_arrow_chunks`)
 * Export a result table as an Arrow IPC file (`to_arrow_ipc_file()`)
 
-```rust
+```rust,no_run
 #[cfg(feature = "arrow-ipc")]
 fn arrow_example() -> velr::Result<()> {
     use arrow2::array::{Array, Utf8Array};
