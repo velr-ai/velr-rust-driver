@@ -1,6 +1,6 @@
 [package]
 name = "velr"
-version = "0.1.44"
+version = "0.1.45"
 edition = "2021"
 
 description = "Velr embedded property-graph database (Rust driver, beta)"

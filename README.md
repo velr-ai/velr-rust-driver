@@ -1,10 +1,23 @@
 # Velr (Rust driver)
 
-Velr is an embedded property-graph database written in Rust from **Velr.ai**.
+Velr is an embedded property-graph database from Velr.ai, written in Rust, built on top of SQLite3 (persisting to a standard SQLite database file) and queried using the openCypher language.
 
-This crate provides the **Rust driver** for Velr. It links against a bundled native runtime (C ABI) shipped under `prebuilt/`.
+Vector data and time-series support are actively in development and will ship after openCypher support has stabilized.
+
+This crate provides the **Rust driver** for Velr. It links against a bundled native runtime with a C ABI, implemented in Rust.
 
 **Questions, feedback, or commercial licensing:** tomas@velr.ai
+
+---
+
+## Release status
+
+This release is **pre-beta**.
+
+* The API and query support are still evolving.
+* **Beta is expected in Q1 - 2026**.
+
+If you hit a missing feature (see below), please reach out — it helps us prioritize.
 
 ---
 
@@ -56,6 +69,23 @@ fn main() -> velr::Result<()> {
     Ok(())
 }
 ```
+
+---
+
+## Query language support
+
+Velr supports **most of openCypher**, but some features are not yet implemented.
+
+Notable missing features:
+
+* **Classic UNWIND list literals**, e.g. `UNWIND [1,2,3] AS r`
+
+  * Use **`UNWIND BIND('name') AS r`** instead, with data provided via:
+
+    * **Arrow** (`bind_arrow`, `bind_arrow_chunks`) 
+
+* **DELETE / DETACH DELETE / removal of nodes or edges** (any form of deleting)
+* **Patterns in `WHERE` clauses** (pattern predicates)
 
 ---
 
@@ -135,9 +165,36 @@ fn arrow_example() -> velr::Result<()> {
 
 ---
 
+## Supported functions
+
+Velr currently supports these openCypher functions:
+
+**Scalars**
+
+* `id()`
+* `type()`
+* `length()`
+* `nodes()`
+* `relationships()`
+* `coalesce()`
+* `labels()`
+* `properties()`
+* `keys()`
+
+**Aggregates**
+
+* `count()`
+* `sum()`
+* `avg()`
+* `min()`
+* `max()`
+* `collect()`
+
+---
+
 ## Platform support
 
-This crate links against a bundled native runtime shipped under `prebuilt/`.
+This crate links against a bundled native runtime.
 
 Currently bundled targets:
 

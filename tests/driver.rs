@@ -1,5 +1,3 @@
-#![cfg(target_os = "macos")] // bundled runtime currently only for macOS
-
 use serde_json::Value;
 use velr::{CellRef, Velr};
 

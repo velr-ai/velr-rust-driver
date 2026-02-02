@@ -1,3 +1,46 @@
+//! Rust bindings for the Velr runtime.
+//!
+//! This crate exposes a high-level API over the Velr runtime ABI (loaded via the `runtime` module),
+//! wrapping raw FFI pointers in RAII types with predictable lifetimes.
+//!
+//! # Threading model
+//!
+//! Velr uses a *connection-affine* model:
+//!
+//! 1) [`Velr`] (the connection) is **`Send` + `!Sync`**.
+//!    - ✅ You may **move** a connection to another thread.
+//!      Example: spawn a worker thread and move the connection into it.
+//!    - ❌ You may **not share** a single connection across threads concurrently.
+//!      Example: `Arc<Velr>` won't compile.
+//!
+//! 2) In-flight / borrowing objects are **`!Send` + `!Sync`** (thread-affine):
+//!    [`ExecTables`], [`TableResult`], [`RowIter`], [`VelrTx`], [`ExecTablesTx`], [`VelrSavepoint`].
+//!    - ❌ You may not move these to another thread.
+//!    - ❌ You may not share these across threads.
+//!
+//! Practical implications:
+//! - ✅ Many connections across many threads is fine (open one connection per thread).
+//! - ✅ You can move a connection between threads (e.g., create in main, move into worker).
+//! - ❌ You cannot run concurrent operations on the same connection across threads.
+//!
+//! If you need parallelism, open multiple connections and/or use a pool.
+//!
+//! # Results and lifetimes
+//!
+//! Queries can produce **zero or more result tables**:
+//! - [`Velr::exec`] / [`VelrTx::exec`] stream tables via [`ExecTables`] / [`ExecTablesTx`].
+//! - [`Velr::exec_one`] / [`VelrTx::exec_one`] return a single [`TableResult`].
+//!
+//! Rows are processed via callbacks. Individual cell values are represented by [`CellRef`], which
+//! may borrow bytes from buffers owned by the underlying row cursor. For `Text`/`Json` values, the
+//! borrowed bytes remain valid until the next call to [`RowIter::next`] on the same iterator (or
+//! until the iterator is dropped). In typical usage this means the borrows are scoped to the row
+//! callback invocation.
+//!
+//! # Errors
+//!
+//! Most operations return [`Result<T>`]. On failure, you get an [`Error`] containing a numeric
+//! code (originating from the runtime ABI) and an optional message.
 #![allow(unsafe_code)]
 
 mod api;
@@ -16,30 +59,15 @@ use std::{
 
 use sys as ffi;
 
-// -----------------------------------------------------------------------------
-// Threading model
-//
-// 1) Velr (the connection) is Send + !Sync.
-//    - ✅ You may MOVE a connection to another thread.
-//      Example: spawn a worker thread and move the connection into it.
-//    - ❌ You may NOT share a single connection across threads concurrently.
-//      Example: Arc<Velr> won't compile
-//
-// 2) In-flight / borrowing objects are !Send + !Sync:
-//    ExecTables, TableResult, RowIter, VelrTx, ExecTablesTx, VelrSavepoint.
-//    - ❌ You may not move these to another thread.
-//    - ❌ You may not share these across threads.
-//
-// Practical implications:
-// - ✅ Many connections across many threads is fine (open one connection per thread).
-// - ✅ You can move a connection between threads (e.g., create in main, move into worker).
-// - ❌ You cannot run concurrent operations on the SAME connection across threads.
-//
-// If you need parallelism, open multiple connections and/or use a pool.
-// -----------------------------------------------------------------------------
-
+/// Convenience result type used throughout the public API.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Error returned by the Velr API.
+///
+/// - `code` is an integer error code returned by the runtime ABI. This is subject for change later.
+/// - `message` is an optional, human-readable message (may be empty).
+///
+/// The runtime may or may not provide an error message for a given code.
 #[derive(Debug)]
 pub struct Error {
     pub code: i32,
@@ -67,10 +95,24 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Get a reference to the loaded runtime API.
+///
+/// This ensures the runtime is initialized (via [`runtime::runtime`]) and then returns the
+/// resolved ABI function table.
+///
+/// # Errors
+///
+/// Returns an [`Error`] if the runtime cannot be loaded or initialized.
 fn velr_api() -> Result<&'static api::Api> {
     Ok(&runtime::runtime()?.api)
 }
 
+/// Convert an ABI-owned error string into a Rust [`String`], freeing it via the runtime.
+///
+/// # Safety
+///
+/// `p` must be either null or a pointer to a NUL-terminated C string allocated by the Velr runtime.
+/// On success, this function attempts to free the string using `velr_string_free`.
 unsafe fn take_err(p: *mut c_char) -> String {
     if p.is_null() {
         return String::new();
@@ -85,6 +127,10 @@ unsafe fn take_err(p: *mut c_char) -> String {
     s
 }
 
+/// Convert a Velr return code plus optional error string into [`Result<()>`].
+///
+/// On success, frees `err` if it is unexpectedly non-null. On failure, converts `err` into an
+/// [`Error`] and frees it via the runtime.
 fn rc_to_result(rc: ffi::velr_code, err: *mut c_char) -> Result<()> {
     let code = rc as i32;
     if code == ffi::velr_code::VELR_OK as i32 {
@@ -103,6 +149,13 @@ fn rc_to_result(rc: ffi::velr_code, err: *mut c_char) -> Result<()> {
 
 // -------------------------- CellRef --------------------------
 
+/// Borrowed view of a single cell value in a result row.
+///
+/// This is a lightweight, non-owning representation used when iterating rows.
+/// Text/JSON values are exposed as raw bytes.
+///
+/// - For text data, use [`CellRef::as_str_utf8`] if you want a UTF-8 `&str`.
+/// - JSON is returned as raw bytes
 #[derive(Debug, Copy, Clone)]
 pub enum CellRef<'a> {
     Null,
@@ -114,6 +167,12 @@ pub enum CellRef<'a> {
 }
 
 impl<'a> CellRef<'a> {
+    /// If this cell is [`CellRef::Text`], attempt to interpret it as UTF-8.
+    ///
+    /// Returns:
+    /// - `Some(Ok(&str))` if the cell is text and valid UTF-8
+    /// - `Some(Err(_))` if the cell is text but invalid UTF-8
+    /// - `None` if the cell is not text
     pub fn as_str_utf8(&self) -> Option<std::result::Result<&'a str, std::str::Utf8Error>> {
         match self {
             CellRef::Text(b) => Some(std::str::from_utf8(b)),
@@ -133,6 +192,17 @@ pub struct Velr {
 }
 
 impl Velr {
+    /// Open a Velr connection.
+    ///
+    /// ## Path semantics
+    ///
+    /// - If `path` is `None`, an **in-memory** database is opened.
+    /// - If `path` is `Some(":memory:")`, an **in-memory** database is opened.
+    /// - Otherwise, `path` is treated as a filesystem path for a file-backed database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `path` contains an interior NUL byte or if the runtime fails to open.
     pub fn open(path: Option<&str>) -> Result<Self> {
         let a = velr_api()?; // ensure runtime is loaded
 
@@ -166,11 +236,20 @@ impl Velr {
         })
     }
 
+    /// Execute `openCypher` and return a stream of result tables.
+    ///
+    /// Use [`ExecTables::next_table`] to pull tables until it returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - `openCypher` contains an interior NUL (\0)
+    /// - the runtime reports an execution/planning/parsing error
     pub fn exec<'db>(&'db self, cypher: &str) -> Result<ExecTables<'db>> {
         let a = velr_api()?;
 
         let cy = CString::new(cypher)
-            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "cypher contains NUL"))?;
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
 
         let mut out_stream: *mut ffi::velr_stream = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -194,11 +273,24 @@ impl Velr {
         })
     }
 
+    /// Execute `openCypher` and return exactly one result table.
+    ///
+    /// This method succeeds only if executing the provided openCypher text produces exactly one
+    /// result table. If execution yields zero tables or more than one table, this returns an error.
+    ///
+    /// Use [`exec`] to stream multiple result tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - `openCypher` contains an interior NUL (\0)
+    /// - the runtime reports an execution/planning/parsing error
+    /// - the execution yields zero or multiple result tables
     pub fn exec_one(&self, cypher: &str) -> Result<TableResult> {
         let a = velr_api()?;
 
         let cy = CString::new(cypher)
-            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "cypher contains NUL"))?;
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
 
         let mut out_table: *mut ffi::velr_table = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -209,6 +301,9 @@ impl Velr {
         TableResult::from_raw(out_table)
     }
 
+    /// Execute a query and discard all results.
+    ///
+    /// This is a convenience wrapper around [`Velr::exec`] that drains all tables and rows.
     pub fn run(&self, cypher: &str) -> Result<()> {
         let mut st = self.exec(cypher)?;
         while let Some(mut t) = st.next_table()? {
@@ -217,6 +312,10 @@ impl Velr {
         Ok(())
     }
 
+    /// Begin a transaction.
+    ///
+    /// The transaction handle is closed automatically on drop. To explicitly finalize a
+    /// transaction, use [`VelrTx::commit`] or [`VelrTx::rollback`].
     pub fn begin_tx(&self) -> Result<VelrTx<'_>> {
         let a = velr_api()?;
 
@@ -240,6 +339,12 @@ impl Velr {
         })
     }
 
+    /// Bind Arrow arrays (Arrow C Data Interface) to a logical name.
+    ///
+    /// Available only when built with the `arrow-ipc` feature.
+    ///
+    /// This transfers ownership of the provided Arrow arrays into Velr for the lifetime of the bind.
+    /// (At the ABI level, the ArrowArray structs are consumed during the call.)
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow(
         &self,
@@ -250,6 +355,15 @@ impl Velr {
         arrow_bind::bind_arrow_db(self.db.as_ptr(), logical, col_names, arrays)
     }
 
+    /// Bind chunked Arrow arrays per column to a logical name.
+    ///
+    /// Available only when built with the `arrow-ipc` feature.
+    ///
+    /// This transfers ownership of the provided Arrow arrays into Velr for the lifetime of the bind.
+    /// (At the ABI level, the ArrowArray structs are consumed during the call.)
+    ///
+    /// All columns must have the same total row count (sum of chunk lengths); otherwise the bind
+    /// returns an error.
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow_chunks(
         &self,
@@ -262,6 +376,7 @@ impl Velr {
 }
 
 impl Drop for Velr {
+    /// Close the connection handle.
     fn drop(&mut self) {
         if let Ok(a) = velr_api() {
             unsafe { (a.velr_close)(self.db.as_ptr()) };
@@ -270,10 +385,13 @@ impl Drop for Velr {
 }
 
 // -------------------------- ExecTables --------------------------
-//
-// In-flight type: !Send + !Sync (thread-affine).
-//
 
+/// Streaming result of an execution that may yield multiple tables.
+///
+/// This is an *in-flight* type and is **`!Send` + `!Sync`** (thread-affine).
+///
+/// Use [`ExecTables::next_table`] to pull result tables sequentially. Dropping this value will
+/// close the underlying execution stream
 pub struct ExecTables<'db> {
     stream: Option<NonNull<ffi::velr_stream>>,
     _db: PhantomData<&'db Velr>,
@@ -281,6 +399,15 @@ pub struct ExecTables<'db> {
 }
 
 impl<'db> ExecTables<'db> {
+    /// Fetch the next result table from the execution stream.
+    ///
+    /// Returns:
+    /// - `Ok(Some(table))` when a new table is available
+    /// - `Ok(None)` when the stream is exhausted (and the runtime stream is closed)
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the runtime reports an error while advancing the stream.
     pub fn next_table(&mut self) -> Result<Option<TableResult>> {
         let a = velr_api()?;
 
@@ -308,6 +435,7 @@ impl<'db> ExecTables<'db> {
 }
 
 impl Drop for ExecTables<'_> {
+    /// Close the underlying execution stream if still open.
     fn drop(&mut self) {
         if let Some(st) = self.stream.take() {
             if let Ok(a) = velr_api() {
@@ -318,10 +446,15 @@ impl Drop for ExecTables<'_> {
 }
 
 // -------------------------- TableResult --------------------------
-//
-// In-flight type: !Send + !Sync (thread-affine).
-//
 
+/// A single result table produced by query execution.
+///
+/// This is an *in-flight* type and is **`!Send` + `!Sync`** (thread-affine).
+///
+/// A table exposes:
+/// - column metadata (names and count)
+/// - row iteration via [`TableResult::rows`], [`TableResult::for_each_row`], or [`TableResult::collect`]
+///
 pub struct TableResult {
     table: NonNull<ffi::velr_table>,
     col_names: Vec<String>,
@@ -330,6 +463,12 @@ pub struct TableResult {
 }
 
 impl TableResult {
+    /// Construct a [`TableResult`] from a raw runtime table pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if `ptr` is null, if the runtime fails to retrieve column names,
+    /// or if column name bytes are not valid UTF-8.
     fn from_raw(ptr: *mut ffi::velr_table) -> Result<Self> {
         let a = velr_api()?;
 
@@ -367,14 +506,24 @@ impl TableResult {
         })
     }
 
+    /// Return the column names for this table.
     pub fn column_names(&self) -> &[String] {
         &self.col_names
     }
 
+    /// Return the number of columns in this table.
     pub fn column_count(&self) -> usize {
         self.col_count
     }
 
+    /// Open a row iterator for this table.
+    ///
+    /// Row iteration is callback-based via [`RowIter::next`], producing a borrowed slice of
+    /// [`CellRef`] for each row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the runtime fails to open the row cursor.
     pub fn rows<'t>(&'t mut self) -> Result<RowIter<'t>> {
         let a = velr_api()?;
 
@@ -406,6 +555,10 @@ impl TableResult {
         })
     }
 
+    /// Visit each row in this table.
+    ///
+    /// The callback receives a slice of [`CellRef`] representing the row’s cells.
+    /// The borrow is scoped to the callback invocation (and remains valid until the next row is fetched).
     pub fn for_each_row<F>(&mut self, mut on_row: F) -> Result<()>
     where
         F: for<'row> FnMut(&[CellRef<'row>]) -> Result<()>,
@@ -415,6 +568,9 @@ impl TableResult {
         Ok(())
     }
 
+    /// Map each row to a value and collect into a vector.
+    ///
+    /// This is a convenience wrapper around [`TableResult::for_each_row`].
     pub fn collect<T, F>(&mut self, mut map: F) -> Result<Vec<T>>
     where
         F: for<'row> FnMut(&[CellRef<'row>]) -> Result<T>,
@@ -427,6 +583,11 @@ impl TableResult {
         Ok(out)
     }
 
+    /// Encode this table as an Arrow IPC file in memory.
+    ///
+    /// Available only when built with the `arrow-ipc` feature.
+    ///
+    /// Returns the IPC file bytes produced by the runtime.
     #[cfg(feature = "arrow-ipc")]
     pub fn to_arrow_ipc_file(&mut self) -> Result<Vec<u8>> {
         let a = velr_api()?;
@@ -451,6 +612,7 @@ impl TableResult {
 }
 
 impl Drop for TableResult {
+    /// Close the table handle.
     fn drop(&mut self) {
         if let Ok(a) = velr_api() {
             unsafe { (a.velr_table_close)(self.table.as_ptr()) };
@@ -459,10 +621,13 @@ impl Drop for TableResult {
 }
 
 // -------------------------- RowIter --------------------------
-//
-// In-flight type: !Send + !Sync (thread-affine).
-//
 
+/// Iterator over rows of a table.
+///
+/// This is an *in-flight* type and is **`!Send` + `!Sync`** (thread-affine).
+///
+/// Rows are produced via [`RowIter::next`], which invokes a callback with a borrowed slice of
+/// [`CellRef`].
 pub struct RowIter<'t> {
     rows: Option<NonNull<ffi::velr_rows>>,
     col_count: usize,
@@ -472,6 +637,20 @@ pub struct RowIter<'t> {
 }
 
 impl<'t> RowIter<'t> {
+    /// Advance to the next row and invoke `on_row`.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if a row was produced and `on_row` was called
+    /// - `Ok(false)` if the iterator is exhausted
+    ///
+    /// ## Lifetimes
+    ///
+    /// For `CellRef::Text` and `CellRef::Json`, the returned byte slices remain valid until the next
+    /// call to [`RowIter::next`] on the same iterator (or until the iterator is dropped).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the runtime reports an error while advancing.
     pub fn next<F>(&mut self, on_row: F) -> Result<bool>
     where
         F: for<'row> FnOnce(&[CellRef<'row>]) -> Result<()>,
@@ -539,9 +718,16 @@ impl Drop for RowIter<'_> {
 
 // -------------------------- Transactions --------------------------
 //
-// In-flight type: !Send + !Sync (thread-affine).
-//
 
+/// A transaction handle (thread-affine).
+///
+/// Finalization:
+/// - [`VelrTx::commit`] consumes `self` and commits.
+/// - [`VelrTx::rollback`] consumes `self` and rolls back.
+///
+/// ## Drop behavior
+///
+/// If a transaction is dropped without an explicit commit/rollback, the runtime rolls it back.
 pub struct VelrTx<'db> {
     tx: Option<NonNull<ffi::velr_tx>>,
     _db: PhantomData<&'db Velr>,
@@ -554,12 +740,15 @@ impl<'db> VelrTx<'db> {
             .ok_or_else(|| Error::new(ffi::velr_code::VELR_ESTATE as i32, "tx already consumed"))
     }
 
+    /// Execute `openCypher` within this transaction and return a stream of result tables.
+    ///  
+    /// See [`Velr::exec`] for general streaming semantics.
     pub fn exec<'tx>(&'tx self, cypher: &str) -> Result<ExecTablesTx<'tx>> {
         let a = velr_api()?;
 
         let tx = self.ptr()?;
         let cy = CString::new(cypher)
-            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "cypher contains NUL"))?;
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
 
         let mut out_stream: *mut ffi::velr_stream_tx = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -582,6 +771,10 @@ impl<'db> VelrTx<'db> {
         })
     }
 
+    /// Execute a query expected to produce exactly one table within this transaction.
+    ///
+    /// This method is implemented by streaming (`exec`) and validating that exactly one table is
+    /// produced. If you expect multiple tables, use [`VelrTx::exec`].
     pub fn exec_one(&self, cypher: &str) -> Result<TableResult> {
         let mut st = self.exec(cypher)?;
         let first = match st.next_table()? {
@@ -602,6 +795,7 @@ impl<'db> VelrTx<'db> {
         Ok(first)
     }
 
+    /// Execute a query within this transaction and discard all results.
     pub fn run(&self, cypher: &str) -> Result<()> {
         let mut st = self.exec(cypher)?;
         while let Some(mut t) = st.next_table()? {
@@ -610,6 +804,12 @@ impl<'db> VelrTx<'db> {
         Ok(())
     }
 
+    /// Commit this transaction.
+    ///
+    /// Consumes the transaction handle. After this call, the transaction is finalized and cannot be
+    /// used again.
+    ///
+    /// Note: the underlying C ABI consumes the transaction handle even if an error is returned.
     pub fn commit(mut self) -> Result<()> {
         let a = velr_api()?;
 
@@ -623,6 +823,12 @@ impl<'db> VelrTx<'db> {
         rc_to_result(rc, err)
     }
 
+    /// Roll back this transaction.
+    ///
+    /// Consumes the transaction handle. After this call, the transaction is finalized and cannot be
+    /// used again.
+    ///
+    /// Note: the underlying C ABI consumes the transaction handle even if an error is returned.
     pub fn rollback(mut self) -> Result<()> {
         let a = velr_api()?;
 
@@ -636,6 +842,13 @@ impl<'db> VelrTx<'db> {
         rc_to_result(rc, err)
     }
 
+    /// Create an unnamed savepoint inside this transaction.
+    ///
+    /// The savepoint handle can be released ([`VelrSavepoint::release`]) or rolled back to
+    /// ([`VelrSavepoint::rollback`]).
+    ///
+    /// If the savepoint is dropped without explicit release/rollback, the runtime rolls back to the
+    /// savepoint and releases it.
     pub fn savepoint<'tx>(&'tx self) -> Result<VelrSavepoint<'tx>> {
         let a = velr_api()?;
 
@@ -657,6 +870,12 @@ impl<'db> VelrTx<'db> {
         })
     }
 
+    /// Create a named savepoint inside this transaction.
+    ///
+    /// `name` must not contain interior NUL bytes (it is passed to the runtime as a C string).
+    ///
+    /// If the savepoint is dropped without explicit release/rollback, the runtime rolls back to the
+    /// savepoint and releases it.
     pub fn savepoint_named<'tx>(&'tx self, name: &str) -> Result<VelrSavepoint<'tx>> {
         let a = velr_api()?;
 
@@ -690,6 +909,9 @@ impl<'db> VelrTx<'db> {
         })
     }
 
+    /// Roll back to a named savepoint and release it.
+    ///
+    /// `name` must not contain interior NUL bytes (it is passed to the runtime as a C string).
     pub fn rollback_to(&self, name: &str) -> Result<()> {
         let a = velr_api()?;
 
@@ -706,6 +928,12 @@ impl<'db> VelrTx<'db> {
         rc_to_result(rc, err)
     }
 
+    /// Bind Arrow arrays (Arrow C Data Interface) to a logical name.
+    ///
+    /// Available only when built with the `arrow-ipc` feature.
+    ///
+    /// This transfers ownership of the provided Arrow arrays into Velr for the lifetime of the bind.
+    /// (At the ABI level, the ArrowArray structs are consumed during the call.)
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow(
         &self,
@@ -717,6 +945,15 @@ impl<'db> VelrTx<'db> {
         arrow_bind::bind_arrow_tx(tx.as_ptr(), logical, col_names, arrays)
     }
 
+    /// Bind chunked Arrow arrays per column to a logical name.
+    ///
+    /// Available only when built with the `arrow-ipc` feature.
+    ///
+    /// This transfers ownership of the provided Arrow arrays into Velr for the lifetime of the bind.
+    /// (At the ABI level, the ArrowArray structs are consumed during the call.)
+    ///
+    /// All columns must have the same total row count (sum of chunk lengths); otherwise the bind
+    /// returns an error.
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow_chunks(
         &self,
@@ -730,6 +967,7 @@ impl<'db> VelrTx<'db> {
 }
 
 impl Drop for VelrTx<'_> {
+    /// Close the transaction handle if still open.
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
             if let Ok(a) = velr_api() {
@@ -741,9 +979,10 @@ impl Drop for VelrTx<'_> {
 
 // -------------------------- ExecTablesTx --------------------------
 //
-// In-flight type: !Send + !Sync (thread-affine).
-//
 
+/// Streaming result of an execution within a transaction.
+///
+/// This is an *in-flight* type and is **`!Send` + `!Sync`** (thread-affine).
 pub struct ExecTablesTx<'tx> {
     stream: Option<NonNull<ffi::velr_stream_tx>>,
     _tx: PhantomData<&'tx VelrTx<'tx>>,
@@ -751,6 +990,9 @@ pub struct ExecTablesTx<'tx> {
 }
 
 impl ExecTablesTx<'_> {
+    /// Fetch the next result table from the transaction execution stream.
+    ///
+    /// Returns `Ok(None)` when exhausted (and closes the underlying stream).
     pub fn next_table(&mut self) -> Result<Option<TableResult>> {
         let a = velr_api()?;
 
@@ -778,6 +1020,7 @@ impl ExecTablesTx<'_> {
 }
 
 impl Drop for ExecTablesTx<'_> {
+    /// Close the underlying transaction execution stream if still open.
     fn drop(&mut self) {
         if let Some(st) = self.stream.take() {
             if let Ok(a) = velr_api() {
@@ -789,9 +1032,17 @@ impl Drop for ExecTablesTx<'_> {
 
 // -------------------------- Savepoints --------------------------
 //
-// In-flight type: !Send + !Sync (thread-affine).
-//
 
+/// A savepoint handle within a transaction (thread-affine).
+///
+/// Use:
+/// - [`VelrSavepoint::release`] to release the savepoint
+/// - [`VelrSavepoint::rollback`] to roll back to the savepoint
+///
+/// ## Drop behavior
+///
+/// If dropped without explicit release/rollback, the runtime rolls back to the savepoint and
+/// releases it.
 pub struct VelrSavepoint<'tx> {
     sp: Option<NonNull<ffi::velr_sp>>,
     _tx: PhantomData<&'tx VelrTx<'tx>>,
@@ -799,6 +1050,12 @@ pub struct VelrSavepoint<'tx> {
 }
 
 impl VelrSavepoint<'_> {
+    /// Release this savepoint.
+    ///
+    /// Consumes the savepoint handle. After this call, the savepoint is finalized and cannot be used
+    /// again.
+    ///
+    /// Note: the underlying C ABI consumes the savepoint handle even if an error is returned.
     pub fn release(mut self) -> Result<()> {
         let a = velr_api()?;
 
@@ -814,6 +1071,12 @@ impl VelrSavepoint<'_> {
         rc_to_result(rc, err)
     }
 
+    /// Roll back to this savepoint and release it.
+    ///
+    /// Consumes the savepoint handle. After this call, the savepoint is finalized and cannot be used
+    /// again.
+    ///
+    /// Note: the underlying C ABI consumes the savepoint handle even if an error is returned.
     pub fn rollback(mut self) -> Result<()> {
         let a = velr_api()?;
 
@@ -831,6 +1094,7 @@ impl VelrSavepoint<'_> {
 }
 
 impl Drop for VelrSavepoint<'_> {
+    /// Close the savepoint handle if still open.
     fn drop(&mut self) {
         if let Some(sp) = self.sp.take() {
             if let Ok(a) = velr_api() {
@@ -841,6 +1105,14 @@ impl Drop for VelrSavepoint<'_> {
 }
 
 // -------------------------- Arrow binding helpers --------------------------
+/// Arrow binding support.
+///
+/// This module is only compiled with the `arrow-ipc` feature enabled.
+///
+/// It exports Arrow arrays/schemas using `arrow2`’s Arrow C Data Interface helpers and passes
+/// them to the Velr runtime ABI. The code uses `ManuallyDrop` to avoid dropping the exported
+/// `ArrowArray` values after the call; this matches an ownership-transfer pattern typical of
+/// the Arrow C Data Interface (the runtime is expected to manage release thereafter).
 
 #[cfg(feature = "arrow-ipc")]
 mod arrow_bind {
