@@ -1,10 +1,10 @@
-# Velr (Rust driver)
+# Velr 
 
 Velr is an embedded property-graph database from Velr.ai, written in Rust, built on top of SQLite3 (persisting to a standard SQLite database file) and queried using the openCypher language.
 
 Vector data and time-series support are actively in development and will ship after openCypher support has stabilized.
 
-This crate provides the **Rust driver** for Velr. It links against a bundled native runtime with a C ABI, implemented in Rust.
+This crate provides the **Rust binding** for Velr. It links against a bundled native runtime with a C ABI, implemented in Rust.
 
 **Questions, feedback, or commercial licensing:** tomas@velr.ai
 
