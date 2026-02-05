@@ -78,13 +78,8 @@ Velr supports **most of openCypher**, but some features are not yet implemented.
 
 Notable missing features:
 
-* **Classic UNWIND list literals**, e.g. `UNWIND [1,2,3] AS r`
+* Remove clause
 
-  * Use **`UNWIND BIND('name') AS r`** instead, with data provided via:
-
-    * **Arrow** (`bind_arrow`, `bind_arrow_chunks`) 
-
-* **DELETE / DETACH DELETE / removal of nodes or edges** (any form of deleting)
 * **Patterns in `WHERE` clauses** (pattern predicates)
 
 ---
