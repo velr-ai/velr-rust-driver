@@ -219,6 +219,98 @@ fn tx_commit_rollback_savepoints_and_drop() -> velr::Result<()> {
     Ok(())
 }
 
+#[test]
+fn named_savepoints_can_rollback_to_earlier_marker() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let tx = db.begin_tx()?;
+
+    tx.savepoint_named("before_write1")?;
+    tx.run("CREATE (:T {k:'a'})")?;
+
+    tx.savepoint_named("before_write2")?;
+    tx.run("CREATE (:T {k:'b'})")?;
+
+    tx.rollback_to("before_write1")?;
+    tx.run("CREATE (:T {k:'c'})")?;
+
+    tx.commit()?;
+    Ok(())
+}
+
+#[test]
+fn named_savepoints_can_be_released_from_top_of_stack() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let tx = db.begin_tx()?;
+
+    tx.savepoint_named("before_write1")?;
+    tx.savepoint_named("before_write2")?;
+    tx.release_savepoint("before_write2")?;
+    tx.release_savepoint("before_write1")?;
+
+    tx.commit()?;
+    Ok(())
+}
+#[test]
+fn named_savepoint_rollback_to_earlier_marker_semantics() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let tx = db.begin_tx()?;
+
+    tx.savepoint_named("before_write1")?;
+    tx.run("CREATE (:T {k:'a'})")?;
+
+    tx.savepoint_named("before_write2")?;
+    tx.run("CREATE (:T {k:'b'})")?;
+
+    tx.rollback_to("before_write1")?;
+    tx.run("CREATE (:T {k:'c'})")?;
+
+    tx.release_savepoint("before_write1")?;
+    tx.commit()?;
+
+    let mut table = db.exec_one("MATCH (n:T) RETURN n.k AS k ORDER BY k")?;
+    let mut values = Vec::new();
+
+    table.for_each_row(|row| {
+        if let CellRef::Text(bytes) = row[0] {
+            values.push(std::str::from_utf8(bytes).unwrap().to_string());
+        }
+        Ok(())
+    })?;
+
+    assert_eq!(values, vec!["c"]);
+    Ok(())
+}
+
+#[test]
+fn scoped_savepoint_rollback_semantics() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let tx = db.begin_tx()?;
+
+    tx.run("CREATE (:T {k:'outer'})")?;
+
+    let sp = tx.savepoint()?;
+    tx.run("CREATE (:T {k:'inner'})")?;
+    sp.rollback()?;
+
+    tx.commit()?;
+
+    let mut table = db.exec_one("MATCH (n:T) RETURN n.k AS k ORDER BY k")?;
+    let mut values = Vec::new();
+
+    table.for_each_row(|row| {
+        match row[0] {
+            CellRef::Text(bytes) => {
+                values.push(std::str::from_utf8(bytes).unwrap().to_string());
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        Ok(())
+    })?;
+
+    assert_eq!(values, vec!["outer"]);
+    Ok(())
+}
+
 #[cfg(feature = "arrow-ipc")]
 mod arrow {
     use super::*;
@@ -294,6 +386,257 @@ mod arrow {
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[..6], b"ARROW1");
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+    use velr::Velr;
+
+    fn assert_trace_basic(
+        trace: &velr::ExplainTrace,
+        expected_cypher_fragment: &str,
+    ) -> velr::Result<()> {
+        let plan_count = trace.plan_count()?;
+        assert!(plan_count >= 1, "expected at least one plan");
+
+        let plan0 = trace.plan_meta(0)?;
+        assert!(
+            plan0.cypher.contains(expected_cypher_fragment),
+            "expected cypher to contain {:?}, got {:?}",
+            expected_cypher_fragment,
+            plan0.cypher
+        );
+
+        let step_count_via_meta = plan0.step_count;
+        let step_count_via_api = trace.step_count(0)?;
+        assert_eq!(step_count_via_meta, step_count_via_api);
+        assert!(step_count_via_api >= 1, "expected at least one step");
+
+        let compact_len = trace.compact_len()?;
+        let compact_bytes = trace.to_compact_bytes()?;
+        let compact_string = trace.to_compact_string()?;
+
+        assert_eq!(compact_len, compact_bytes.len());
+        assert_eq!(compact_bytes, compact_string.as_bytes());
+        assert!(
+            !compact_string.is_empty(),
+            "compact explain should not be empty"
+        );
+
+        // Snapshot should be internally consistent with the getter API.
+        let snap = trace.snapshot()?;
+        assert_eq!(snap.len(), plan_count);
+
+        let total_steps: usize = snap.iter().map(|p| p.steps.len()).sum();
+        assert!(
+            total_steps >= 1,
+            "snapshot should contain at least one step"
+        );
+
+        let total_statements: usize = snap
+            .iter()
+            .flat_map(|p| p.steps.iter())
+            .map(|s| s.statements.len())
+            .sum();
+        assert!(
+            total_statements >= 1,
+            "snapshot should contain at least one statement"
+        );
+
+        // Walk the raw metadata API too, and verify counts match.
+        for plan_idx in 0..plan_count {
+            let pm = trace.plan_meta(plan_idx)?;
+            assert_eq!(pm.step_count, trace.step_count(plan_idx)?);
+
+            for step_idx in 0..pm.step_count {
+                let sm = trace.step_meta(plan_idx, step_idx)?;
+                assert_eq!(
+                    sm.statement_count,
+                    trace.statement_count(plan_idx, step_idx)?
+                );
+
+                for stmt_idx in 0..sm.statement_count {
+                    let stm = trace.statement_meta(plan_idx, step_idx, stmt_idx)?;
+                    assert_eq!(
+                        stm.sqlite_plan_count,
+                        trace.sqlite_plan_count(plan_idx, step_idx, stmt_idx)?
+                    );
+                    assert!(
+                        !stm.sql.is_empty(),
+                        "statement sql should not be empty at {plan_idx}/{step_idx}/{stmt_idx}"
+                    );
+
+                    let details = trace.sqlite_plan_details(plan_idx, step_idx, stmt_idx)?;
+                    assert_eq!(details.len(), stm.sqlite_plan_count);
+
+                    for (detail_idx, d) in details.iter().enumerate() {
+                        let d2 =
+                            trace.sqlite_plan_detail(plan_idx, step_idx, stmt_idx, detail_idx)?;
+                        assert_eq!(&d2, d);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn explain_non_tx_snapshot_and_compact() -> velr::Result<()> {
+        let db = Velr::open(None)?;
+
+        db.run(
+            r#"
+            CREATE
+              (:Movie {title:'The Matrix', released:1999}),
+              (:Movie {title:'Inception', released:2010});
+            "#,
+        )?;
+
+        let q = "MATCH (m:Movie {title:'The Matrix'}) RETURN m.title AS title";
+        let trace = db.explain(q)?;
+
+        assert_trace_basic(&trace, "MATCH (m:Movie")?;
+
+        // Make sure snapshot contains something useful.
+        let snap = trace.snapshot()?;
+        assert!(!snap.is_empty());
+
+        let first_plan = &snap[0];
+        assert!(first_plan.meta.step_count >= 1);
+        assert!(first_plan.meta.cypher.contains("The Matrix"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn explain_analyze_non_tx_smoke() -> velr::Result<()> {
+        let db = Velr::open(None)?;
+
+        db.run(
+            r#"
+            CREATE
+              (:Movie {title:'The Matrix'}),
+              (:Movie {title:'Inception'}),
+              (:Movie {title:'Memento'});
+            "#,
+        )?;
+
+        let q = "MATCH (m:Movie) RETURN count(m) AS c";
+        let trace = db.explain_analyze(q)?;
+
+        assert_trace_basic(&trace, "MATCH (m:Movie)")?;
+
+        let compact = trace.to_compact_string()?;
+        assert!(
+            compact.contains("MATCH") || compact.contains("RETURN") || compact.contains("count"),
+            "compact explain did not contain expected query-related text: {compact:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn explain_tx_smoke() -> velr::Result<()> {
+        let db = Velr::open(None)?;
+
+        let tx = db.begin_tx()?;
+        tx.run("CREATE (:Temp {k:'inside_tx'})")?;
+
+        let q = "MATCH (t:Temp) RETURN count(t) AS c";
+        let trace = tx.explain(q)?;
+
+        assert_trace_basic(&trace, "MATCH (t:Temp)")?;
+
+        // The tx should still be usable after explain().
+        let mut t = tx.exec_one(q)?;
+        let mut got = None;
+        t.for_each_row(|r| {
+            match r[0] {
+                CellRef::Integer(i) => got = Some(i),
+                _ => panic!("expected integer count"),
+            }
+            Ok(())
+        })?;
+        assert_eq!(got, Some(1));
+
+        tx.rollback()?;
+        Ok(())
+    }
+
+    #[test]
+    fn explain_analyze_tx_smoke() -> velr::Result<()> {
+        let db = Velr::open(None)?;
+
+        let tx = db.begin_tx()?;
+        tx.run(
+            r#"
+            CREATE
+              (:X {v: 1}),
+              (:X {v: 2}),
+              (:X {v: 3});
+            "#,
+        )?;
+
+        let q = "MATCH (x:X) RETURN count(x) AS c";
+        let trace = tx.explain_analyze(q)?;
+
+        assert_trace_basic(&trace, "MATCH (x:X)")?;
+
+        let snap = trace.snapshot()?;
+        let stmt_count: usize = snap
+            .iter()
+            .flat_map(|p| p.steps.iter())
+            .map(|s| s.statements.len())
+            .sum();
+        assert!(stmt_count >= 1);
+
+        tx.rollback()?;
+        Ok(())
+    }
+
+    #[test]
+    fn explain_sqlite_detail_access_smoke() -> velr::Result<()> {
+        let db = Velr::open(None)?;
+
+        db.run(
+            r#"
+            CREATE
+              (:Movie {title:'The Matrix', released:1999}),
+              (:Movie {title:'Inception', released:2010});
+            "#,
+        )?;
+
+        let trace = db
+            .explain("MATCH (m:Movie) WHERE m.title = 'Inception' RETURN m.released AS released")?;
+
+        let mut found_statement = false;
+
+        for plan_idx in 0..trace.plan_count()? {
+            let step_count = trace.step_count(plan_idx)?;
+            for step_idx in 0..step_count {
+                let stmt_count = trace.statement_count(plan_idx, step_idx)?;
+                for stmt_idx in 0..stmt_count {
+                    let stmt = trace.statement_meta(plan_idx, step_idx, stmt_idx)?;
+                    if !stmt.sql.is_empty() {
+                        found_statement = true;
+
+                        let details = trace.sqlite_plan_details(plan_idx, step_idx, stmt_idx)?;
+                        for d in details {
+                            assert!(!d.is_empty(), "sqlite detail should not be empty");
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            found_statement,
+            "expected at least one non-empty SQL statement"
+        );
         Ok(())
     }
 }

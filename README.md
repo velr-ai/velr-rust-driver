@@ -12,12 +12,14 @@ This crate provides the **Rust binding** for Velr. It links against a bundled na
 
 ## Release status
 
-This release is **pre-beta**.
+This release is **alpha**.
 
 * The API and query support are still evolving.
-* **Beta is expected in Q1 - 2026**.
+* openCypher coverage is already substantial, but some features are still missing.
 
 If you hit a missing feature (see below), please reach out — it helps us prioritize.
+
+Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
 
 ---
 
@@ -78,9 +80,9 @@ Velr supports **most of openCypher**, but some features are not yet implemented.
 
 Notable missing features:
 
-* Remove clause
-
-* **Patterns in `WHERE` clauses** (pattern predicates)
+* `REMOVE` clause
+* Query parameters (for example `$name`)
+* The query planner does not yet use indexes in all cases where expected.
 
 ---
 
@@ -105,26 +107,55 @@ while let Some(mut table) = stream.next_table()? {
 ```
 
 ---
-
 ## Transactions and savepoints
+
+Velr supports transactions together with two kinds of savepoints:
+
+* **Scoped savepoints** via `savepoint()`, which return a guard
+* **Named savepoints** via `savepoint_named(name)`, which remain active in the transaction until released or the transaction ends
+
+Calling `rollback_to(name)` rolls back to the named savepoint, discards any newer named savepoints, and keeps the target savepoint active.
+
+### Scoped savepoint
 
 ```rust,no_run
 let db = Velr::open(None)?;
 
 let tx = db.begin_tx()?;
-tx.run("CREATE (:Temp {k:'t1'})")?;
+tx.run("CREATE (:Temp {k:'outer'})")?;
 
 {
-    let sp = tx.savepoint_named("sp1")?;
+    let sp = tx.savepoint()?;
     tx.run("CREATE (:Temp {k:'inner'})")?;
-    sp.rollback()?; // rollback to savepoint, then release it
+    sp.rollback()?; // rollback to the scoped savepoint
 }
 
 tx.commit()?;
+````
 
+### Named savepoints
+
+```rust,no_run
+let db = Velr::open(None)?;
+
+let tx = db.begin_tx()?;
+
+tx.savepoint_named("before_write1")?;
+tx.run("CREATE (:Temp {k:'a'})")?;
+
+tx.savepoint_named("before_write2")?;
+tx.run("CREATE (:Temp {k:'b'})")?;
+
+tx.rollback_to("before_write1")?;
+tx.run("CREATE (:Temp {k:'c'})")?;
+
+tx.release_savepoint("before_write1")?;
+tx.commit()?;
 ```
 
-Dropping an active transaction without `commit()` will roll it back (RAII).
+`release_savepoint(name)` currently releases the most recent active named savepoint.
+
+Dropping an active transaction without `commit()` will roll it back automatically.
 
 ---
 
@@ -193,21 +224,21 @@ This crate links against a bundled native runtime.
 
 Currently bundled targets:
 
-* macOS universal (arm64 + x86_64)
-* Linux x86_64
-* Linux aarch64
-* Windows x86_64
+    * macOS universal (arm64 + x86_64)
+    * Linux x86_64
+    * Linux aarch64
+    * Windows x86_64
 
 
 ---
 
-## License
+### Licensing 
 
-This project is licensed under the **Velr Beta Test License v1.0**.
+* The **Rust binding source code** in this package is licensed under **MIT**.
+* The **bundled native runtime binaries** may be **used and freely redistributed in unmodified form** under the terms of **`LICENSE.runtime`**.
 
-* Evaluation / beta use only
-* No production use
-* No redistribution
+See [`LICENSE`](LICENSE) and [`LICENSE.runtime`](LICENSE.runtime) for the full license texts.
 
-See [`LICENSE`](LICENSE) for the full terms.
+
+
 

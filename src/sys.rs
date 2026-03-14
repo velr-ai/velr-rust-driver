@@ -41,7 +41,8 @@ pub struct velr_cell {
 }
 /// Borrowed byte slice view (not NUL-terminated).
 ///
-/// Used for passing column names without allocating C strings.
+/// Used for passing UTF-8 names/strings without allocating C strings, and for returning borrowed
+/// string data from some ABI calls.
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
 #[repr(C)]
@@ -60,6 +61,40 @@ pub enum velr_code {
     VELR_EUTF = -2,
     VELR_ESTATE = -3,
     VELR_EERR = -4,
+}
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct velr_explain_trace;
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct velr_explain_plan_meta {
+    pub plan_id: velr_strview,
+    pub cypher: velr_strview,
+    pub step_count: usize,
+}
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct velr_explain_step_meta {
+    pub step_no: usize,
+    pub group_id: velr_strview,
+    pub op_index: velr_strview,
+    pub phase: velr_strview,
+    pub title: velr_strview,
+    pub source: velr_strview,
+    pub note: velr_strview,
+    pub statement_count: usize,
+}
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct velr_explain_stmt_meta {
+    pub stmt_id: velr_strview,
+    pub kind: velr_strview,
+    pub sql: velr_strview,
+    pub note: velr_strview,
+    pub sqlite_plan_count: usize,
 }
 /// Chunked Arrow column descriptor.
 ///

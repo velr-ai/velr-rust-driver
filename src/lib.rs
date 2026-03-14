@@ -10,11 +10,12 @@
 //! 1) [`Velr`] (the connection) is **`Send` + `!Sync`**.
 //!    - ✅ You may **move** a connection to another thread.
 //!      Example: spawn a worker thread and move the connection into it.
-//!    - ❌ You may **not share** a single connection across threads concurrently.
-//!      Example: `Arc<Velr>` won't compile.
+//!    - ❌ Wrapping a connection in `Arc` does not make it safe to share across threads;
+//!      `Velr` is `!Sync`, so concurrent shared use is not supported.
 //!
-//! 2) In-flight / borrowing objects are **`!Send` + `!Sync`** (thread-affine):
-//!    [`ExecTables`], [`TableResult`], [`RowIter`], [`VelrTx`], [`ExecTablesTx`], [`VelrSavepoint`].
+//! 2) In-flight / handle-based objects are **`!Send` + `!Sync`** (thread-affine):
+//!    [`ExecTables`], [`TableResult`], [`RowIter`], [`VelrTx`], [`ExecTablesTx`],
+//!    [`VelrSavepoint`], [`ExplainTrace`].
 //!    - ❌ You may not move these to another thread.
 //!    - ❌ You may not share these across threads.
 //!
@@ -48,7 +49,7 @@ mod runtime;
 mod sys;
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, CString},
     fmt,
     marker::PhantomData,
@@ -106,7 +107,20 @@ impl std::error::Error for Error {}
 fn velr_api() -> Result<&'static api::Api> {
     Ok(&runtime::runtime()?.api)
 }
-
+/*
+fn borrowed_bytes<'a>(ptr: *const u8, len: usize, what: &str) -> Result<&'a [u8]> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(Error::new(
+            ffi::velr_code::VELR_EERR as i32,
+            format!("{what} is null with non-zero length"),
+        ));
+    }
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+*/
 /// Convert an ABI-owned error string into a Rust [`String`], freeing it via the runtime.
 ///
 /// # Safety
@@ -127,6 +141,31 @@ unsafe fn take_err(p: *mut c_char) -> String {
     s
 }
 
+fn free_unexpected_err(err: *mut c_char) {
+    if !err.is_null() {
+        if let Ok(a) = velr_api() {
+            unsafe { (a.velr_string_free)(err) };
+        }
+    }
+}
+
+fn take_owned_bytes(a: &api::Api, ptr: *mut u8, len: usize, what: &str) -> Result<Vec<u8>> {
+    if ptr.is_null() {
+        return if len == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                format!("{what} returned null pointer with non-zero length"),
+            ))
+        };
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+    unsafe { (a.velr_free)(ptr, len) };
+    Ok(bytes)
+}
+
 /// Convert a Velr return code plus optional error string into [`Result<()>`].
 ///
 /// On success, frees `err` if it is unexpectedly non-null. On failure, converts `err` into an
@@ -134,16 +173,473 @@ unsafe fn take_err(p: *mut c_char) -> String {
 fn rc_to_result(rc: ffi::velr_code, err: *mut c_char) -> Result<()> {
     let code = rc as i32;
     if code == ffi::velr_code::VELR_OK as i32 {
-        // usually err is null on OK, but be defensive
-        if !err.is_null() {
-            if let Ok(a) = velr_api() {
-                unsafe { (a.velr_string_free)(err) };
-            }
-        }
+        free_unexpected_err(err);
         Ok(())
     } else {
         let msg = unsafe { take_err(err) };
         Err(Error::new(code, msg))
+    }
+}
+
+fn rc_to_result_noerr(rc: ffi::velr_code, context: impl Into<String>) -> Result<()> {
+    let code = rc as i32;
+    if code == ffi::velr_code::VELR_OK as i32 {
+        Ok(())
+    } else {
+        Err(Error::new(code, context.into()))
+    }
+}
+
+fn strview_to_string(v: ffi::velr_strview, what: &str) -> Result<String> {
+    if v.len == 0 {
+        return Ok(String::new());
+    }
+    if v.ptr.is_null() {
+        return Err(Error::new(
+            ffi::velr_code::VELR_EERR as i32,
+            format!("{what} is null with non-zero length"),
+        ));
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(v.ptr, v.len) };
+    let s = std::str::from_utf8(bytes).map_err(|_| {
+        Error::new(
+            ffi::velr_code::VELR_EUTF as i32,
+            format!("{what} is not valid UTF-8"),
+        )
+    })?;
+    Ok(s.to_string())
+}
+
+fn opt_strview_to_string(v: ffi::velr_strview, what: &str) -> Result<Option<String>> {
+    if v.ptr.is_null() && v.len == 0 {
+        return Ok(None);
+    }
+    Ok(Some(strview_to_string(v, what)?))
+}
+
+/// Owned plan metadata returned from an [`ExplainTrace`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainPlanMeta {
+    pub plan_id: String,
+    pub cypher: String,
+    pub step_count: usize,
+}
+
+/// Owned step metadata returned from an [`ExplainTrace`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainStepMeta {
+    pub step_no: usize,
+    pub group_id: String,
+    pub op_index: String,
+    pub phase: String,
+    pub title: String,
+    pub source: String,
+    pub note: Option<String>,
+    pub statement_count: usize,
+}
+
+/// Owned statement metadata returned from an [`ExplainTrace`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainStatementMeta {
+    pub stmt_id: String,
+    pub kind: String,
+    pub sql: String,
+    pub note: Option<String>,
+    pub sqlite_plan_count: usize,
+}
+
+/// One explain statement plus its SQLite query-plan detail lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainStatement {
+    pub meta: ExplainStatementMeta,
+    pub sqlite_plan: Vec<String>,
+}
+
+/// One explain step plus all statements in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainStep {
+    pub meta: ExplainStepMeta,
+    pub statements: Vec<ExplainStatement>,
+}
+
+/// One explain plan plus all steps in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainPlan {
+    pub meta: ExplainPlanMeta,
+    pub steps: Vec<ExplainStep>,
+}
+
+/// EXPLAIN / EXPLAIN ANALYZE trace handle.
+///
+/// This is an in-flight type and is **`!Send` + `!Sync`** (thread-affine).
+/// Dropping it closes the underlying runtime trace handle.
+///
+/// All strings exposed by this type are copied into owned Rust `String`s before being returned.
+pub struct ExplainTrace {
+    trace: NonNull<ffi::velr_explain_trace>,
+    _nosend: PhantomData<Rc<()>>, // !Send + !Sync
+}
+
+impl ExplainTrace {
+    fn from_raw(ptr: *mut ffi::velr_explain_trace) -> Result<Self> {
+        let trace = NonNull::new(ptr).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "runtime returned null explain trace",
+            )
+        })?;
+
+        Ok(Self {
+            trace,
+            _nosend: PhantomData,
+        })
+    }
+
+    /// Return the number of top-level plans in this trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the runtime API cannot be loaded.
+    pub fn plan_count(&self) -> Result<usize> {
+        let a = velr_api()?;
+        Ok(unsafe { (a.velr_explain_trace_plan_count)(self.trace.as_ptr()) })
+    }
+
+    /// Fetch metadata for one plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - the runtime API cannot be loaded
+    /// - `plan_idx` is out of range
+    /// - returned string fields are not valid UTF-8
+    pub fn plan_meta(&self, plan_idx: usize) -> Result<ExplainPlanMeta> {
+        let a = velr_api()?;
+        let mut out = std::mem::MaybeUninit::<ffi::velr_explain_plan_meta>::uninit();
+
+        let rc = unsafe {
+            (a.velr_explain_trace_plan_meta)(self.trace.as_ptr(), plan_idx, out.as_mut_ptr())
+        };
+        rc_to_result_noerr(
+            rc,
+            format!("velr_explain_trace_plan_meta failed at plan_idx={plan_idx}"),
+        )?;
+
+        let out = unsafe { out.assume_init() };
+        Ok(ExplainPlanMeta {
+            plan_id: strview_to_string(out.plan_id, "plan_id")?,
+            cypher: strview_to_string(out.cypher, "cypher")?,
+            step_count: out.step_count,
+        })
+    }
+
+    /// Return the number of steps in a plan.
+    ///
+    /// This is a convenience wrapper over [`ExplainTrace::plan_meta`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if `plan_idx` is out of range or metadata decoding fails.
+    pub fn step_count(&self, plan_idx: usize) -> Result<usize> {
+        Ok(self.plan_meta(plan_idx)?.step_count)
+    }
+
+    /// Fetch metadata for one step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - the runtime API cannot be loaded
+    /// - `plan_idx` or `step_idx` is out of range
+    /// - returned string fields are not valid UTF-8
+    pub fn step_meta(&self, plan_idx: usize, step_idx: usize) -> Result<ExplainStepMeta> {
+        let a = velr_api()?;
+        let mut out = std::mem::MaybeUninit::<ffi::velr_explain_step_meta>::uninit();
+
+        let rc = unsafe {
+            (a.velr_explain_trace_step_meta)(
+                self.trace.as_ptr(),
+                plan_idx,
+                step_idx,
+                out.as_mut_ptr(),
+            )
+        };
+        rc_to_result_noerr(
+            rc,
+            format!(
+                "velr_explain_trace_step_meta failed at plan_idx={plan_idx}, step_idx={step_idx}"
+            ),
+        )?;
+
+        let out = unsafe { out.assume_init() };
+        Ok(ExplainStepMeta {
+            step_no: out.step_no,
+            group_id: strview_to_string(out.group_id, "group_id")?,
+            op_index: strview_to_string(out.op_index, "op_index")?,
+            phase: strview_to_string(out.phase, "phase")?,
+            title: strview_to_string(out.title, "title")?,
+            source: strview_to_string(out.source, "source")?,
+            note: opt_strview_to_string(out.note, "step.note")?,
+            statement_count: out.statement_count,
+        })
+    }
+
+    /// Return the number of statements in a step.
+    ///
+    /// This is a convenience wrapper over [`ExplainTrace::step_meta`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if `plan_idx` / `step_idx` are out of range or metadata decoding fails.
+    pub fn statement_count(&self, plan_idx: usize, step_idx: usize) -> Result<usize> {
+        Ok(self.step_meta(plan_idx, step_idx)?.statement_count)
+    }
+
+    /// Fetch metadata for one statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - the runtime API cannot be loaded
+    /// - `plan_idx`, `step_idx`, or `stmt_idx` is out of range
+    /// - returned string fields are not valid UTF-8
+    pub fn statement_meta(
+        &self,
+        plan_idx: usize,
+        step_idx: usize,
+        stmt_idx: usize,
+    ) -> Result<ExplainStatementMeta> {
+        let a = velr_api()?;
+        let mut out = std::mem::MaybeUninit::<ffi::velr_explain_stmt_meta>::uninit();
+
+        let rc = unsafe {
+            (a.velr_explain_trace_statement_meta)(
+                self.trace.as_ptr(),
+                plan_idx,
+                step_idx,
+                stmt_idx,
+                out.as_mut_ptr(),
+            )
+        };
+        rc_to_result_noerr(
+            rc,
+            format!(
+                "velr_explain_trace_statement_meta failed at plan_idx={plan_idx}, step_idx={step_idx}, stmt_idx={stmt_idx}"
+            ),
+        )?;
+
+        let out = unsafe { out.assume_init() };
+        Ok(ExplainStatementMeta {
+            stmt_id: strview_to_string(out.stmt_id, "stmt_id")?,
+            kind: strview_to_string(out.kind, "kind")?,
+            sql: strview_to_string(out.sql, "sql")?,
+            note: opt_strview_to_string(out.note, "statement.note")?,
+            sqlite_plan_count: out.sqlite_plan_count,
+        })
+    }
+
+    /// Return the number of SQLite query-plan detail lines for one statement.
+    ///
+    /// This is a convenience wrapper over [`ExplainTrace::statement_meta`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if indices are out of range or metadata decoding fails.
+    pub fn sqlite_plan_count(
+        &self,
+        plan_idx: usize,
+        step_idx: usize,
+        stmt_idx: usize,
+    ) -> Result<usize> {
+        Ok(self
+            .statement_meta(plan_idx, step_idx, stmt_idx)?
+            .sqlite_plan_count)
+    }
+
+    /// Fetch one SQLite query-plan detail line.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - the runtime API cannot be loaded
+    /// - any index is out of range
+    /// - the returned detail line is not valid UTF-8
+    pub fn sqlite_plan_detail(
+        &self,
+        plan_idx: usize,
+        step_idx: usize,
+        stmt_idx: usize,
+        detail_idx: usize,
+    ) -> Result<String> {
+        let a = velr_api()?;
+        let mut out = std::mem::MaybeUninit::<ffi::velr_strview>::uninit();
+
+        let rc = unsafe {
+            (a.velr_explain_trace_sqlite_plan_detail)(
+                self.trace.as_ptr(),
+                plan_idx,
+                step_idx,
+                stmt_idx,
+                detail_idx,
+                out.as_mut_ptr(),
+            )
+        };
+        rc_to_result_noerr(
+            rc,
+            format!(
+                "velr_explain_trace_sqlite_plan_detail failed at plan_idx={plan_idx}, step_idx={step_idx}, stmt_idx={stmt_idx}, detail_idx={detail_idx}"
+            ),
+        )?;
+
+        let out = unsafe { out.assume_init() };
+        strview_to_string(out, "sqlite_plan_detail")
+    }
+
+    /// Fetch all SQLite query-plan detail lines for one statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if indices are out of range or any returned detail line
+    /// cannot be decoded.
+    pub fn sqlite_plan_details(
+        &self,
+        plan_idx: usize,
+        step_idx: usize,
+        stmt_idx: usize,
+    ) -> Result<Vec<String>> {
+        let n = self.sqlite_plan_count(plan_idx, step_idx, stmt_idx)?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(self.sqlite_plan_detail(plan_idx, step_idx, stmt_idx, i)?);
+        }
+        Ok(out)
+    }
+
+    /// Materialize the entire trace into owned Rust structs.
+    ///
+    /// This walks all plans, steps, statements, and SQLite plan details and returns
+    /// a fully owned snapshot detached from the borrowed runtime string views.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if any nested metadata/detail lookup fails.
+    pub fn snapshot(&self) -> Result<Vec<ExplainPlan>> {
+        let plan_count = self.plan_count()?;
+        let mut plans = Vec::with_capacity(plan_count);
+
+        for plan_idx in 0..plan_count {
+            let plan_meta = self.plan_meta(plan_idx)?;
+            let mut steps = Vec::with_capacity(plan_meta.step_count);
+
+            for step_idx in 0..plan_meta.step_count {
+                let step_meta = self.step_meta(plan_idx, step_idx)?;
+                let mut statements = Vec::with_capacity(step_meta.statement_count);
+
+                for stmt_idx in 0..step_meta.statement_count {
+                    let stmt_meta = self.statement_meta(plan_idx, step_idx, stmt_idx)?;
+                    let sqlite_plan = self.sqlite_plan_details(plan_idx, step_idx, stmt_idx)?;
+                    statements.push(ExplainStatement {
+                        meta: stmt_meta,
+                        sqlite_plan,
+                    });
+                }
+
+                steps.push(ExplainStep {
+                    meta: step_meta,
+                    statements,
+                });
+            }
+
+            plans.push(ExplainPlan {
+                meta: plan_meta,
+                steps,
+            });
+        }
+
+        Ok(plans)
+    }
+
+    /// Return the size in bytes of the compact rendering.
+    ///
+    /// The compact rendering is UTF-8 text, but this method returns the raw byte count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the runtime API cannot be loaded or the runtime
+    /// fails to render the compact form.
+    pub fn compact_len(&self) -> Result<usize> {
+        let a = velr_api()?;
+        let mut len: usize = 0;
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc =
+            unsafe { (a.velr_explain_trace_compact_len)(self.trace.as_ptr(), &mut len, &mut err) };
+        rc_to_result(rc, err)?;
+        Ok(len)
+    }
+
+    /// Render the trace to compact UTF-8 bytes.
+    ///
+    /// The returned bytes are owned by Rust and independent of the runtime buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - the runtime API cannot be loaded
+    /// - the runtime fails to render the compact form
+    /// - the runtime returns an invalid null/non-null pointer + length combination
+    pub fn to_compact_bytes(&self) -> Result<Vec<u8>> {
+        let a = velr_api()?;
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe {
+            (a.velr_explain_trace_compact_malloc)(self.trace.as_ptr(), &mut ptr, &mut len, &mut err)
+        };
+        rc_to_result(rc, err)?;
+        take_owned_bytes(a, ptr, len, "velr_explain_trace_compact_malloc")
+    }
+
+    /// Render the trace to a compact UTF-8 string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the compact rendering cannot be produced or if the
+    /// returned bytes are not valid UTF-8.
+    pub fn to_compact_string(&self) -> Result<String> {
+        let bytes = self.to_compact_bytes()?;
+        let s = String::from_utf8(bytes).map_err(|e| {
+            Error::new(
+                ffi::velr_code::VELR_EUTF as i32,
+                format!("compact explain is not valid UTF-8: {e}"),
+            )
+        })?;
+        Ok(s)
+    }
+
+    /// Write the compact rendering into any Rust writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if rendering fails or if writing to `out` fails.
+    pub fn write_compact(&self, mut out: impl std::io::Write) -> Result<()> {
+        let bytes = self.to_compact_bytes()?;
+        out.write_all(&bytes).map_err(|e| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                format!("failed to write compact explain: {e}"),
+            )
+        })
+    }
+}
+
+impl Drop for ExplainTrace {
+    fn drop(&mut self) {
+        if let Ok(a) = velr_api() {
+            unsafe { (a.velr_explain_trace_close)(self.trace.as_ptr()) };
+        }
     }
 }
 
@@ -312,6 +808,55 @@ impl Velr {
         Ok(())
     }
 
+    /// Build an EXPLAIN trace for `openCypher`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - `openCypher` contains an interior NUL (`\0`)
+    /// - the runtime reports a planning/explain error
+    pub fn explain(&self, cypher: &str) -> Result<ExplainTrace> {
+        let a = velr_api()?;
+
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+
+        let mut out_trace: *mut ffi::velr_explain_trace = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc =
+            unsafe { (a.velr_explain)(self.db.as_ptr(), cy.as_ptr(), &mut out_trace, &mut err) };
+        rc_to_result(rc, err)?;
+        ExplainTrace::from_raw(out_trace)
+    }
+
+    /// Build an EXPLAIN ANALYZE trace for `openCypher`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - `openCypher` contains an interior NUL (`\0`)
+    /// - the runtime reports a planning/explain error
+    pub fn explain_analyze(&self, cypher: &str) -> Result<ExplainTrace> {
+        let a = velr_api()?;
+
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+
+        let mut out_trace: *mut ffi::velr_explain_trace = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe {
+            (a.velr_explain_analyze)(self.db.as_ptr(), cy.as_ptr(), &mut out_trace, &mut err)
+        };
+        rc_to_result(rc, err)?;
+        ExplainTrace::from_raw(out_trace)
+    }
+
+    /// Begin a transaction.
+    ///
+    /// The transaction handle is closed automatically on drop. To explicitly finalize a
+    /// transaction, use [`VelrTx::commit`] or [`VelrTx::rollback`].
     /// Begin a transaction.
     ///
     /// The transaction handle is closed automatically on drop. To explicitly finalize a
@@ -334,6 +879,7 @@ impl Velr {
 
         Ok(VelrTx {
             tx: Some(nn),
+            named_savepoints: RefCell::new(Vec::new()),
             _db: PhantomData,
             _nosend: PhantomData,
         })
@@ -475,35 +1021,58 @@ impl TableResult {
         let table = NonNull::new(ptr)
             .ok_or_else(|| Error::new(ffi::velr_code::VELR_EERR as i32, "null table"))?;
 
-        let col_count = unsafe { (a.velr_table_column_count)(table.as_ptr()) };
+        let build = (|| -> Result<(Vec<String>, usize)> {
+            let col_count = unsafe { (a.velr_table_column_count)(table.as_ptr()) };
 
-        let mut names = Vec::with_capacity(col_count);
-        for i in 0..col_count {
-            let mut p: *const u8 = std::ptr::null();
-            let mut len: usize = 0;
+            let mut names = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                let mut p: *const u8 = std::ptr::null();
+                let mut len: usize = 0;
 
-            let rc = unsafe { (a.velr_table_column_name)(table.as_ptr(), i, &mut p, &mut len) };
+                let rc = unsafe { (a.velr_table_column_name)(table.as_ptr(), i, &mut p, &mut len) };
 
-            if rc as i32 != ffi::velr_code::VELR_OK as i32 {
-                return Err(Error::new(
-                    rc as i32,
-                    format!("velr_table_column_name failed at idx={i}"),
-                ));
+                if rc as i32 != ffi::velr_code::VELR_OK as i32 {
+                    return Err(Error::new(
+                        rc as i32,
+                        format!("velr_table_column_name failed at idx={i}"),
+                    ));
+                }
+
+                let bytes: &[u8] = if len == 0 {
+                    &[]
+                } else if p.is_null() {
+                    return Err(Error::new(
+                        ffi::velr_code::VELR_EERR as i32,
+                        format!("column name at idx={i} is null with non-zero length"),
+                    ));
+                } else {
+                    unsafe { std::slice::from_raw_parts(p, len) }
+                };
+
+                let s = std::str::from_utf8(bytes).map_err(|_| {
+                    Error::new(
+                        ffi::velr_code::VELR_EUTF as i32,
+                        format!("column name at idx={i} is not valid UTF-8"),
+                    )
+                })?;
+                names.push(s.to_string());
             }
 
-            let bytes = unsafe { std::slice::from_raw_parts(p, len) };
-            let s = std::str::from_utf8(bytes).map_err(|_| {
-                Error::new(ffi::velr_code::VELR_EUTF as i32, "column name not utf-8")
-            })?;
-            names.push(s.to_string());
-        }
+            Ok((names, col_count))
+        })();
 
-        Ok(Self {
-            table,
-            col_names: names,
-            col_count,
-            _nosend: PhantomData,
-        })
+        match build {
+            Ok((col_names, col_count)) => Ok(Self {
+                table,
+                col_names,
+                col_count,
+                _nosend: PhantomData,
+            }),
+            Err(e) => {
+                unsafe { (a.velr_table_close)(table.as_ptr()) };
+                Err(e)
+            }
+        }
     }
 
     /// Return the column names for this table.
@@ -518,6 +1087,7 @@ impl TableResult {
 
     /// Open a row iterator for this table.
     ///
+    /// This requires `&mut self`, so only one active row iterator may exist for a table at a time.
     /// Row iteration is callback-based via [`RowIter::next`], producing a borrowed slice of
     /// [`CellRef`] for each row.
     ///
@@ -600,14 +1170,7 @@ impl TableResult {
             (a.velr_table_ipc_file_malloc)(self.table.as_ptr(), &mut ptr, &mut len, &mut err)
         };
         rc_to_result(rc, err)?;
-
-        if ptr.is_null() {
-            return Ok(Vec::new());
-        }
-
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-        unsafe { (a.velr_free)(ptr, len) };
-        Ok(bytes)
+        take_owned_bytes(a, ptr, len, "velr_table_ipc_file_malloc")
     }
 }
 
@@ -675,11 +1238,27 @@ impl<'t> RowIter<'t> {
         };
 
         if rc == 0 {
+            free_unexpected_err(err);
+            unsafe { (a.velr_rows_close)(rows.as_ptr()) };
+            self.rows = None;
             return Ok(false);
         }
         if rc < 0 {
             let msg = unsafe { take_err(err) };
             return Err(Error::new(rc, msg));
+        }
+
+        free_unexpected_err(err);
+
+        if written > self.buf.len() {
+            return Err(Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                format!(
+                    "velr_rows_next reported {} cells, buffer holds {}",
+                    written,
+                    self.buf.len()
+                ),
+            ));
         }
 
         let mut scratch: Vec<CellRef<'_>> = Vec::with_capacity(written);
@@ -689,12 +1268,32 @@ impl<'t> RowIter<'t> {
                 ffi::velr_cell_type::VELR_BOOL => CellRef::Bool(c.i64_ != 0),
                 ffi::velr_cell_type::VELR_INT64 => CellRef::Integer(c.i64_),
                 ffi::velr_cell_type::VELR_DOUBLE => CellRef::Float(c.f64_),
+
                 ffi::velr_cell_type::VELR_TEXT => {
-                    let b = unsafe { std::slice::from_raw_parts(c.ptr, c.len) };
+                    let b: &[u8] = if c.len == 0 {
+                        &[]
+                    } else if c.ptr.is_null() {
+                        return Err(Error::new(
+                            ffi::velr_code::VELR_EERR as i32,
+                            "VELR_TEXT cell had null pointer with non-zero length",
+                        ));
+                    } else {
+                        unsafe { std::slice::from_raw_parts(c.ptr, c.len) }
+                    };
                     CellRef::Text(b)
                 }
+
                 ffi::velr_cell_type::VELR_JSON => {
-                    let b = unsafe { std::slice::from_raw_parts(c.ptr, c.len) };
+                    let b: &[u8] = if c.len == 0 {
+                        &[]
+                    } else if c.ptr.is_null() {
+                        return Err(Error::new(
+                            ffi::velr_code::VELR_EERR as i32,
+                            "VELR_JSON cell had null pointer with non-zero length",
+                        ));
+                    } else {
+                        unsafe { std::slice::from_raw_parts(c.ptr, c.len) }
+                    };
                     CellRef::Json(b)
                 }
             };
@@ -716,6 +1315,11 @@ impl Drop for RowIter<'_> {
     }
 }
 
+#[derive(Debug)]
+struct NamedSavepoint {
+    name: String,
+    sp: NonNull<ffi::velr_sp>,
+}
 // -------------------------- Transactions --------------------------
 //
 
@@ -730,6 +1334,7 @@ impl Drop for RowIter<'_> {
 /// If a transaction is dropped without an explicit commit/rollback, the runtime rolls it back.
 pub struct VelrTx<'db> {
     tx: Option<NonNull<ffi::velr_tx>>,
+    named_savepoints: RefCell<Vec<NamedSavepoint>>,
     _db: PhantomData<&'db Velr>,
     _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
@@ -740,8 +1345,15 @@ impl<'db> VelrTx<'db> {
             .ok_or_else(|| Error::new(ffi::velr_code::VELR_ESTATE as i32, "tx already consumed"))
     }
 
+    fn find_named_index(&self, name: &str) -> Option<usize> {
+        self.named_savepoints
+            .borrow()
+            .iter()
+            .position(|sp| sp.name == name)
+    }
+
     /// Execute `openCypher` within this transaction and return a stream of result tables.
-    ///  
+    ///
     /// See [`Velr::exec`] for general streaming semantics.
     pub fn exec<'tx>(&'tx self, cypher: &str) -> Result<ExecTablesTx<'tx>> {
         let a = velr_api()?;
@@ -804,6 +1416,52 @@ impl<'db> VelrTx<'db> {
         Ok(())
     }
 
+    /// Build an EXPLAIN trace for `openCypher`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - `openCypher` contains an interior NUL (`\0`)
+    /// - the runtime reports a planning/explain error
+    pub fn explain(&self, cypher: &str) -> Result<ExplainTrace> {
+        let a = velr_api()?;
+        let tx = self.ptr()?;
+
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+
+        let mut out_trace: *mut ffi::velr_explain_trace = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe { (a.velr_tx_explain)(tx.as_ptr(), cy.as_ptr(), &mut out_trace, &mut err) };
+        rc_to_result(rc, err)?;
+        ExplainTrace::from_raw(out_trace)
+    }
+
+    /// Build an EXPLAIN ANALYZE trace for `openCypher`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - `openCypher` contains an interior NUL (`\0`)
+    /// - the runtime reports a planning/explain error
+    pub fn explain_analyze(&self, cypher: &str) -> Result<ExplainTrace> {
+        let a = velr_api()?;
+        let tx = self.ptr()?;
+
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+
+        let mut out_trace: *mut ffi::velr_explain_trace = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe {
+            (a.velr_tx_explain_analyze)(tx.as_ptr(), cy.as_ptr(), &mut out_trace, &mut err)
+        };
+        rc_to_result(rc, err)?;
+        ExplainTrace::from_raw(out_trace)
+    }
+
     /// Commit this transaction.
     ///
     /// Consumes the transaction handle. After this call, the transaction is finalized and cannot be
@@ -812,6 +1470,9 @@ impl<'db> VelrTx<'db> {
     /// Note: the underlying C ABI consumes the transaction handle even if an error is returned.
     pub fn commit(mut self) -> Result<()> {
         let a = velr_api()?;
+
+        // After commit the runtime transaction owns final cleanup of any outstanding named savepoints.
+        self.named_savepoints.get_mut().clear();
 
         let tx = self
             .tx
@@ -832,6 +1493,9 @@ impl<'db> VelrTx<'db> {
     pub fn rollback(mut self) -> Result<()> {
         let a = velr_api()?;
 
+        // After rollback the runtime transaction owns final cleanup of any outstanding named savepoints.
+        self.named_savepoints.get_mut().clear();
+
         let tx = self
             .tx
             .take()
@@ -842,13 +1506,39 @@ impl<'db> VelrTx<'db> {
         rc_to_result(rc, err)
     }
 
-    /// Create an unnamed savepoint inside this transaction.
+    fn create_named_savepoint_raw(&self, name: &str) -> Result<NonNull<ffi::velr_sp>> {
+        let a = velr_api()?;
+        let tx = self.ptr()?;
+
+        let cname = CString::new(name).map_err(|_| {
+            Error::new(
+                ffi::velr_code::VELR_EUTF as i32,
+                "savepoint name contains NUL",
+            )
+        })?;
+
+        let mut out_sp: *mut ffi::velr_sp = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe {
+            (a.velr_tx_savepoint_named)(tx.as_ptr(), cname.as_ptr(), &mut out_sp, &mut err)
+        };
+        rc_to_result(rc, err)?;
+
+        NonNull::new(out_sp).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "savepoint_named returned null",
+            )
+        })
+    }
+
+    /// Create an unnamed scoped savepoint inside this transaction.
     ///
-    /// The savepoint handle can be released ([`VelrSavepoint::release`]) or rolled back to
-    /// ([`VelrSavepoint::rollback`]).
-    ///
-    /// If the savepoint is dropped without explicit release/rollback, the runtime rolls back to the
-    /// savepoint and releases it.
+    /// The returned handle is RAII-managed:
+    /// - call [`VelrSavepoint::release`] to keep the work since the savepoint
+    /// - call [`VelrSavepoint::rollback`] to undo back to the savepoint
+    /// - dropping the handle rolls back to the savepoint and releases it
     pub fn savepoint<'tx>(&'tx self) -> Result<VelrSavepoint<'tx>> {
         let a = velr_api()?;
 
@@ -870,61 +1560,115 @@ impl<'db> VelrTx<'db> {
         })
     }
 
-    /// Create a named savepoint inside this transaction.
+    /// Create a detached named savepoint inside this transaction.
     ///
-    /// `name` must not contain interior NUL bytes (it is passed to the runtime as a C string).
+    /// Unlike [`VelrTx::savepoint`], this does not return a guard. The named savepoint remains
+    /// active in the transaction until:
+    /// - [`VelrTx::rollback_to`] rolls back to it
+    /// - [`VelrTx::release_savepoint`] explicitly releases it
+    /// - the transaction is committed, rolled back, or dropped
     ///
-    /// If the savepoint is dropped without explicit release/rollback, the runtime rolls back to the
-    /// savepoint and releases it.
-    pub fn savepoint_named<'tx>(&'tx self, name: &str) -> Result<VelrSavepoint<'tx>> {
-        let a = velr_api()?;
+    /// Active names must be unique within the transaction.
+    pub fn savepoint_named(&self, name: &str) -> Result<()> {
+        if self.find_named_index(name).is_some() {
+            return Err(Error::new(
+                ffi::velr_code::VELR_ESTATE as i32,
+                format!("named savepoint {name:?} already exists"),
+            ));
+        }
 
-        let tx = self.ptr()?;
-        let cname = CString::new(name).map_err(|_| {
-            Error::new(
-                ffi::velr_code::VELR_EUTF as i32,
-                "savepoint name contains NUL",
-            )
-        })?;
+        let sp = self.create_named_savepoint_raw(name)?;
 
-        let mut out_sp: *mut ffi::velr_sp = std::ptr::null_mut();
-        let mut err: *mut c_char = std::ptr::null_mut();
+        self.named_savepoints.borrow_mut().push(NamedSavepoint {
+            name: name.to_string(),
+            sp,
+        });
 
-        let rc = unsafe {
-            (a.velr_tx_savepoint_named)(tx.as_ptr(), cname.as_ptr(), &mut out_sp, &mut err)
-        };
-        rc_to_result(rc, err)?;
-
-        let nn = NonNull::new(out_sp).ok_or_else(|| {
-            Error::new(
-                ffi::velr_code::VELR_EERR as i32,
-                "savepoint_named returned null",
-            )
-        })?;
-
-        Ok(VelrSavepoint {
-            sp: Some(nn),
-            _tx: PhantomData,
-            _nosend: PhantomData,
-        })
+        Ok(())
     }
 
-    /// Roll back to a named savepoint and release it.
+    /// Roll back to a previously-created named savepoint.
     ///
-    /// `name` must not contain interior NUL bytes (it is passed to the runtime as a C string).
+    /// Driver semantics:
+    /// - all newer named savepoints are discarded
+    /// - the target named savepoint remains active after rollback
+    ///
+    /// This is implemented using the stored savepoint handle, because the runtime's
+    /// `velr_tx_rollback_to(...)` is not guaranteed to interoperate with savepoints
+    /// created through `velr_tx_savepoint_named(...)`.
     pub fn rollback_to(&self, name: &str) -> Result<()> {
-        let a = velr_api()?;
-
-        let tx = self.ptr()?;
-        let cname = CString::new(name).map_err(|_| {
+        let idx = self.find_named_index(name).ok_or_else(|| {
             Error::new(
-                ffi::velr_code::VELR_EUTF as i32,
-                "savepoint name contains NUL",
+                ffi::velr_code::VELR_ESTATE as i32,
+                format!("no such active named savepoint {name:?}"),
             )
         })?;
 
+        let target_name = {
+            let named = self.named_savepoints.borrow();
+            named[idx].name.clone()
+        };
+
+        let target_sp = {
+            let named = self.named_savepoints.borrow();
+            named[idx].sp
+        };
+
+        // Roll back using the savepoint handle itself. This consumes the runtime savepoint
+        // and invalidates any newer savepoints as part of the rollback.
+        let a = velr_api()?;
         let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe { (a.velr_tx_rollback_to)(tx.as_ptr(), cname.as_ptr(), &mut err) };
+        let rc = unsafe { (a.velr_sp_rollback)(target_sp.as_ptr(), &mut err) };
+        rc_to_result(rc, err)?;
+
+        // After a successful rollback:
+        // - savepoints before idx are still valid
+        // - the target savepoint handle is consumed
+        // - newer savepoints are invalid
+        {
+            let mut named = self.named_savepoints.borrow_mut();
+            named.truncate(idx);
+        }
+
+        // Recreate the target savepoint so it remains active after rollback.
+        // This matches the external API semantics we want.
+        let recreated = self.create_named_savepoint_raw(&target_name)?;
+        self.named_savepoints.borrow_mut().push(NamedSavepoint {
+            name: target_name,
+            sp: recreated,
+        });
+
+        Ok(())
+    }
+
+    /// Release the most recently-created active named savepoint.
+    ///
+    /// Releasing a non-topmost named savepoint is intentionally rejected here to keep the driver
+    /// semantics simple and well-defined.
+    pub fn release_savepoint(&self, name: &str) -> Result<()> {
+        let a = velr_api()?;
+
+        let mut named = self.named_savepoints.borrow_mut();
+        let last_idx = named.len().checked_sub(1).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_ESTATE as i32,
+                "no active named savepoints",
+            )
+        })?;
+
+        if named[last_idx].name != name {
+            return Err(Error::new(
+                ffi::velr_code::VELR_ESTATE as i32,
+                format!(
+                    "release_savepoint({name:?}) requires {name:?} to be the most recent active named savepoint"
+                ),
+            ));
+        }
+
+        let entry = named.pop().unwrap();
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { (a.velr_sp_release)(entry.sp.as_ptr(), &mut err) };
         rc_to_result(rc, err)
     }
 
@@ -932,7 +1676,8 @@ impl<'db> VelrTx<'db> {
     ///
     /// Available only when built with the `arrow-ipc` feature.
     ///
-    /// This transfers ownership of the provided Arrow arrays into Velr for the lifetime of the bind.
+    /// This consumes the exported ArrowArray values at the ABI boundary.
+    /// Callers must not reuse or release those exported ArrowArray values after the call.
     /// (At the ABI level, the ArrowArray structs are consumed during the call.)
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow(
@@ -969,6 +1714,10 @@ impl<'db> VelrTx<'db> {
 impl Drop for VelrTx<'_> {
     /// Close the transaction handle if still open.
     fn drop(&mut self) {
+        // Do not attempt to individually close named savepoints here; the transaction finalization
+        // owns that cleanup.
+        self.named_savepoints.get_mut().clear();
+
         if let Some(tx) = self.tx.take() {
             if let Ok(a) = velr_api() {
                 unsafe { (a.velr_tx_close)(tx.as_ptr()) };
@@ -1029,20 +1778,21 @@ impl Drop for ExecTablesTx<'_> {
         }
     }
 }
-
 // -------------------------- Savepoints --------------------------
 //
 
-/// A savepoint handle within a transaction (thread-affine).
+/// A scoped savepoint handle within a transaction (thread-affine).
 ///
-/// Use:
-/// - [`VelrSavepoint::release`] to release the savepoint
-/// - [`VelrSavepoint::rollback`] to roll back to the savepoint
+/// This is the RAII/scoped savepoint API:
+/// - [`VelrTx::savepoint`] creates one
+/// - [`VelrSavepoint::release`] keeps the work since the savepoint
+/// - [`VelrSavepoint::rollback`] undoes back to the savepoint
 ///
 /// ## Drop behavior
 ///
 /// If dropped without explicit release/rollback, the runtime rolls back to the savepoint and
 /// releases it.
+#[must_use = "savepoint guards are RAII; bind the returned value to a variable or explicitly call release()/rollback()"]
 pub struct VelrSavepoint<'tx> {
     sp: Option<NonNull<ffi::velr_sp>>,
     _tx: PhantomData<&'tx VelrTx<'tx>>,

@@ -27,6 +27,93 @@ pub struct Api {
         *mut c_int,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_explain: unsafe extern "C" fn(
+        *mut velr_db,
+        *const c_char,
+        *mut *mut velr_explain_trace,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_explain_analyze: unsafe extern "C" fn(
+        *mut velr_db,
+        *const c_char,
+        *mut *mut velr_explain_trace,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_tx_explain: unsafe extern "C" fn(
+        *mut velr_tx,
+        *const c_char,
+        *mut *mut velr_explain_trace,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_tx_explain_analyze: unsafe extern "C" fn(
+        *mut velr_tx,
+        *const c_char,
+        *mut *mut velr_explain_trace,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_explain_trace_close: unsafe extern "C" fn(*mut velr_explain_trace),
+    pub velr_explain_trace_plan_count: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+    ) -> usize,
+    pub velr_explain_trace_plan_meta: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        usize,
+        *mut velr_explain_plan_meta,
+    ) -> velr_code,
+    pub velr_explain_trace_step_count: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        usize,
+    ) -> usize,
+    pub velr_explain_trace_step_meta: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        usize,
+        usize,
+        *mut velr_explain_step_meta,
+    ) -> velr_code,
+    pub velr_explain_trace_statement_count: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        usize,
+        usize,
+    ) -> usize,
+    pub velr_explain_trace_statement_meta: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        usize,
+        usize,
+        usize,
+        *mut velr_explain_stmt_meta,
+    ) -> velr_code,
+    pub velr_explain_trace_sqlite_plan_count: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        usize,
+        usize,
+        usize,
+    ) -> usize,
+    pub velr_explain_trace_sqlite_plan_detail: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        usize,
+        usize,
+        usize,
+        usize,
+        *mut velr_strview,
+    ) -> velr_code,
+    pub velr_explain_trace_compact_len: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        *mut usize,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_explain_trace_compact_write: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        *mut u8,
+        usize,
+        *mut usize,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_explain_trace_compact_malloc: unsafe extern "C" fn(
+        *mut velr_explain_trace,
+        *mut *mut u8,
+        *mut usize,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_exec_one: unsafe extern "C" fn(
         *mut velr_db,
         *const c_char,
@@ -194,6 +281,69 @@ impl Api {
             velr_stream_next_table: get(
                 lib,
                 concat!(stringify!(velr_stream_next_table), "\0").as_bytes(),
+            )?,
+            velr_explain: get(lib, concat!(stringify!(velr_explain), "\0").as_bytes())?,
+            velr_explain_analyze: get(
+                lib,
+                concat!(stringify!(velr_explain_analyze), "\0").as_bytes(),
+            )?,
+            velr_tx_explain: get(
+                lib,
+                concat!(stringify!(velr_tx_explain), "\0").as_bytes(),
+            )?,
+            velr_tx_explain_analyze: get(
+                lib,
+                concat!(stringify!(velr_tx_explain_analyze), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_close: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_close), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_plan_count: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_plan_count), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_plan_meta: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_plan_meta), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_step_count: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_step_count), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_step_meta: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_step_meta), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_statement_count: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_statement_count), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_statement_meta: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_statement_meta), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_sqlite_plan_count: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_sqlite_plan_count), "\0")
+                    .as_bytes(),
+            )?,
+            velr_explain_trace_sqlite_plan_detail: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_sqlite_plan_detail), "\0")
+                    .as_bytes(),
+            )?,
+            velr_explain_trace_compact_len: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_compact_len), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_compact_write: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_compact_write), "\0").as_bytes(),
+            )?,
+            velr_explain_trace_compact_malloc: get(
+                lib,
+                concat!(stringify!(velr_explain_trace_compact_malloc), "\0").as_bytes(),
             )?,
             velr_exec_one: get(
                 lib,

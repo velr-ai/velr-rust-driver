@@ -1,0 +1,128 @@
+Velr Runtime Binary Redistribution License
+Version 1.0
+
+Copyright (c) 2026 Velr Tech AB (Velr.ai)
+All rights reserved.
+
+This Velr Runtime Binary Redistribution License (the "License") governs use of
+the Velr runtime in compiled, object-code, or binary form, including any
+bundled native runtime, shared library, static library, or compiled C ABI
+distribution provided by Velr Tech AB ("Licensor").
+
+1. Scope
+
+This License applies only to the Runtime in binary or object-code form.
+
+This License does not grant any rights to:
+- the source code of the Runtime;
+- any unpublished materials;
+- any other software licensed under separate terms; or
+- any trademarks, logos, or brand features of the Licensor except as expressly
+  stated in this License.
+
+2. License Grant
+
+Subject to the terms of this License, the Licensor grants you a worldwide,
+non-exclusive license to:
+
+a) use, execute, and reproduce the Runtime;
+b) distribute and redistribute the Runtime, in unmodified binary form;
+c) bundle and redistribute the Runtime, in unmodified binary form, as part of:
+   - the Velr Python bindings;
+   - other Velr language bindings; or
+   - your own applications, services, containers, installers, or deployment
+     artifacts; and
+d) use and redistribute the Runtime for personal, internal, educational,
+   evaluation, and commercial purposes.
+
+3. Conditions
+
+You may exercise the rights granted above only if:
+
+a) you distribute the Runtime only in unmodified binary form;
+b) you include a copy of this License with any redistribution of the Runtime;
+c) you preserve all copyright, attribution, and other proprietary notices
+   included in or on the Runtime; and
+d) you do not state or imply that the Licensor endorses you, your company, or
+   your products without prior written permission.
+
+4. Restrictions
+
+Except as expressly permitted by this License or by applicable law, you may not:
+
+a) distribute, publish, or provide access to the source code of the Runtime;
+b) modify, adapt, translate, reverse engineer, decompile, disassemble, or
+   create derivative works of the Runtime;
+c) remove, alter, or obscure any copyright, attribution, license, or other
+   proprietary notices included in the Runtime;
+d) use the trademarks, trade names, logos, or branding of the Licensor except
+   for reasonable factual attribution identifying the origin of the Runtime; or
+e) represent the Runtime, whether alone or bundled with other software, as
+   being licensed under an open source license.
+
+For clarity, redistribution of the unmodified Runtime together with bindings,
+applications, or deployment artifacts is expressly permitted under Section 2.
+
+5. Ownership
+
+The Runtime is licensed, not sold. The Licensor and its licensors retain all
+right, title, and interest in and to the Runtime, including all intellectual
+property rights therein, except for the limited rights expressly granted by
+this License.
+
+6. Feedback
+
+If you provide suggestions, ideas, bug reports, or other feedback relating to
+the Runtime, the Licensor may use that feedback without restriction and without
+any obligation to you.
+
+7. No Support or Maintenance
+
+The Licensor is not obligated to provide support, maintenance, updates,
+upgrades, patches, or fixes for the Runtime under this License.
+
+8. Termination
+
+This License terminates automatically if you fail to comply with its terms.
+
+Upon termination, you must cease distribution of the Runtime. Sections 5, 6, 7,
+9, 10, and 13 survive termination.
+
+9. Disclaimer of Warranty
+
+THE RUNTIME IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, OR
+THAT THE RUNTIME WILL BE ERROR-FREE OR UNINTERRUPTED.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSOR DISCLAIMS ALL
+WARRANTIES AND CONDITIONS WITH RESPECT TO THE RUNTIME.
+
+10. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+LICENSOR OR ITS LICENSORS BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL,
+CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR ANY LOSS OF DATA, PROFITS,
+REVENUE, GOODWILL, OR BUSINESS INTERRUPTION, ARISING OUT OF OR RELATING TO THE
+RUNTIME OR THIS LICENSE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE TOTAL LIABILITY OF THE
+LICENSOR AND ITS LICENSORS FOR ALL CLAIMS ARISING OUT OF OR RELATING TO THE
+RUNTIME OR THIS LICENSE SHALL NOT EXCEED ONE HUNDRED EUROS (EUR 100).
+
+11. Compliance with Law
+
+You are responsible for complying with all applicable laws and regulations in
+connection with your use and distribution of the Runtime.
+
+12. Entire Agreement
+
+This License is the entire agreement between you and the Licensor regarding the
+Runtime in binary form and supersedes any prior or contemporaneous
+understandings regarding that subject matter.
+
+13. Governing Law
+
+This License shall be governed by and construed in accordance with the laws of
+Sweden, excluding its conflict of law rules, unless otherwise required by
+applicable law.
