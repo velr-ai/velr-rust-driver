@@ -1,12 +1,19 @@
-# Velr 
+# Velr
 
 Velr is an embedded property-graph database from Velr.ai, written in Rust, built on top of SQLite3 (persisting to a standard SQLite database file) and queried using the openCypher language.
 
-Vector data and time-series support are actively in development and will ship after openCypher support has stabilized.
-
 This crate provides the **Rust binding** for Velr. It links against a bundled native runtime with a C ABI, implemented in Rust.
 
-**Questions, feedback, or commercial licensing:** tomas@velr.ai
+For the main Velr public entry point, see [velr-ai/velr](https://github.com/velr-ai/velr).  
+For the Velr website, see [velr.ai](https://velr.ai/).
+
+## Community
+
+- **Community and questions:** [GitHub Discussions](https://github.com/velr-ai/velr/discussions)
+- **Bug reports and feature requests:** [GitHub Issues](https://github.com/velr-ai/velr/issues)
+- **Rust examples:** [velr-rust-examples](https://github.com/velr-ai/velr-rust-examples)
+
+We’d love to have you join the Velr community.
 
 ---
 
@@ -14,12 +21,13 @@ This crate provides the **Rust binding** for Velr. It links against a bundled na
 
 This release is **alpha**.
 
-* The API and query support are still evolving.
-* openCypher coverage is already substantial, but some features are still missing.
-
-If you hit a missing feature (see below), please reach out — it helps us prioritize.
+- The API and query support are still evolving.
+- openCypher coverage is already substantial, but some features are still missing.
 
 Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
+
+**Velr 1.0 is focused on strong openCypher compatibility.**  
+**Vector search**, **time-series**, and **federation** are planned as post-1.0 capabilities.
 
 ---
 
@@ -29,14 +37,14 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-velr = "0.1"
+velr = "0.2"
 ````
 
 Enable Arrow IPC support (binding Arrow arrays + exporting result tables as Arrow IPC):
 
 ```toml
 [dependencies]
-velr = { version = "0.1", features = ["arrow-ipc"] }
+velr = { version = "0.2", features = ["arrow-ipc"] }
 ```
 
 ---
@@ -156,6 +164,30 @@ tx.commit()?;
 `release_savepoint(name)` currently releases the most recent active named savepoint.
 
 Dropping an active transaction without `commit()` will roll it back automatically.
+
+---
+## Explain plans
+
+Velr can produce an explain trace for a query, which is useful when you want to inspect how a openCypher query is planned and translated internally.
+
+Use `Velr::explain` to build a trace without executing the query:
+
+```rust,no_run
+use velr::Velr;
+
+fn main() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+
+    let trace = db.explain("MATCH (n) RETURN n")?;
+
+    println!("plans: {}", trace.plan_count()?);
+    println!("{}", trace.to_compact_string()?);
+
+    Ok(())
+}
+```
+
+The returned `ExplainTrace` can be inspected programmatically or rendered as a compact string for logging, debugging, tests, or documentation.
 
 ---
 
