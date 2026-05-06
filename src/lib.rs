@@ -732,6 +732,45 @@ impl Velr {
         })
     }
 
+    /// Open an existing file-backed Velr database in read-only mode.
+    ///
+    /// Unlike [`Velr::open`], this does not create, initialize, migrate, or
+    /// repair a database. The file must already exist and carry the current
+    /// Velr schema version. Use this for viewers, agents, and other read paths
+    /// that should not perform schema DDL.
+    ///
+    /// If the loaded native runtime is older and does not expose the underlying
+    /// C ABI symbol, this returns an error.
+    pub fn open_readonly(path: &str) -> Result<Self> {
+        let a = velr_api()?;
+        let open_readonly = a.velr_open_existing_readonly.ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "loaded Velr runtime does not expose velr_open_existing_readonly",
+            )
+        })?;
+
+        let mut out_db: *mut ffi::velr_db = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let cpath = CString::new(path)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "path contains NUL"))?;
+
+        let rc = unsafe { open_readonly(cpath.as_ptr(), &mut out_db, &mut err) };
+        rc_to_result(rc, err)?;
+
+        let nn = NonNull::new(out_db).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "velr_open_existing_readonly returned null db",
+            )
+        })?;
+
+        Ok(Self {
+            db: nn,
+            _not_sync: PhantomData,
+        })
+    }
+
     /// Execute `openCypher` and return a stream of result tables.
     ///
     /// Use [`ExecTables::next_table`] to pull tables until it returns `Ok(None)`.

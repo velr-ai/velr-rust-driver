@@ -88,6 +88,49 @@ fn roundtrip_all_types_non_tx() -> velr::Result<()> {
 }
 
 #[test]
+fn text_values_that_begin_with_brackets_stay_text() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+
+    db.run(
+        r#"
+        CREATE (:Sample {
+          plain: 'They are also historically associated with and used by search engines.',
+          cited: '[3][4] They are also historically associated with and used by search engines.'
+        });
+        "#,
+    )?;
+
+    let mut table = db.exec_one(
+        "MATCH (s:Sample)
+         RETURN s.plain AS plain, s.cited AS cited",
+    )?;
+
+    let mut row_count = 0usize;
+    table.for_each_row(|row| {
+        row_count += 1;
+        match row[0] {
+            CellRef::Text(bytes) => assert_eq!(
+                bytes,
+                b"They are also historically associated with and used by search engines."
+            ),
+            other => panic!("expected plain text cell, got {other:?}"),
+        }
+        match row[1] {
+            CellRef::Text(bytes) => assert_eq!(
+                bytes,
+                b"[3][4] They are also historically associated with and used by search engines."
+            ),
+            other => panic!("expected cited text cell, got {other:?}"),
+        }
+        Ok(())
+    })?;
+
+    assert_eq!(row_count, 1);
+
+    Ok(())
+}
+
+#[test]
 fn exec_stream_two_tables() -> velr::Result<()> {
     let db = Velr::open(None)?;
 

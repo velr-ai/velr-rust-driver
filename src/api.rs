@@ -13,6 +13,13 @@ pub struct Api {
         *mut *mut velr_db,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_open_existing_readonly: Option<
+        unsafe extern "C" fn(
+            *const c_char,
+            *mut *mut velr_db,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
     pub velr_close: unsafe extern "C" fn(*mut velr_db),
     pub velr_exec_start: unsafe extern "C" fn(
         *mut velr_db,
@@ -263,12 +270,22 @@ impl Api {
             let sym: Symbol<T> = lib.get::<T>(name)?;
             Ok(*sym)
         }
+        unsafe fn get_optional<T: Copy>(
+            lib: &Library,
+            name: &'static [u8],
+        ) -> Option<T> {
+            lib.get::<T>(name).ok().map(|sym| *sym)
+        }
         Ok(Self {
             velr_string_free: get(
                 lib,
                 concat!(stringify!(velr_string_free), "\0").as_bytes(),
             )?,
             velr_open: get(lib, concat!(stringify!(velr_open), "\0").as_bytes())?,
+            velr_open_existing_readonly: get_optional(
+                lib,
+                concat!(stringify!(velr_open_existing_readonly), "\0").as_bytes(),
+            ),
             velr_close: get(lib, concat!(stringify!(velr_close), "\0").as_bytes())?,
             velr_exec_start: get(
                 lib,

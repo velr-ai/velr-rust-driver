@@ -23,6 +23,8 @@ This release is **alpha**.
 
 - The API and query support are still evolving.
 - openCypher coverage is already substantial, but some features are still missing.
+- During the `0.2.x` series, we do **not** guarantee database migration or on-disk database compatibility between releases.
+- Starting with the `0.3.x` series, we intend to guarantee internal database compatibility within the branch.
 
 Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
 
@@ -82,14 +84,41 @@ fn main() -> velr::Result<()> {
 
 ---
 
+## Opening an existing database read-only
+
+Use `Velr::open_readonly(path)` for viewers, agents, and other read paths that
+should not initialize or migrate the database:
+
+```rust,no_run
+use velr::Velr;
+
+fn main() -> velr::Result<()> {
+    let db = Velr::open_readonly("mygraph.db")?;
+    let mut table = db.exec_one("MATCH (n) RETURN count(n) AS count")?;
+
+    table.for_each_row(|row| {
+        println!("{:?}", row[0]);
+        Ok(())
+    })?;
+
+    Ok(())
+}
+```
+
+`open_readonly` requires an existing file-backed database at the current Velr
+schema version. It does not create files, run schema DDL, or migrate older
+databases. Use `Velr::open` from import and maintenance code when
+initialization or migration is intended.
+
+---
+
 ## Query language support
 
 Velr supports **most of openCypher**, but some features are not yet implemented.
 
-Notable missing features:
+Notable current limitations:
 
-* `REMOVE` clause
-* Query parameters (for example `$name`)
+* Driver-level query parameters (for example `$name`)
 * The query planner does not yet use indexes in all cases where expected.
 
 ---
@@ -270,7 +299,3 @@ Currently bundled targets:
 * The **bundled native runtime binaries** may be **used and freely redistributed in unmodified form** under the terms of **`LICENSE.runtime`**.
 
 See [`LICENSE`](LICENSE) and [`LICENSE.runtime`](LICENSE.runtime) for the full license texts.
-
-
-
-
