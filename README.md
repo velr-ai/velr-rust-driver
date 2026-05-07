@@ -281,14 +281,20 @@ Velr currently supports these openCypher functions:
 
 ## Platform support
 
-This crate links against a bundled native runtime.
+This crate links against a bundled native runtime. Cargo selects one platform-specific
+`velr-runtime-*` crate for the current build target, so user installation stays:
+
+```toml
+[dependencies]
+velr = "0.2"
+```
 
 Currently bundled targets:
 
-    * macOS universal (arm64 + x86_64)
-    * Linux x86_64
-    * Linux aarch64
-    * Windows x86_64
+* macOS universal (arm64 + x86_64)
+* Linux x86_64
+* Linux aarch64
+* Windows x86_64
 
 
 ---

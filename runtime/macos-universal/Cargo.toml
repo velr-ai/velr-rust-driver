@@ -1,0 +1,16 @@
+[package]
+name = "velr-runtime-macos-universal"
+version = "0.2.11"
+edition = "2021"
+
+description = "Velr native runtime for macOS universal"
+license-file = "LICENSE.runtime"
+homepage = "https://velr.ai"
+repository = "https://github.com/velr-ai/velr-rust-driver"
+documentation = "https://docs.rs/velr"
+
+include = ["src/**", "prebuilt/**", "Cargo.toml", "LICENSE.runtime"]
+
+[lib]
+name = "velr_runtime_macos_universal"
+path = "src/lib.rs"

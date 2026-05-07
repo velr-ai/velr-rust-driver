@@ -23,17 +23,38 @@
 //! The runtime is initialized lazily on first use and stored in a global [`OnceLock`]. If
 //! initialization fails, subsequent calls to [`runtime()`] will return the same error (cloned).
 
-use std::{
-    env, fs,
-    io::Write,
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
+use std::{env, fs, io::Write, path::PathBuf, sync::OnceLock};
 
 use blake3::Hasher;
 use libloading::Library;
 
 use crate::{api::Api, Error, Result};
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+use velr_runtime_linux_x86_64 as selected_runtime;
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))]
+use velr_runtime_linux_aarch64 as selected_runtime;
+
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+use velr_runtime_macos_universal as selected_runtime;
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]
+use velr_runtime_windows_x86_64 as selected_runtime;
+
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+    all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"),
+)))]
+compile_error!("No bundled Velr runtime for this target.");
 
 /// Process-wide singleton storage for the runtime.
 ///
@@ -154,63 +175,7 @@ impl Runtime {
 /// - The embedded runtime bytes.
 /// - The filename to use when materializing the runtime to disk.
 fn bundled_runtime_bytes_and_name() -> (&'static [u8], &'static str) {
-    // macOS universal dylib
-    #[cfg(target_os = "macos")]
-    {
-        (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/prebuilt/macos-universal/libvelrc.dylib"
-            )),
-            "libvelrc.dylib",
-        )
-    }
-
-    // Linux x86_64
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/prebuilt/linux-x86_64/libvelrc.so"
-            )),
-            "libvelrc.so",
-        )
-    }
-
-    // Linux aarch64
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/prebuilt/linux-aarch64/libvelrc.so"
-            )),
-            "libvelrc.so",
-        )
-    }
-
-    // Windows x86_64: load the DLL (not the import lib)
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/prebuilt/windows-x86_64/velrc.dll"
-            )),
-            "velrc.dll",
-        )
-    }
-
-    #[cfg(not(any(
-        target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-        all(target_os = "windows", target_arch = "x86_64"),
-    )))]
-    {
-        compile_error!("No bundled Velr runtime for this target.");
-    }
+    selected_runtime::bytes_and_name()
 }
 
 /// Write runtime bytes to a stable cache path and return the path.
