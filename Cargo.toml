@@ -1,6 +1,6 @@
 [package]
 name = "velr"
-version = "0.2.11"
+version = "0.2.13"
 edition = "2021"
 
 description = "Velr embedded property-graph database (Rust driver, beta)"
@@ -21,16 +21,16 @@ blake3 = "1"
 arrow2 = { version = "0.18", optional = true, default-features = false }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))'.dependencies]
-velr_runtime_linux_x86_64 = { package = "velr-runtime-linux-x86_64", version = "=0.2.11", path = "runtime/linux-x86_64" }
+velr_runtime_linux_x86_64 = { package = "velr-runtime-linux-x86_64", version = "=0.2.13", path = "runtime/linux-x86_64" }
 
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))'.dependencies]
-velr_runtime_linux_aarch64 = { package = "velr-runtime-linux-aarch64", version = "=0.2.11", path = "runtime/linux-aarch64" }
+velr_runtime_linux_aarch64 = { package = "velr-runtime-linux-aarch64", version = "=0.2.13", path = "runtime/linux-aarch64" }
 
 [target.'cfg(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")))'.dependencies]
-velr_runtime_macos_universal = { package = "velr-runtime-macos-universal", version = "=0.2.11", path = "runtime/macos-universal" }
+velr_runtime_macos_universal = { package = "velr-runtime-macos-universal", version = "=0.2.13", path = "runtime/macos-universal" }
 
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))'.dependencies]
-velr_runtime_windows_x86_64 = { package = "velr-runtime-windows-x86_64", version = "=0.2.11", path = "runtime/windows-x86_64" }
+velr_runtime_windows_x86_64 = { package = "velr-runtime-windows-x86_64", version = "=0.2.13", path = "runtime/windows-x86_64" }
 
 [dev-dependencies]
 serde_json = "1"
