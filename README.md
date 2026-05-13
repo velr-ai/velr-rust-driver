@@ -24,6 +24,7 @@ This release is **alpha**.
 - The API and query support are still evolving.
 - openCypher coverage is already substantial, but some features are still missing.
 - During the `0.2.x` series, we do **not** guarantee database migration or on-disk database compatibility between releases.
+- Velr 0.2.14 includes a breaking on-disk storage change; existing databases from earlier releases must be recreated by re-importing the source data.
 - Starting with the `0.3.x` series, we intend to guarantee internal database compatibility within the branch.
 
 Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
