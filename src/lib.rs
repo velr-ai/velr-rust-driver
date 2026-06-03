@@ -96,6 +96,31 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+fn missing_runtime_symbol(name: &str) -> Error {
+    Error::new(
+        ffi::velr_code::VELR_EERR as i32,
+        format!("loaded Velr runtime does not expose {name}"),
+    )
+}
+
+fn require_runtime_symbol<T: Copy>(symbol: Option<T>, name: &str) -> Result<T> {
+    symbol.ok_or_else(|| missing_runtime_symbol(name))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationStatus {
+    AlreadyCurrent,
+    Migrated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub from_version: i32,
+    pub to_version: i32,
+    pub status: MigrationStatus,
+    pub steps: Vec<String>,
+}
+
 /// Get a reference to the loaded runtime API.
 ///
 /// This ensures the runtime is initialized (via [`runtime::runtime`]) and then returns the
@@ -769,6 +794,102 @@ impl Velr {
             db: nn,
             _not_sync: PhantomData,
         })
+    }
+
+    /// Return the schema version cached by this connection.
+    pub fn schema_version(&self) -> Result<i32> {
+        let a = velr_api()?;
+        let schema_version = require_runtime_symbol(a.velr_schema_version, "velr_schema_version")?;
+
+        let mut out = 0i32;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { schema_version(self.db.as_ptr(), &mut out, &mut err) };
+        rc_to_result(rc, err)?;
+        Ok(out)
+    }
+
+    /// Return the current schema version supported by this runtime.
+    pub fn current_schema_version(&self) -> Result<i32> {
+        let a = velr_api()?;
+        let current_schema_version =
+            require_runtime_symbol(a.velr_current_schema_version, "velr_current_schema_version")?;
+
+        let mut out = 0i32;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { current_schema_version(self.db.as_ptr(), &mut out, &mut err) };
+        rc_to_result(rc, err)?;
+        Ok(out)
+    }
+
+    /// Return true when this connection is on an older supported schema version.
+    pub fn needs_migration(&self) -> Result<bool> {
+        let a = velr_api()?;
+        let needs_migration =
+            require_runtime_symbol(a.velr_needs_migration, "velr_needs_migration")?;
+
+        let mut out = 0;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { needs_migration(self.db.as_ptr(), &mut out, &mut err) };
+        rc_to_result(rc, err)?;
+        Ok(out != 0)
+    }
+
+    /// Explicitly migrate this database to the current schema version.
+    ///
+    /// Opening a supported older database does not migrate it. Call this method,
+    /// or run `MIGRATE DATABASE`, when maintenance code intentionally wants to
+    /// apply the pending schema migration.
+    pub fn migrate(&self) -> Result<MigrationReport> {
+        let a = velr_api()?;
+        let migrate = require_runtime_symbol(a.velr_migrate, "velr_migrate")?;
+
+        let mut raw = ffi::velr_migration_report {
+            from_version: 0,
+            to_version: 0,
+            status: ffi::velr_migration_status::VELR_MIGRATION_ALREADY_CURRENT,
+            step_count: 0,
+            steps: std::ptr::null_mut(),
+        };
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe { migrate(self.db.as_ptr(), &mut raw, &mut err) };
+        let result = rc_to_result(rc, err).and_then(|()| {
+            let status = match raw.status {
+                ffi::velr_migration_status::VELR_MIGRATION_ALREADY_CURRENT => {
+                    MigrationStatus::AlreadyCurrent
+                }
+                ffi::velr_migration_status::VELR_MIGRATION_MIGRATED => MigrationStatus::Migrated,
+            };
+            let steps = if raw.steps.is_null() || raw.step_count == 0 {
+                Vec::new()
+            } else {
+                let detail = unsafe { CStr::from_ptr(raw.steps) }
+                    .to_string_lossy()
+                    .into_owned();
+                detail
+                    .split(',')
+                    .filter(|step| !step.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            };
+
+            Ok(MigrationReport {
+                from_version: raw.from_version,
+                to_version: raw.to_version,
+                status,
+                steps,
+            })
+        });
+
+        if !raw.steps.is_null() {
+            if let Some(clear) = a.velr_migration_report_clear {
+                unsafe { clear(&mut raw) };
+            } else {
+                unsafe { (a.velr_string_free)(raw.steps) };
+            }
+        }
+
+        result
     }
 
     /// Execute `openCypher` and return a stream of result tables.

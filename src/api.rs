@@ -21,6 +21,25 @@ pub struct Api {
         ) -> velr_code,
     >,
     pub velr_close: unsafe extern "C" fn(*mut velr_db),
+    pub velr_schema_version: Option<
+        unsafe extern "C" fn(*mut velr_db, *mut i32, *mut *mut c_char) -> velr_code,
+    >,
+    pub velr_current_schema_version: Option<
+        unsafe extern "C" fn(*mut velr_db, *mut i32, *mut *mut c_char) -> velr_code,
+    >,
+    pub velr_needs_migration: Option<
+        unsafe extern "C" fn(*mut velr_db, *mut c_int, *mut *mut c_char) -> velr_code,
+    >,
+    pub velr_migrate: Option<
+        unsafe extern "C" fn(
+            *mut velr_db,
+            *mut velr_migration_report,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
+    pub velr_migration_report_clear: Option<
+        unsafe extern "C" fn(*mut velr_migration_report),
+    >,
     pub velr_exec_start: unsafe extern "C" fn(
         *mut velr_db,
         *const c_char,
@@ -287,6 +306,26 @@ impl Api {
                 concat!(stringify!(velr_open_existing_readonly), "\0").as_bytes(),
             ),
             velr_close: get(lib, concat!(stringify!(velr_close), "\0").as_bytes())?,
+            velr_schema_version: get_optional(
+                lib,
+                concat!(stringify!(velr_schema_version), "\0").as_bytes(),
+            ),
+            velr_current_schema_version: get_optional(
+                lib,
+                concat!(stringify!(velr_current_schema_version), "\0").as_bytes(),
+            ),
+            velr_needs_migration: get_optional(
+                lib,
+                concat!(stringify!(velr_needs_migration), "\0").as_bytes(),
+            ),
+            velr_migrate: get_optional(
+                lib,
+                concat!(stringify!(velr_migrate), "\0").as_bytes(),
+            ),
+            velr_migration_report_clear: get_optional(
+                lib,
+                concat!(stringify!(velr_migration_report_clear), "\0").as_bytes(),
+            ),
             velr_exec_start: get(
                 lib,
                 concat!(stringify!(velr_exec_start), "\0").as_bytes(),

@@ -106,10 +106,84 @@ fn main() -> velr::Result<()> {
 }
 ```
 
-`open_readonly` requires an existing file-backed database at the current Velr
+`open_readonly` requires an existing file-backed database at a supported Velr
 schema version. It does not create files, run schema DDL, or migrate older
-databases. Use `Velr::open` from import and maintenance code when
-initialization or migration is intended.
+databases. If a feature requires the current schema, such as
+`SHOW CURRENT GRAPH SHAPE`, open read-write and call `db.migrate()` explicitly
+when migration is intended.
+
+---
+
+## Schema migration
+
+Velr does not migrate supported older databases automatically on open. Use the
+driver migration API, or run `MIGRATE DATABASE`, from maintenance code when you
+intend to update the on-disk schema.
+
+```rust,no_run
+use velr::{MigrationStatus, Velr};
+
+fn main() -> velr::Result<()> {
+    let db = Velr::open(Some("mygraph.db"))?;
+
+    if db.needs_migration()? {
+        let report = db.migrate()?;
+        match report.status {
+            MigrationStatus::Migrated => {
+                println!(
+                    "migrated schema {} -> {} via {:?}",
+                    report.from_version, report.to_version, report.steps
+                );
+            }
+            MigrationStatus::AlreadyCurrent => {}
+        }
+    }
+
+    Ok(())
+}
+```
+
+The equivalent Cypher command is useful for scripts and tools that already work
+through query execution:
+
+```rust,no_run
+let db = Velr::open(Some("mygraph.db"))?;
+let mut report = db.exec_one("MIGRATE DATABASE")?;
+println!("{:?}", report.column_names());
+```
+
+---
+
+## Introspection
+
+Use `SHOW CURRENT GRAPH SHAPE` to inspect the observed schema of the graph. It
+reports the shape present in stored data: node labels, relationship types,
+properties, observed value types, and counts. It is an observed shape surface,
+not a declared GQL graph type.
+
+In this release, `SHOW CURRENT GRAPH SHAPE` is available on schema version 4
+databases. Older supported databases must be migrated explicitly before this
+command is valid.
+
+```rust,no_run
+let db = Velr::open(Some("mygraph.db"))?;
+
+let mut shape = db.exec_one(
+    "SHOW CURRENT GRAPH SHAPE
+     YIELD element_kind, element_name, property_name, observed_type, owner_count
+     WHERE element_kind = 'node_property'
+     RETURN element_name, property_name, observed_type, owner_count",
+)?;
+
+shape.for_each_row(|row| {
+    println!("{row:?}");
+    Ok(())
+})?;
+```
+
+Use `YIELD` to compose the command with `WHERE` and `RETURN`. Plain
+`SHOW CURRENT GRAPH SHAPE` returns the default projection; `YIELD *` exposes the
+full current row shape.
 
 ---
 
@@ -255,19 +329,65 @@ fn arrow_example() -> velr::Result<()> {
 
 ## Supported functions
 
-Velr currently supports these openCypher functions:
+Velr currently supports these openCypher functions and constructors:
 
-**Scalars**
+**Graph and path**
 
 * `id()`
 * `type()`
+* `labels()`
+* `keys()`
+* `properties()`
 * `length()`
 * `nodes()`
 * `relationships()`
+
+**Lists and predicates**
+
+* `size()`
+* `head()`
+* `last()`
+* `tail()`
+* `reverse()`
+* `range()`
+* `all()`
+* `any()`
+* `none()`
+* `single()`
+
+**Strings and conversion**
+
 * `coalesce()`
-* `labels()`
-* `properties()`
-* `keys()`
+* `toInteger()`
+* `toString()`
+* `toLower()`
+* `trim()`
+* `substring()`
+* `split()`
+
+**Numeric**
+
+* `abs()`
+* `ceil()`
+* `rand()`
+* `sign()`
+* `sqrt()`
+
+**Temporal**
+
+* `date()`
+* `time()`
+* `localtime()`
+* `datetime()`
+* `localdatetime()`
+* `duration()`
+* `datetime.fromepoch()`
+* `datetime.fromepochmillis()`
+* `date.realtime()`, `date.transaction()`, `date.statement()`
+* `time.realtime()`, `time.transaction()`, `time.statement()`
+* `localtime.realtime()`, `localtime.transaction()`, `localtime.statement()`
+* `datetime.realtime()`, `datetime.transaction()`, `datetime.statement()`
+* `localdatetime.realtime()`, `localdatetime.transaction()`, `localdatetime.statement()`
 
 **Aggregates**
 
@@ -277,6 +397,8 @@ Velr currently supports these openCypher functions:
 * `min()`
 * `max()`
 * `collect()`
+* `percentileDisc()`
+* `percentileCont()`
 
 ---
 

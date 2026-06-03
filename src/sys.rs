@@ -1,7 +1,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
-use std::os::raw::{c_char, c_int};
+use std::os::raw::c_char;
 #[cfg(feature = "arrow-ipc")]
 use arrow2::ffi::{ArrowArray, ArrowSchema};
 /// Discriminant for [`velr_cell`].
@@ -50,6 +50,28 @@ pub struct velr_cell {
 pub struct velr_strview {
     pub ptr: *const u8,
     pub len: usize,
+}
+/// Migration status returned by [`velr_migrate`].
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum velr_migration_status {
+    VELR_MIGRATION_ALREADY_CURRENT = 0,
+    VELR_MIGRATION_MIGRATED = 1,
+}
+/// Migration report returned by [`velr_migrate`].
+///
+/// `steps` is a NUL-terminated, comma-separated UTF-8 string allocated by Velr, or NULL when no
+/// steps were applied. Free it with [`velr_migration_report_clear`] or [`velr_string_free`].
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct velr_migration_report {
+    pub from_version: i32,
+    pub to_version: i32,
+    pub status: velr_migration_status,
+    pub step_count: usize,
+    pub steps: *mut c_char,
 }
 /// Result codes returned by most ABI functions.
 #[allow(non_camel_case_types)]
