@@ -42,6 +42,21 @@
 //!
 //! Most operations return [`Result<T>`]. On failure, you get an [`Error`] containing a numeric
 //! code (originating from the runtime ABI) and an optional message.
+//!
+//! # Schema migration and introspection
+//!
+//! This runtime's current on-disk schema is version 5. Supported older databases can be opened
+//! without automatic migration. Reads remain available on those databases, but writes and
+//! `SHOW CURRENT GRAPH SHAPE` require schema version 5 and return a query error until the user
+//! explicitly migrates.
+//!
+//! Use [`Velr::schema_version`], [`Velr::current_schema_version`], and
+//! [`Velr::needs_migration`] to inspect the connection state. Use [`Velr::migrate`] or execute
+//! `MIGRATE DATABASE` from maintenance code when upgrading is intended.
+//!
+//! `SHOW CURRENT GRAPH SHAPE` exposes Velr's observed graph schema: labels, relationship types,
+//! properties, observed value types, and counts. Use `YIELD` to compose it with `WHERE` and
+//! `RETURN`, or `YIELD *` to inspect the full row shape.
 #![allow(unsafe_code)]
 
 mod api;
@@ -107,17 +122,25 @@ fn require_runtime_symbol<T: Copy>(symbol: Option<T>, name: &str) -> Result<T> {
     symbol.ok_or_else(|| missing_runtime_symbol(name))
 }
 
+/// Status returned by [`Velr::migrate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationStatus {
+    /// The database was already at the current runtime schema version.
     AlreadyCurrent,
+    /// At least one migration step was applied.
     Migrated,
 }
 
+/// Report returned by [`Velr::migrate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationReport {
+    /// Schema version observed before migration.
     pub from_version: i32,
+    /// Schema version after migration.
     pub to_version: i32,
+    /// Whether migration work was applied.
     pub status: MigrationStatus,
+    /// Runtime migration step identifiers applied in order.
     pub steps: Vec<String>,
 }
 
@@ -760,9 +783,14 @@ impl Velr {
     /// Open an existing file-backed Velr database in read-only mode.
     ///
     /// Unlike [`Velr::open`], this does not create, initialize, migrate, or
-    /// repair a database. The file must already exist and carry the current
+    /// repair a database. The file must already exist and carry a supported
     /// Velr schema version. Use this for viewers, agents, and other read paths
     /// that should not perform schema DDL.
+    ///
+    /// Supported older databases remain readable. Mutating queries and features
+    /// that require schema version 5, including `SHOW CURRENT GRAPH SHAPE`, are
+    /// unavailable until the database is opened read-write and explicitly
+    /// migrated with [`Velr::migrate`] or `MIGRATE DATABASE`.
     ///
     /// If the loaded native runtime is older and does not expose the underlying
     /// C ABI symbol, this returns an error.
@@ -822,6 +850,9 @@ impl Velr {
     }
 
     /// Return true when this connection is on an older supported schema version.
+    ///
+    /// Older supported databases can be read, but mutating queries are rejected
+    /// until the database is explicitly migrated to the current schema version.
     pub fn needs_migration(&self) -> Result<bool> {
         let a = velr_api()?;
         let needs_migration =
@@ -839,6 +870,8 @@ impl Velr {
     /// Opening a supported older database does not migrate it. Call this method,
     /// or run `MIGRATE DATABASE`, when maintenance code intentionally wants to
     /// apply the pending schema migration.
+    ///
+    /// Migration must be performed on a read-write connection.
     pub fn migrate(&self) -> Result<MigrationReport> {
         let a = velr_api()?;
         let migrate = require_runtime_symbol(a.velr_migrate, "velr_migrate")?;

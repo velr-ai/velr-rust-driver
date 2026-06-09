@@ -13,13 +13,13 @@ fn migration_api_reports_current_in_memory_database() -> velr::Result<()> {
         Err(err) => return Err(err),
     };
 
-    assert_eq!(schema_version, 4);
-    assert_eq!(db.current_schema_version()?, 4);
+    let current_schema_version = db.current_schema_version()?;
+    assert_eq!(schema_version, current_schema_version);
     assert!(!db.needs_migration()?);
 
     let report = db.migrate()?;
-    assert_eq!(report.from_version, 4);
-    assert_eq!(report.to_version, 4);
+    assert_eq!(report.from_version, schema_version);
+    assert_eq!(report.to_version, current_schema_version);
     assert_eq!(report.status, MigrationStatus::AlreadyCurrent);
     assert!(report.steps.is_empty());
 

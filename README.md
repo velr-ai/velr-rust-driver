@@ -27,6 +27,15 @@ This release is **alpha**.
 - Velr 0.2.14 includes a breaking on-disk storage change; existing databases from earlier releases must be recreated by re-importing the source data.
 - Starting with the `0.3.x` series, we intend to guarantee internal database compatibility within the branch.
 
+### Schema version 5 compatibility
+
+This release's current on-disk schema is version 5. Supported older databases
+can be opened with `Velr::open` or `Velr::open_readonly` without changing the
+file. Reads continue to work on those databases, but writes (`CREATE`, `MERGE`,
+`SET`, `DELETE`, `DETACH DELETE`, and other mutating queries) are only available
+after migrating to schema version 5. This is intentional: migration is an
+explicit maintenance operation, not a side effect of opening a database.
+
 Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
 
 **Velr 1.0 is focused on strong openCypher compatibility.**  
@@ -108,9 +117,10 @@ fn main() -> velr::Result<()> {
 
 `open_readonly` requires an existing file-backed database at a supported Velr
 schema version. It does not create files, run schema DDL, or migrate older
-databases. If a feature requires the current schema, such as
-`SHOW CURRENT GRAPH SHAPE`, open read-write and call `db.migrate()` explicitly
-when migration is intended.
+databases. Older supported databases, such as schema version 3 or 4 databases
+opened by a schema version 5 runtime, remain available for reads. Writes and
+features that require schema version 5 fail with a normal query error until the
+database is explicitly migrated.
 
 ---
 
@@ -118,7 +128,8 @@ when migration is intended.
 
 Velr does not migrate supported older databases automatically on open. Use the
 driver migration API, or run `MIGRATE DATABASE`, from maintenance code when you
-intend to update the on-disk schema.
+intend to update the on-disk schema. See the release-status note above for the
+schema version 5 read/write compatibility behavior.
 
 ```rust,no_run
 use velr::{MigrationStatus, Velr};
@@ -161,9 +172,15 @@ reports the shape present in stored data: node labels, relationship types,
 properties, observed value types, and counts. It is an observed shape surface,
 not a declared GQL graph type.
 
-In this release, `SHOW CURRENT GRAPH SHAPE` is available on schema version 4
-databases. Older supported databases must be migrated explicitly before this
-command is valid.
+`SHOW CURRENT GRAPH SHAPE` is available on schema version 5 databases. Older
+supported databases can still be opened for reads, but must be migrated
+explicitly before this command is valid. Schema version 5 maintains this
+inventory through the write planner instead of persistent graph-shape triggers.
+
+The default projection returns `element_kind`, `element_name`, `property_name`,
+`observed_type`, `owner_count`, `present_count`, and `missing_count`.
+`YIELD *` exposes the full row shape, including `surface`, `source_label`,
+`target_label`, `required`, `storage_class`, and `tag`.
 
 ```rust,no_run
 let db = Velr::open(Some("mygraph.db"))?;
