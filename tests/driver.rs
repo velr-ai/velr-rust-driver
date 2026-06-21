@@ -1,5 +1,5 @@
 use serde_json::Value;
-use velr::{CellRef, Velr};
+use velr::{CellRef, QueryOptions, Velr};
 
 #[derive(Debug, PartialEq)]
 enum Owned {
@@ -25,6 +25,117 @@ fn own_cell(c: &CellRef<'_>) -> Owned {
 fn assert_f64(a: f64, b: f64) {
     let diff = (a - b).abs();
     assert!(diff < 1e-12, "expected {b}, got {a} (diff {diff})");
+}
+
+fn missing_options_symbol(e: &velr::Error) -> bool {
+    e.message.contains("does not expose") && e.message.contains("_with_options")
+}
+
+#[test]
+fn query_options_cap_rows_non_tx() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let mut t = match db.exec_one_with_options(
+        "UNWIND [1,2,3,4,5,6] AS x RETURN x ORDER BY x LIMIT 10",
+        QueryOptions::max_result_rows(5),
+    ) {
+        Ok(t) => t,
+        Err(e) if missing_options_symbol(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    assert_eq!(t.column_names(), &["x".to_string()]);
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Owned::Int(1)],
+            vec![Owned::Int(2)],
+            vec![Owned::Int(3)],
+            vec![Owned::Int(4)],
+            vec![Owned::Int(5)]
+        ]
+    );
+
+    let mut t = db.exec_one_with_options(
+        "UNWIND [1,2,3,4,5,6] AS x RETURN x ORDER BY x LIMIT 3",
+        QueryOptions::max_result_rows(5),
+    )?;
+
+    assert_eq!(t.column_names(), &["x".to_string()]);
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Owned::Int(1)],
+            vec![Owned::Int(2)],
+            vec![Owned::Int(3)]
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn query_options_cap_rows_per_stream_table_non_tx() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let mut st = match db.exec_with_options(
+        "UNWIND [1,2,3] AS x RETURN x ORDER BY x;
+         UNWIND [10,20,30] AS y RETURN y ORDER BY y",
+        QueryOptions::max_result_rows(1),
+    ) {
+        Ok(st) => st,
+        Err(e) if missing_options_symbol(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    let mut first = st.next_table()?.expect("first result table");
+    assert_eq!(first.column_names(), &["x".to_string()]);
+    let rows = first.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(rows, vec![vec![Owned::Int(1)]]);
+
+    let mut second = st.next_table()?.expect("second result table");
+    assert_eq!(second.column_names(), &["y".to_string()]);
+    let rows = second.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(rows, vec![vec![Owned::Int(10)]]);
+
+    assert!(st.next_table()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn query_options_zero_preserves_columns_non_tx() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let mut t = match db.exec_one_with_options(
+        "RETURN 1 AS one, 2 AS two",
+        QueryOptions::max_result_rows(0),
+    ) {
+        Ok(t) => t,
+        Err(e) if missing_options_symbol(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    assert_eq!(t.column_names(), &["one".to_string(), "two".to_string()]);
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert!(rows.is_empty());
+    Ok(())
+}
+
+#[test]
+fn query_options_cap_rows_tx() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let tx = db.begin_tx()?;
+    let mut t = match tx.exec_one_with_options(
+        "UNWIND [10,20,30] AS x RETURN x ORDER BY x",
+        QueryOptions::max_result_rows(1),
+    ) {
+        Ok(t) => t,
+        Err(e) if missing_options_symbol(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    assert_eq!(t.column_names(), &["x".to_string()]);
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(rows, vec![vec![Owned::Int(10)]]);
+    Ok(())
 }
 
 #[test]

@@ -38,6 +38,34 @@
 //! until the iterator is dropped). In typical usage this means the borrows are scoped to the row
 //! callback invocation.
 //!
+//! # Bounded result previews
+//!
+//! Hosts that need projected column names plus a small sample can use [`QueryOptions`] with
+//! [`Velr::exec_with_options`], [`Velr::exec_one_with_options`], or [`Velr::run_with_options`].
+//! The row cap is enforced by Velr while emitting result rows; the driver does not rewrite the
+//! Cypher text.
+//!
+//! ```
+//! # use velr::{QueryOptions, Velr};
+//! # fn main() -> velr::Result<()> {
+//! let db = Velr::open(None)?;
+//! let mut table = db.exec_one_with_options(
+//!     "UNWIND [1,2,3,4,5,6] AS x RETURN x ORDER BY x LIMIT 10",
+//!     QueryOptions::max_result_rows(5),
+//! )?;
+//!
+//! assert_eq!(table.column_names(), &["x".to_string()]);
+//! let rows = table.collect(|row| Ok(format!("{:?}", row[0])))?;
+//! assert_eq!(rows.len(), 5);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Existing Cypher `LIMIT` clauses still apply. For example, `LIMIT 3` with
+//! `QueryOptions::max_result_rows(5)` emits at most three rows, while `LIMIT 10` with the same
+//! option emits at most five rows. Use `QueryOptions::max_result_rows(0)` when you want result
+//! table metadata, including column names, without materializing any rows.
+//!
 //! # Errors
 //!
 //! Most operations return [`Result<T>`]. On failure, you get an [`Error`] containing a numeric
@@ -120,6 +148,65 @@ fn missing_runtime_symbol(name: &str) -> Error {
 
 fn require_runtime_symbol<T: Copy>(symbol: Option<T>, name: &str) -> Result<T> {
     symbol.ok_or_else(|| missing_runtime_symbol(name))
+}
+
+/// Out-of-band execution options for query result emission.
+///
+/// Use this type with [`Velr::exec_with_options`], [`Velr::exec_one_with_options`],
+/// [`Velr::run_with_options`], and the matching [`VelrTx`] methods when a host wants to preview
+/// a query result without rewriting the Cypher text.
+///
+/// The options affect result emission only. They do not make a query read-only and they are not a
+/// timeout or cancellation mechanism.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct QueryOptions {
+    /// Maximum number of rows to emit from each result table.
+    ///
+    /// - `None` preserves the default behavior and emits all rows produced by the query.
+    /// - `Some(0)` preserves result table metadata, including column names, but row cursors
+    ///   immediately return EOF.
+    /// - `Some(n)` emits at most `n` rows from each result table.
+    ///
+    /// Existing Cypher `LIMIT` clauses still apply. For example, a query with `LIMIT 3` and
+    /// `max_result_rows = Some(5)` emits at most three rows, while `LIMIT 10` with
+    /// `max_result_rows = Some(5)` emits at most five rows.
+    pub max_result_rows: Option<usize>,
+}
+
+impl QueryOptions {
+    /// Create default query options.
+    ///
+    /// The default has no row cap and behaves like the non-`_with_options` execution methods.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create query options that cap emitted rows per result table.
+    ///
+    /// Passing `0` preserves result table metadata, including column names, but emits no rows.
+    pub fn max_result_rows(max_result_rows: usize) -> Self {
+        Self {
+            max_result_rows: Some(max_result_rows),
+        }
+    }
+
+    /// Set the maximum emitted row count per result table.
+    ///
+    /// Passing `0` preserves result table metadata, including column names, but emits no rows.
+    pub fn with_max_result_rows(mut self, max_result_rows: usize) -> Self {
+        self.max_result_rows = Some(max_result_rows);
+        self
+    }
+}
+
+fn raw_query_options(options: QueryOptions) -> ffi::velr_query_options {
+    ffi::velr_query_options {
+        has_max_result_rows: i32::from(options.max_result_rows.is_some()),
+        max_result_rows: options.max_result_rows.unwrap_or(0),
+        reserved0: 0,
+        reserved1: 0,
+    }
 }
 
 /// Status returned by [`Velr::migrate`].
@@ -962,12 +1049,66 @@ impl Velr {
         })
     }
 
+    /// Execute `openCypher` with out-of-band result emission options.
+    ///
+    /// Use this when a host wants result metadata and a bounded row preview without rewriting the
+    /// Cypher text. [`QueryOptions::max_result_rows`] caps rows emitted from each result table.
+    /// Existing Cypher `LIMIT` clauses still apply, so the effective emitted row count is bounded
+    /// by both the query and the option.
+    ///
+    /// `QueryOptions::max_result_rows(0)` preserves table metadata, including column names, but
+    /// row cursors immediately return EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - `openCypher` contains an interior NUL (`\0`)
+    /// - the runtime reports an execution, planning, or parsing error
+    pub fn exec_with_options<'db>(
+        &'db self,
+        cypher: &str,
+        options: QueryOptions,
+    ) -> Result<ExecTables<'db>> {
+        let a = velr_api()?;
+
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+        let raw_options = raw_query_options(options);
+
+        let mut out_stream: *mut ffi::velr_stream = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe {
+            (a.velr_exec_start_with_options)(
+                self.db.as_ptr(),
+                cy.as_ptr(),
+                &raw_options,
+                &mut out_stream,
+                &mut err,
+            )
+        };
+        rc_to_result(rc, err)?;
+
+        let nn = NonNull::new(out_stream).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "velr_exec_start_with_options returned null stream",
+            )
+        })?;
+
+        Ok(ExecTables {
+            stream: Some(nn),
+            _db: PhantomData,
+            _nosend: PhantomData,
+        })
+    }
+
     /// Execute `openCypher` and return exactly one result table.
     ///
     /// This method succeeds only if executing the provided openCypher text produces exactly one
     /// result table. If execution yields zero tables or more than one table, this returns an error.
     ///
-    /// Use [`exec`] to stream multiple result tables.
+    /// Use [`Velr::exec`] to stream multiple result tables.
     ///
     /// # Errors
     ///
@@ -990,11 +1131,69 @@ impl Velr {
         TableResult::from_raw(out_table)
     }
 
+    /// Execute `openCypher` with options and return exactly one result table.
+    ///
+    /// This is the options-aware form of [`Velr::exec_one`]. It succeeds only if executing the
+    /// provided openCypher text produces exactly one result table. Row emission is controlled by
+    /// [`QueryOptions`]; use [`QueryOptions::max_result_rows`] with `0` to inspect column metadata
+    /// without emitting rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - `openCypher` contains an interior NUL (`\0`)
+    /// - the runtime reports an execution, planning, or parsing error
+    /// - the execution yields zero or multiple result tables
+    pub fn exec_one_with_options(
+        &self,
+        cypher: &str,
+        options: QueryOptions,
+    ) -> Result<TableResult> {
+        let a = velr_api()?;
+
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+        let raw_options = raw_query_options(options);
+
+        let mut out_table: *mut ffi::velr_table = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe {
+            (a.velr_exec_one_with_options)(
+                self.db.as_ptr(),
+                cy.as_ptr(),
+                &raw_options,
+                &mut out_table,
+                &mut err,
+            )
+        };
+        rc_to_result(rc, err)?;
+        TableResult::from_raw(out_table)
+    }
+
     /// Execute a query and discard all results.
     ///
     /// This is a convenience wrapper around [`Velr::exec`] that drains all tables and rows.
     pub fn run(&self, cypher: &str) -> Result<()> {
         let mut st = self.exec(cypher)?;
+        while let Some(mut t) = st.next_table()? {
+            t.for_each_row(|_| Ok(()))?;
+        }
+        Ok(())
+    }
+
+    /// Execute a query with options and discard emitted results.
+    ///
+    /// This drains all result tables like [`Velr::run`]. Query options still affect the rows that
+    /// are drained, but they do not skip side effects from write queries. For example, a
+    /// read-write query with `max_result_rows = 1` may emit one row while still applying all writes
+    /// required by the query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if [`Velr::exec_with_options`] or row draining fails.
+    pub fn run_with_options(&self, cypher: &str, options: QueryOptions) -> Result<()> {
+        let mut st = self.exec_with_options(cypher, options)?;
         while let Some(mut t) = st.next_table()? {
             t.for_each_row(|_| Ok(()))?;
         }
@@ -1576,6 +1775,58 @@ impl<'db> VelrTx<'db> {
         })
     }
 
+    /// Execute `openCypher` within this transaction with out-of-band result emission options.
+    ///
+    /// Transactional semantics match [`VelrTx::exec`]. [`QueryOptions::max_result_rows`] caps
+    /// emitted rows per result table without rewriting the Cypher text. Existing Cypher `LIMIT`
+    /// clauses still apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - the transaction is no longer active
+    /// - `openCypher` contains an interior NUL (`\0`)
+    /// - the runtime reports an execution, planning, or parsing error
+    pub fn exec_with_options<'tx>(
+        &'tx self,
+        cypher: &str,
+        options: QueryOptions,
+    ) -> Result<ExecTablesTx<'tx>> {
+        let a = velr_api()?;
+
+        let tx = self.ptr()?;
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+        let raw_options = raw_query_options(options);
+
+        let mut out_stream: *mut ffi::velr_stream_tx = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe {
+            (a.velr_tx_exec_start_with_options)(
+                tx.as_ptr(),
+                cy.as_ptr(),
+                &raw_options,
+                &mut out_stream,
+                &mut err,
+            )
+        };
+        rc_to_result(rc, err)?;
+
+        let nn = NonNull::new(out_stream).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "tx_exec_start_with_options returned null stream",
+            )
+        })?;
+
+        Ok(ExecTablesTx {
+            stream: Some(nn),
+            _tx: PhantomData,
+            _nosend: PhantomData,
+        })
+    }
+
     /// Execute a query expected to produce exactly one table within this transaction.
     ///
     /// This method is implemented by streaming (`exec`) and validating that exactly one table is
@@ -1600,9 +1851,63 @@ impl<'db> VelrTx<'db> {
         Ok(first)
     }
 
+    /// Execute a query with options and require exactly one result table.
+    ///
+    /// This is the options-aware form of [`VelrTx::exec_one`]. It succeeds only if executing the
+    /// provided openCypher text produces exactly one result table. Use
+    /// [`QueryOptions::max_result_rows`] with `0` to inspect column metadata without emitting rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if:
+    /// - the transaction is no longer active
+    /// - `openCypher` contains an interior NUL (`\0`)
+    /// - the loaded runtime does not expose the transaction query-options ABI
+    /// - the runtime reports an execution, planning, or parsing error
+    /// - the execution yields zero or multiple result tables
+    pub fn exec_one_with_options(
+        &self,
+        cypher: &str,
+        options: QueryOptions,
+    ) -> Result<TableResult> {
+        let mut st = self.exec_with_options(cypher, options)?;
+        let first = match st.next_table()? {
+            Some(t) => t,
+            None => {
+                return Err(Error::new(
+                    ffi::velr_code::VELR_EERR as i32,
+                    "query produced no result tables",
+                ))
+            }
+        };
+        if st.next_table()?.is_some() {
+            return Err(Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "query produced multiple tables; use exec()",
+            ));
+        }
+        Ok(first)
+    }
+
     /// Execute a query within this transaction and discard all results.
     pub fn run(&self, cypher: &str) -> Result<()> {
         let mut st = self.exec(cypher)?;
+        while let Some(mut t) = st.next_table()? {
+            t.for_each_row(|_| Ok(()))?;
+        }
+        Ok(())
+    }
+
+    /// Execute a query with options inside this transaction and discard results.
+    ///
+    /// This drains all result tables like [`VelrTx::run`]. Query options cap only emitted rows;
+    /// they do not skip query side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if [`VelrTx::exec_with_options`] or row draining fails.
+    pub fn run_with_options(&self, cypher: &str, options: QueryOptions) -> Result<()> {
+        let mut st = self.exec_with_options(cypher, options)?;
         while let Some(mut t) = st.next_table()? {
             t.for_each_row(|_| Ok(()))?;
         }

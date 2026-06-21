@@ -1,7 +1,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 #[cfg(feature = "arrow-ipc")]
 use arrow2::ffi::{ArrowArray, ArrowSchema};
 /// Discriminant for [`velr_cell`].
@@ -38,6 +38,15 @@ pub struct velr_cell {
     pub f64_: f64,
     pub ptr: *const u8,
     pub len: usize,
+}
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct velr_query_options {
+    pub has_max_result_rows: c_int,
+    pub max_result_rows: usize,
+    pub reserved0: u64,
+    pub reserved1: u64,
 }
 /// Borrowed byte slice view (not NUL-terminated).
 ///

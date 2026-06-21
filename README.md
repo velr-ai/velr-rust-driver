@@ -236,6 +236,45 @@ while let Some(mut table) = stream.next_table()? {
 ```
 
 ---
+
+## Bounded result previews
+
+Use `QueryOptions::max_result_rows` when a host needs projected column names and
+a small row sample without rewriting the Cypher text:
+
+```rust,no_run
+use velr::{QueryOptions, Velr};
+
+fn main() -> velr::Result<()> {
+    let db = Velr::open_readonly("mygraph.db")?;
+    let mut table = db.exec_one_with_options(
+        "MATCH (n) RETURN labels(n) AS labels, n.name AS name ORDER BY name",
+        QueryOptions::max_result_rows(20),
+    )?;
+
+    let columns = table.column_names().to_vec();
+    let sample = table.collect(|row| {
+        Ok(row.iter().map(|cell| format!("{cell:?}")).collect::<Vec<_>>())
+    })?;
+
+    println!("{columns:?}");
+    println!("{sample:?}");
+    Ok(())
+}
+```
+
+`max_result_rows = 0` preserves the returned column metadata and opens row
+cursors at EOF. The cap is enforced by Velr during result emission, not by
+appending or injecting Cypher `LIMIT`, and applies independently to each result
+table produced by `exec_with_options`. Existing Cypher `LIMIT` clauses still
+apply, so a query with `LIMIT 3` and `max_result_rows = 5` emits at most three
+rows, while `LIMIT 10` with `max_result_rows = 5` emits at most five rows. It is
+not a timeout or cancellation
+mechanism; hosts that need read-only validation or execution deadlines should
+keep those checks separate.
+
+---
+
 ## Transactions and savepoints
 
 Velr supports transactions together with two kinds of savepoints:

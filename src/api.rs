@@ -46,6 +46,13 @@ pub struct Api {
         *mut *mut velr_stream,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_exec_start_with_options: unsafe extern "C" fn(
+        *mut velr_db,
+        *const c_char,
+        *const velr_query_options,
+        *mut *mut velr_stream,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_exec_close: unsafe extern "C" fn(*mut velr_stream),
     pub velr_stream_next_table: unsafe extern "C" fn(
         *mut velr_stream,
@@ -146,6 +153,13 @@ pub struct Api {
         *mut *mut velr_table,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_exec_one_with_options: unsafe extern "C" fn(
+        *mut velr_db,
+        *const c_char,
+        *const velr_query_options,
+        *mut *mut velr_table,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_table_close: unsafe extern "C" fn(*mut velr_table),
     pub velr_table_column_count: unsafe extern "C" fn(*mut velr_table) -> usize,
     pub velr_table_column_name: unsafe extern "C" fn(
@@ -184,6 +198,13 @@ pub struct Api {
     pub velr_tx_exec_start: unsafe extern "C" fn(
         *mut velr_tx,
         *const c_char,
+        *mut *mut velr_stream_tx,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_tx_exec_start_with_options: unsafe extern "C" fn(
+        *mut velr_tx,
+        *const c_char,
+        *const velr_query_options,
         *mut *mut velr_stream_tx,
         *mut *mut c_char,
     ) -> velr_code,
@@ -330,6 +351,10 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_exec_start), "\0").as_bytes(),
             )?,
+            velr_exec_start_with_options: get(
+                lib,
+                concat!(stringify!(velr_exec_start_with_options), "\0").as_bytes(),
+            )?,
             velr_exec_close: get(
                 lib,
                 concat!(stringify!(velr_exec_close), "\0").as_bytes(),
@@ -405,6 +430,10 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_exec_one), "\0").as_bytes(),
             )?,
+            velr_exec_one_with_options: get(
+                lib,
+                concat!(stringify!(velr_exec_one_with_options), "\0").as_bytes(),
+            )?,
             velr_table_close: get(
                 lib,
                 concat!(stringify!(velr_table_close), "\0").as_bytes(),
@@ -448,6 +477,10 @@ impl Api {
             velr_tx_exec_start: get(
                 lib,
                 concat!(stringify!(velr_tx_exec_start), "\0").as_bytes(),
+            )?,
+            velr_tx_exec_start_with_options: get(
+                lib,
+                concat!(stringify!(velr_tx_exec_start_with_options), "\0").as_bytes(),
             )?,
             velr_exec_tx_close: get(
                 lib,
