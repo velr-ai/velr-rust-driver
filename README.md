@@ -273,6 +273,49 @@ not a timeout or cancellation
 mechanism; hosts that need read-only validation or execution deadlines should
 keep those checks separate.
 
+## Query parameter binding
+
+Use `params!`, `QueryParams`, or `QueryOptions::with_param` to bind openCypher parameters
+out of band. Query text uses `$name`; API parameter names omit the leading `$`.
+Values are passed as Cypher values, not interpolated into query text, so a Rust
+`String` is always a Cypher string value.
+
+```rust,no_run
+use velr::{QueryOptions, Velr};
+
+fn main() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+
+    db.run_with_params(
+        "CREATE (:Person {name: $name, age: $age})",
+        velr::params! {
+            name: "Alice",
+            age: 42_i64,
+        }?,
+    )?;
+
+    let mut table = db.exec_one_with_options(
+        "MATCH (p:Person) WHERE p.age >= $min_age RETURN p.name AS name ORDER BY name",
+        QueryOptions::max_result_rows(20).with_param("min_age", 18_i64)?,
+    )?;
+
+    println!("{:?}", table.column_names());
+    table.for_each_row(|row| {
+        println!("{row:?}");
+        Ok(())
+    })?;
+    Ok(())
+}
+```
+
+Supported parameter values are `null`, booleans, signed 64-bit integers, finite
+floats, strings, lists, and maps. Lists and maps can be supplied as
+`QueryValue::List` / `QueryValue::Map`, Rust `Vec`s, `BTreeMap<String, _>`,
+`HashMap<String, _>`, or `serde_json::Value`.
+
+Use string-literal keys in `params!` for parameter names that are not Rust
+identifiers, such as `$1`: `velr::params! { name: "Alice", "1" => 42_i64 }?`.
+
 ---
 
 ## Transactions and savepoints

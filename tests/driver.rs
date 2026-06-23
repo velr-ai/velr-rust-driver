@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+
 use serde_json::Value;
-use velr::{CellRef, QueryOptions, Velr};
+use velr::{CellRef, QueryOptions, QueryParams, QueryValue, Velr};
 
 #[derive(Debug, PartialEq)]
 enum Owned {
@@ -135,6 +137,95 @@ fn query_options_cap_rows_tx() -> velr::Result<()> {
     assert_eq!(t.column_names(), &["x".to_string()]);
     let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
     assert_eq!(rows, vec![vec![Owned::Int(10)]]);
+    Ok(())
+}
+
+#[test]
+fn query_params_and_row_cap_non_tx() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let options = QueryOptions::max_result_rows(2).with_param("min", 2_i64)?;
+    let mut t = db.exec_one_with_options(
+        "UNWIND [1,2,3,4] AS x WITH x WHERE x >= $min RETURN x ORDER BY x",
+        options,
+    )?;
+
+    assert_eq!(t.column_names(), &["x".to_string()]);
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(rows, vec![vec![Owned::Int(2)], vec![Owned::Int(3)]]);
+    Ok(())
+}
+
+#[test]
+fn query_params_shortcut_preserves_string_values_non_tx() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let params = QueryParams::new()
+        .with("name", "Alice")?
+        .with("literal", "MATCH (n) RETURN n")?;
+    let mut t = db.exec_one_with_params("RETURN $name AS name, $literal AS literal", params)?;
+
+    assert_eq!(
+        t.column_names(),
+        &["name".to_string(), "literal".to_string()]
+    );
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Owned::Text(b"Alice".to_vec()),
+            Owned::Text(b"MATCH (n) RETURN n".to_vec())
+        ]]
+    );
+    Ok(())
+}
+
+#[test]
+fn query_params_shortcuts_work_in_tx() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let tx = db.begin_tx()?;
+
+    let mut props = BTreeMap::new();
+    props.insert("name".to_string(), QueryValue::String("Alice".to_string()));
+    props.insert("score".to_string(), QueryValue::Integer(7));
+    tx.run_with_params(
+        "CREATE (:Person $props)",
+        QueryParams::new().with("props", QueryValue::Map(props))?,
+    )?;
+
+    let params = QueryParams::new().with("name", "Alice")?;
+    let mut t = tx.exec_one_with_params(
+        "MATCH (p:Person {name: $name}) RETURN p.score AS score",
+        params,
+    )?;
+    assert_eq!(t.column_names(), &["score".to_string()]);
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(rows, vec![vec![Owned::Int(7)]]);
+    Ok(())
+}
+
+#[test]
+fn query_params_macro_supports_identifier_and_literal_keys() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+
+    let params = velr::params! {
+        name: "Alice",
+        age: 42_i64,
+        "1" => 7_i64,
+        "literal" => "MATCH (n) RETURN n",
+    }?;
+    let mut t = db.exec_one_with_params(
+        "RETURN $name AS name, $age AS age, $1 AS one, $literal AS literal",
+        params,
+    )?;
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Owned::Text(b"Alice".to_vec()),
+            Owned::Int(42),
+            Owned::Int(7),
+            Owned::Text(b"MATCH (n) RETURN n".to_vec())
+        ]]
+    );
     Ok(())
 }
 

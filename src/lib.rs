@@ -66,6 +66,33 @@
 //! option emits at most five rows. Use `QueryOptions::max_result_rows(0)` when you want result
 //! table metadata, including column names, without materializing any rows.
 //!
+//! # Query parameter binding
+//!
+//! Use [`params!`] or [`QueryParams`] for params-only calls, or combine params with bounded
+//! previews through [`QueryOptions`]. Query text uses `$name`; API parameter names omit the
+//! leading `$`.
+//!
+//! ```
+//! # use velr::{QueryOptions, Velr};
+//! # fn main() -> velr::Result<()> {
+//! let db = Velr::open(None)?;
+//! db.run_with_params(
+//!     "CREATE (:Person {name: $name, age: $age})",
+//!     velr::params! {
+//!         name: "Alice",
+//!         age: 42_i64,
+//!     }?,
+//! )?;
+//!
+//! let mut table = db.exec_one_with_options(
+//!     "MATCH (p:Person) WHERE p.age >= $min_age RETURN p.name AS name ORDER BY name",
+//!     QueryOptions::max_result_rows(20).with_param("min_age", 18_i64)?,
+//! )?;
+//! assert_eq!(table.column_names(), &["name".to_string()]);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Errors
 //!
 //! Most operations return [`Result<T>`]. On failure, you get an [`Error`] containing a numeric
@@ -93,14 +120,17 @@ mod sys;
 
 use std::{
     cell::{Cell, RefCell},
+    collections::{BTreeMap, HashMap},
     ffi::{CStr, CString},
     fmt,
+    hash::BuildHasher,
     marker::PhantomData,
     os::raw::c_char,
     ptr::NonNull,
     rc::Rc,
 };
 
+use serde_json::Value as JsonValue;
 use sys as ffi;
 
 /// Convenience result type used throughout the public API.
@@ -139,6 +169,463 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A Cypher value supplied out-of-band through [`QueryParams`].
+///
+/// Values are bound as data and are never parsed as Cypher text. For example,
+/// `QueryValue::String("RETURN 1".to_string())` is a Cypher string value, not executable text.
+///
+/// This covers the openCypher parameter value surface: `null`, booleans, signed 64-bit integers,
+/// finite floats, strings, lists, and maps with string keys.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryValue {
+    /// The Cypher `null` value.
+    Null,
+    /// A Cypher `BOOLEAN`.
+    Bool(bool),
+    /// A Cypher `INTEGER`.
+    Integer(i64),
+    /// A Cypher `FLOAT`.
+    Float(f64),
+    /// A Cypher `STRING`.
+    String(String),
+    /// A Cypher list.
+    List(Vec<QueryValue>),
+    /// A Cypher map.
+    Map(BTreeMap<String, QueryValue>),
+}
+
+/// Named parameters supplied to a Cypher query.
+///
+/// Query text references parameters with `$name`; API callers pass the name without the leading
+/// `$`, for example `QueryParams::new().with("name", "Alice")?`. Numeric parameter names are
+/// passed the same way, so `$1` in query text is bound with the key `"1"`.
+///
+/// Parameters are sent to the runtime separately from the Cypher text. They are suitable for user
+/// data because strings and other values cannot be interpreted as query fragments.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueryParams {
+    values: BTreeMap<String, QueryValue>,
+}
+
+/// Error returned while constructing or binding query parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryParamError {
+    message: String,
+}
+
+impl QueryParamError {
+    /// Create a parameter-construction error with a human-readable message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for QueryParamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for QueryParamError {}
+
+impl From<QueryParamError> for Error {
+    fn from(value: QueryParamError) -> Self {
+        Error::new(ffi::velr_code::VELR_EARG as i32, value.to_string())
+    }
+}
+
+/// Fallible conversion from a Rust value into a Cypher parameter value.
+///
+/// Implementations are provided for `QueryValue`, `()`, `Option<T>`, booleans, signed and
+/// unsigned integer types that fit in Cypher `INTEGER`, `f32`/`f64` finite floats, `String`,
+/// `&str`, `Vec<T>`, `BTreeMap<String, T>`, `HashMap<String, T>`, and `serde_json::Value`.
+pub trait TryIntoQueryValue {
+    /// Convert this Rust value into a Cypher parameter value.
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError>;
+}
+
+impl QueryParams {
+    /// Create an empty parameter map.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return a new parameter map with one additional named value.
+    ///
+    /// The name must be non-empty and should not include the leading `$` used in Cypher text.
+    /// Returns [`QueryParamError`] if the name or value cannot be represented as a Cypher
+    /// parameter value.
+    pub fn with<V>(
+        mut self,
+        name: impl Into<String>,
+        value: V,
+    ) -> std::result::Result<Self, QueryParamError>
+    where
+        V: TryIntoQueryValue,
+    {
+        self.insert(name, value)?;
+        Ok(self)
+    }
+
+    /// Insert or replace one named value.
+    ///
+    /// The name must be non-empty and should not include the leading `$` used in Cypher text.
+    /// Returns [`QueryParamError`] if the name or value cannot be represented as a Cypher
+    /// parameter value.
+    pub fn insert<V>(
+        &mut self,
+        name: impl Into<String>,
+        value: V,
+    ) -> std::result::Result<(), QueryParamError>
+    where
+        V: TryIntoQueryValue,
+    {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(QueryParamError::new("query parameter name cannot be empty"));
+        }
+        if name.starts_with('$') {
+            return Err(QueryParamError::new(
+                "query parameter name should not include the leading `$`",
+            ));
+        }
+        let value = value.try_into_query_value()?;
+        validate_query_value(&value)?;
+        self.values.insert(name, value);
+        Ok(())
+    }
+
+    /// Get a parameter value by name, without the leading `$`.
+    pub fn get(&self, name: &str) -> Option<&QueryValue> {
+        self.values.get(name)
+    }
+
+    /// Iterate over parameter names and values in stable key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &QueryValue)> {
+        self.values
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+    }
+
+    /// Return true when the parameter map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Return the number of named parameters.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
+/// Build a [`QueryParams`] map with compact syntax.
+///
+/// The macro returns `Result<QueryParams, QueryParamError>` so parameter-name and value validation
+/// remain explicit at the call site.
+///
+/// ```
+/// # fn main() -> velr::Result<()> {
+/// let params = velr::params! {
+///     "name" => "Alice",
+///     "age" => 42_i64,
+/// }?;
+/// assert_eq!(params.len(), 2);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Identifier keys are also accepted and are stringified, and can be mixed with literal keys:
+///
+/// ```
+/// # fn main() -> velr::Result<()> {
+/// let params = velr::params! {
+///     name: "Alice",
+///     "1" => 42_i64,
+/// }?;
+/// assert_eq!(params.len(), 2);
+/// # Ok(())
+/// # }
+/// ```
+#[macro_export]
+macro_rules! params {
+    () => {
+        ::std::result::Result::<$crate::QueryParams, $crate::QueryParamError>::Ok(
+            $crate::QueryParams::new(),
+        )
+    };
+    (@insert $params:ident,) => {};
+    (@insert $params:ident) => {};
+    (@insert $params:ident, $name:ident : $value:expr, $($rest:tt)*) => {
+        $params.insert(::std::stringify!($name), $value)?;
+        $crate::params!(@insert $params, $($rest)*);
+    };
+    (@insert $params:ident, $name:ident : $value:expr) => {
+        $params.insert(::std::stringify!($name), $value)?;
+    };
+    (@insert $params:ident, $name:literal => $value:expr, $($rest:tt)*) => {
+        $params.insert($name, $value)?;
+        $crate::params!(@insert $params, $($rest)*);
+    };
+    (@insert $params:ident, $name:literal => $value:expr) => {
+        $params.insert($name, $value)?;
+    };
+    ($($tt:tt)+) => {{
+        let mut params = $crate::QueryParams::new();
+        let result: ::std::result::Result<$crate::QueryParams, $crate::QueryParamError> = (|| {
+            $crate::params!(@insert params, $($tt)+);
+            ::std::result::Result::Ok(params)
+        })();
+        result
+    }};
+}
+
+impl TryIntoQueryValue for QueryValue {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        validate_query_value(&self)?;
+        Ok(self)
+    }
+}
+
+impl TryIntoQueryValue for () {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        Ok(QueryValue::Null)
+    }
+}
+
+impl<T> TryIntoQueryValue for Option<T>
+where
+    T: TryIntoQueryValue,
+{
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        match self {
+            Some(value) => value.try_into_query_value(),
+            None => Ok(QueryValue::Null),
+        }
+    }
+}
+
+impl TryIntoQueryValue for bool {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        Ok(QueryValue::Bool(self))
+    }
+}
+
+impl TryIntoQueryValue for i64 {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        Ok(QueryValue::Integer(self))
+    }
+}
+
+macro_rules! signed_int_value {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl TryIntoQueryValue for $ty {
+                fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+                    Ok(QueryValue::Integer(i64::from(self)))
+                }
+            }
+        )*
+    };
+}
+
+signed_int_value!(i8, i16, i32);
+
+impl TryIntoQueryValue for isize {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        let value = i64::try_from(self)
+            .map_err(|_| QueryParamError::new("isize parameter does not fit Cypher INTEGER"))?;
+        Ok(QueryValue::Integer(value))
+    }
+}
+
+macro_rules! unsigned_int_value {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl TryIntoQueryValue for $ty {
+                fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+                    let value = i64::try_from(self).map_err(|_| {
+                        QueryParamError::new(concat!(
+                            stringify!($ty),
+                            " parameter does not fit Cypher INTEGER"
+                        ))
+                    })?;
+                    Ok(QueryValue::Integer(value))
+                }
+            }
+        )*
+    };
+}
+
+unsigned_int_value!(u8, u16, u32, u64, usize);
+
+impl TryIntoQueryValue for f64 {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        if !self.is_finite() {
+            return Err(QueryParamError::new(
+                "floating point query parameters must be finite",
+            ));
+        }
+        Ok(QueryValue::Float(self))
+    }
+}
+
+impl TryIntoQueryValue for f32 {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        if !self.is_finite() {
+            return Err(QueryParamError::new(
+                "floating point query parameters must be finite",
+            ));
+        }
+        Ok(QueryValue::Float(f64::from(self)))
+    }
+}
+
+impl TryIntoQueryValue for String {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        Ok(QueryValue::String(self))
+    }
+}
+
+impl TryIntoQueryValue for &str {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        Ok(QueryValue::String(self.to_string()))
+    }
+}
+
+impl<T> TryIntoQueryValue for Vec<T>
+where
+    T: TryIntoQueryValue,
+{
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        let mut out = Vec::with_capacity(self.len());
+        for value in self {
+            let value = value.try_into_query_value()?;
+            validate_query_value(&value)?;
+            out.push(value);
+        }
+        Ok(QueryValue::List(out))
+    }
+}
+
+impl<T> TryIntoQueryValue for BTreeMap<String, T>
+where
+    T: TryIntoQueryValue,
+{
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        let mut out = BTreeMap::new();
+        for (key, value) in self {
+            let value = value.try_into_query_value()?;
+            validate_query_value(&value)?;
+            out.insert(key, value);
+        }
+        Ok(QueryValue::Map(out))
+    }
+}
+
+impl<T, S> TryIntoQueryValue for HashMap<String, T, S>
+where
+    T: TryIntoQueryValue,
+    S: BuildHasher,
+{
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        let mut out = BTreeMap::new();
+        for (key, value) in self {
+            let value = value.try_into_query_value()?;
+            validate_query_value(&value)?;
+            out.insert(key, value);
+        }
+        Ok(QueryValue::Map(out))
+    }
+}
+
+impl TryIntoQueryValue for JsonValue {
+    fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError> {
+        match self {
+            JsonValue::Null => Ok(QueryValue::Null),
+            JsonValue::Bool(value) => Ok(QueryValue::Bool(value)),
+            JsonValue::Number(value) => {
+                if let Some(value) = value.as_i64() {
+                    Ok(QueryValue::Integer(value))
+                } else if let Some(value) = value.as_u64() {
+                    let value = i64::try_from(value).map_err(|_| {
+                        QueryParamError::new("JSON integer parameter does not fit Cypher INTEGER")
+                    })?;
+                    Ok(QueryValue::Integer(value))
+                } else if let Some(value) = value.as_f64() {
+                    if !value.is_finite() {
+                        return Err(QueryParamError::new(
+                            "floating point query parameters must be finite",
+                        ));
+                    }
+                    Ok(QueryValue::Float(value))
+                } else {
+                    Err(QueryParamError::new("unsupported JSON number parameter"))
+                }
+            }
+            JsonValue::String(value) => Ok(QueryValue::String(value)),
+            JsonValue::Array(values) => {
+                let mut out = Vec::with_capacity(values.len());
+                for value in values {
+                    out.push(value.try_into_query_value()?);
+                }
+                Ok(QueryValue::List(out))
+            }
+            JsonValue::Object(values) => {
+                let mut out = BTreeMap::new();
+                for (key, value) in values {
+                    out.insert(key, value.try_into_query_value()?);
+                }
+                Ok(QueryValue::Map(out))
+            }
+        }
+    }
+}
+
+fn validate_query_value(value: &QueryValue) -> std::result::Result<(), QueryParamError> {
+    match value {
+        QueryValue::Float(value) if !value.is_finite() => Err(QueryParamError::new(
+            "floating point query parameters must be finite",
+        )),
+        QueryValue::List(values) => {
+            for value in values {
+                validate_query_value(value)?;
+            }
+            Ok(())
+        }
+        QueryValue::Map(values) => {
+            for value in values.values() {
+                validate_query_value(value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn query_value_to_json(value: &QueryValue) -> JsonValue {
+    match value {
+        QueryValue::Null => JsonValue::Null,
+        QueryValue::Bool(value) => JsonValue::Bool(*value),
+        QueryValue::Integer(value) => JsonValue::Number(serde_json::Number::from(*value)),
+        QueryValue::Float(value) => JsonValue::Number(
+            serde_json::Number::from_f64(*value)
+                .expect("QueryValue::Float is validated to be finite"),
+        ),
+        QueryValue::String(value) => JsonValue::String(value.clone()),
+        QueryValue::List(values) => {
+            JsonValue::Array(values.iter().map(query_value_to_json).collect())
+        }
+        QueryValue::Map(values) => JsonValue::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), query_value_to_json(value)))
+                .collect(),
+        ),
+    }
+}
+
 fn missing_runtime_symbol(name: &str) -> Error {
     Error::new(
         ffi::velr_code::VELR_EERR as i32,
@@ -158,7 +645,7 @@ fn require_runtime_symbol<T: Copy>(symbol: Option<T>, name: &str) -> Result<T> {
 ///
 /// The options affect result emission only. They do not make a query read-only and they are not a
 /// timeout or cancellation mechanism.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct QueryOptions {
     /// Maximum number of rows to emit from each result table.
@@ -172,6 +659,10 @@ pub struct QueryOptions {
     /// `max_result_rows = Some(5)` emits at most three rows, while `LIMIT 10` with
     /// `max_result_rows = Some(5)` emits at most five rows.
     pub max_result_rows: Option<usize>,
+    /// Named query parameters bound as Cypher values.
+    ///
+    /// Query text references these with `$name`; parameter names in this map omit the leading `$`.
+    pub params: QueryParams,
 }
 
 impl QueryOptions {
@@ -188,6 +679,7 @@ impl QueryOptions {
     pub fn max_result_rows(max_result_rows: usize) -> Self {
         Self {
             max_result_rows: Some(max_result_rows),
+            params: QueryParams::new(),
         }
     }
 
@@ -198,15 +690,134 @@ impl QueryOptions {
         self.max_result_rows = Some(max_result_rows);
         self
     }
+
+    /// Set the full parameter map for this query.
+    pub fn with_params(mut self, params: QueryParams) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Add one named parameter to this query.
+    ///
+    /// The name should not include the leading `$` used in Cypher text.
+    pub fn with_param<V>(
+        mut self,
+        name: impl Into<String>,
+        value: V,
+    ) -> std::result::Result<Self, QueryParamError>
+    where
+        V: TryIntoQueryValue,
+    {
+        self.params.insert(name, value)?;
+        Ok(self)
+    }
 }
 
-fn raw_query_options(options: QueryOptions) -> ffi::velr_query_options {
-    ffi::velr_query_options {
+struct RawQueryParams {
+    ptr: NonNull<ffi::velr_query_params>,
+    free: unsafe extern "C" fn(*mut ffi::velr_query_params),
+}
+
+impl RawQueryParams {
+    fn from_query_params(params: &QueryParams) -> Result<Option<Self>> {
+        if params.is_empty() {
+            return Ok(None);
+        }
+
+        let a = velr_api()?;
+        let ptr = unsafe { (a.velr_query_params_new)() };
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "velr_query_params_new returned null",
+            )
+        })?;
+
+        let out = Self {
+            ptr,
+            free: a.velr_query_params_free,
+        };
+        for (name, value) in params.iter() {
+            out.set(name, value)?;
+        }
+        Ok(Some(out))
+    }
+
+    fn set(&self, name: &str, value: &QueryValue) -> Result<()> {
+        let a = velr_api()?;
+        let name = raw_strview(name.as_bytes());
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            match value {
+                QueryValue::Null => {
+                    (a.velr_query_params_set_null)(self.ptr.as_ptr(), name, &mut err)
+                }
+                QueryValue::Bool(value) => (a.velr_query_params_set_bool)(
+                    self.ptr.as_ptr(),
+                    name,
+                    i32::from(*value),
+                    &mut err,
+                ),
+                QueryValue::Integer(value) => {
+                    (a.velr_query_params_set_i64)(self.ptr.as_ptr(), name, *value, &mut err)
+                }
+                QueryValue::Float(value) => {
+                    (a.velr_query_params_set_f64)(self.ptr.as_ptr(), name, *value, &mut err)
+                }
+                QueryValue::String(value) => (a.velr_query_params_set_text)(
+                    self.ptr.as_ptr(),
+                    name,
+                    raw_strview(value.as_bytes()),
+                    &mut err,
+                ),
+                QueryValue::List(_) | QueryValue::Map(_) => {
+                    let json = serde_json::to_vec(&query_value_to_json(value)).map_err(|e| {
+                        Error::new(
+                            ffi::velr_code::VELR_EERR as i32,
+                            format!("failed to encode query parameter JSON: {e}"),
+                        )
+                    })?;
+                    (a.velr_query_params_set_json)(
+                        self.ptr.as_ptr(),
+                        name,
+                        raw_strview(&json),
+                        &mut err,
+                    )
+                }
+            }
+        };
+        rc_to_result(rc, err)
+    }
+}
+
+impl Drop for RawQueryParams {
+    fn drop(&mut self) {
+        unsafe {
+            (self.free)(self.ptr.as_ptr());
+        }
+    }
+}
+
+fn raw_strview(bytes: &[u8]) -> ffi::velr_strview {
+    ffi::velr_strview {
+        ptr: bytes.as_ptr(),
+        len: bytes.len(),
+    }
+}
+
+fn raw_query_options(
+    options: &QueryOptions,
+) -> Result<(ffi::velr_query_options, Option<RawQueryParams>)> {
+    let params = RawQueryParams::from_query_params(&options.params)?;
+    let raw = ffi::velr_query_options {
         has_max_result_rows: i32::from(options.max_result_rows.is_some()),
         max_result_rows: options.max_result_rows.unwrap_or(0),
-        reserved0: 0,
-        reserved1: 0,
-    }
+        params: params
+            .as_ref()
+            .map(|params| params.ptr.as_ptr() as *const ffi::velr_query_params)
+            .unwrap_or(std::ptr::null()),
+    };
+    Ok((raw, params))
 }
 
 /// Status returned by [`Velr::migrate`].
@@ -1073,7 +1684,7 @@ impl Velr {
 
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
-        let raw_options = raw_query_options(options);
+        let (raw_options, _raw_params) = raw_query_options(&options)?;
 
         let mut out_stream: *mut ffi::velr_stream = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -1153,7 +1764,7 @@ impl Velr {
 
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
-        let raw_options = raw_query_options(options);
+        let (raw_options, _raw_params) = raw_query_options(&options)?;
 
         let mut out_table: *mut ffi::velr_table = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -1198,6 +1809,34 @@ impl Velr {
             t.for_each_row(|_| Ok(()))?;
         }
         Ok(())
+    }
+
+    /// Execute `openCypher` with bound parameters and return a stream of result tables.
+    ///
+    /// This is a convenience wrapper around [`Velr::exec_with_options`] for the common case where
+    /// only parameters are needed.
+    pub fn exec_with_params<'db>(
+        &'db self,
+        cypher: &str,
+        params: QueryParams,
+    ) -> Result<ExecTables<'db>> {
+        self.exec_with_options(cypher, QueryOptions::new().with_params(params))
+    }
+
+    /// Execute `openCypher` with bound parameters and return exactly one result table.
+    ///
+    /// This is a convenience wrapper around [`Velr::exec_one_with_options`] for the common case
+    /// where only parameters are needed.
+    pub fn exec_one_with_params(&self, cypher: &str, params: QueryParams) -> Result<TableResult> {
+        self.exec_one_with_options(cypher, QueryOptions::new().with_params(params))
+    }
+
+    /// Execute `openCypher` with bound parameters and discard all results.
+    ///
+    /// This is a convenience wrapper around [`Velr::run_with_options`] for the common case where
+    /// only parameters are needed.
+    pub fn run_with_params(&self, cypher: &str, params: QueryParams) -> Result<()> {
+        self.run_with_options(cypher, QueryOptions::new().with_params(params))
     }
 
     /// Build an EXPLAIN trace for `openCypher`.
@@ -1797,7 +2436,7 @@ impl<'db> VelrTx<'db> {
         let tx = self.ptr()?;
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
-        let raw_options = raw_query_options(options);
+        let (raw_options, _raw_params) = raw_query_options(&options)?;
 
         let mut out_stream: *mut ffi::velr_stream_tx = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -1912,6 +2551,34 @@ impl<'db> VelrTx<'db> {
             t.for_each_row(|_| Ok(()))?;
         }
         Ok(())
+    }
+
+    /// Execute `openCypher` with bound parameters inside this transaction.
+    ///
+    /// This is a convenience wrapper around [`VelrTx::exec_with_options`] for the common case
+    /// where only parameters are needed.
+    pub fn exec_with_params<'tx>(
+        &'tx self,
+        cypher: &str,
+        params: QueryParams,
+    ) -> Result<ExecTablesTx<'tx>> {
+        self.exec_with_options(cypher, QueryOptions::new().with_params(params))
+    }
+
+    /// Execute `openCypher` with bound parameters inside this transaction and require one table.
+    ///
+    /// This is a convenience wrapper around [`VelrTx::exec_one_with_options`] for the common case
+    /// where only parameters are needed.
+    pub fn exec_one_with_params(&self, cypher: &str, params: QueryParams) -> Result<TableResult> {
+        self.exec_one_with_options(cypher, QueryOptions::new().with_params(params))
+    }
+
+    /// Execute `openCypher` with bound parameters inside this transaction and discard results.
+    ///
+    /// This is a convenience wrapper around [`VelrTx::run_with_options`] for the common case where
+    /// only parameters are needed.
+    pub fn run_with_params(&self, cypher: &str, params: QueryParams) -> Result<()> {
+        self.run_with_options(cypher, QueryOptions::new().with_params(params))
     }
 
     /// Build an EXPLAIN trace for `openCypher`.

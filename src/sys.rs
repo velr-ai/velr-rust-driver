@@ -45,8 +45,7 @@ pub struct velr_cell {
 pub struct velr_query_options {
     pub has_max_result_rows: c_int,
     pub max_result_rows: usize,
-    pub reserved0: u64,
-    pub reserved1: u64,
+    pub params: *const velr_query_params,
 }
 /// Borrowed byte slice view (not NUL-terminated).
 ///
@@ -145,6 +144,10 @@ pub struct velr_arrow_chunks {
 }
 #[repr(C)]
 pub struct velr_db {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub struct velr_query_params {
     _private: [u8; 0],
 }
 #[repr(C)]

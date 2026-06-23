@@ -21,6 +21,43 @@ pub struct Api {
         ) -> velr_code,
     >,
     pub velr_close: unsafe extern "C" fn(*mut velr_db),
+    pub velr_query_params_new: unsafe extern "C" fn() -> *mut velr_query_params,
+    pub velr_query_params_free: unsafe extern "C" fn(*mut velr_query_params),
+    pub velr_query_params_set_null: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_query_params_set_bool: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        c_int,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_query_params_set_i64: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        i64,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_query_params_set_f64: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        f64,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_query_params_set_text: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        velr_strview,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_query_params_set_json: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        velr_strview,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_schema_version: Option<
         unsafe extern "C" fn(*mut velr_db, *mut i32, *mut *mut c_char) -> velr_code,
     >,
@@ -327,6 +364,38 @@ impl Api {
                 concat!(stringify!(velr_open_existing_readonly), "\0").as_bytes(),
             ),
             velr_close: get(lib, concat!(stringify!(velr_close), "\0").as_bytes())?,
+            velr_query_params_new: get(
+                lib,
+                concat!(stringify!(velr_query_params_new), "\0").as_bytes(),
+            )?,
+            velr_query_params_free: get(
+                lib,
+                concat!(stringify!(velr_query_params_free), "\0").as_bytes(),
+            )?,
+            velr_query_params_set_null: get(
+                lib,
+                concat!(stringify!(velr_query_params_set_null), "\0").as_bytes(),
+            )?,
+            velr_query_params_set_bool: get(
+                lib,
+                concat!(stringify!(velr_query_params_set_bool), "\0").as_bytes(),
+            )?,
+            velr_query_params_set_i64: get(
+                lib,
+                concat!(stringify!(velr_query_params_set_i64), "\0").as_bytes(),
+            )?,
+            velr_query_params_set_f64: get(
+                lib,
+                concat!(stringify!(velr_query_params_set_f64), "\0").as_bytes(),
+            )?,
+            velr_query_params_set_text: get(
+                lib,
+                concat!(stringify!(velr_query_params_set_text), "\0").as_bytes(),
+            )?,
+            velr_query_params_set_json: get(
+                lib,
+                concat!(stringify!(velr_query_params_set_json), "\0").as_bytes(),
+            )?,
             velr_schema_version: get_optional(
                 lib,
                 concat!(stringify!(velr_schema_version), "\0").as_bytes(),
