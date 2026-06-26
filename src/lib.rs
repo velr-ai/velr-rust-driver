@@ -100,10 +100,10 @@
 //!
 //! # Schema migration and introspection
 //!
-//! This runtime's current on-disk schema is version 5. Supported older databases can be opened
+//! This runtime's current on-disk schema is version 6. Supported older databases can be opened
 //! without automatic migration. Reads remain available on those databases, but writes and
-//! `SHOW CURRENT GRAPH SHAPE` require schema version 5 and return a query error until the user
-//! explicitly migrates.
+//! features that require the current schema return a query error until the user explicitly
+//! migrates. `SHOW CURRENT GRAPH SHAPE` is available once a database has reached schema version 5.
 //!
 //! Use [`Velr::schema_version`], [`Velr::current_schema_version`], and
 //! [`Velr::needs_migration`] to inspect the connection state. Use [`Velr::migrate`] or execute
@@ -112,6 +112,14 @@
 //! `SHOW CURRENT GRAPH SHAPE` exposes Velr's observed graph schema: labels, relationship types,
 //! properties, observed value types, and counts. Use `YIELD` to compose it with `WHERE` and
 //! `RETURN`, or `YIELD *` to inspect the full row shape.
+//!
+//! Fulltext search is also available through normal Cypher execution. Use `CREATE FULLTEXT INDEX`
+//! to define an index and `CALL db.index.fulltext.queryNodes(...)` to search it. Fulltext indexes
+//! use a sidecar next to file-backed databases, and no dedicated driver methods are required. The
+//! query grammar supports terms, phrases, field scoping, boolean grouping, required/excluded
+//! terms, phrase slop, phrase-prefix, boosts, and `*` match-all. `score` is a non-normalized
+//! relevance score. Higher scores are better within a single query result set; scores are not
+//! guaranteed to be in `0..1` or comparable across different queries.
 #![allow(unsafe_code)]
 
 mod api;
@@ -1486,9 +1494,10 @@ impl Velr {
     /// that should not perform schema DDL.
     ///
     /// Supported older databases remain readable. Mutating queries and features
-    /// that require schema version 5, including `SHOW CURRENT GRAPH SHAPE`, are
-    /// unavailable until the database is opened read-write and explicitly
-    /// migrated with [`Velr::migrate`] or `MIGRATE DATABASE`.
+    /// that require the current schema version are unavailable until the
+    /// database is opened read-write and explicitly migrated. `SHOW CURRENT
+    /// GRAPH SHAPE` is available once a database has reached schema version 5.
+    /// Use [`Velr::migrate`] or `MIGRATE DATABASE` to apply pending migrations.
     ///
     /// If the loaded native runtime is older and does not expose the underlying
     /// C ABI symbol, this returns an error.

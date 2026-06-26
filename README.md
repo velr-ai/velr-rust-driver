@@ -22,19 +22,20 @@ We’d love to have you join the Velr community.
 This release is **alpha**.
 
 - The API and query support are still evolving.
-- openCypher coverage is already substantial, but some features are still missing.
+- Velr targets openCypher compatibility, but exact error semantics are not
+  guaranteed to match other openCypher implementations.
 - During the `0.2.x` series, we do **not** guarantee database migration or on-disk database compatibility between releases.
 - Velr 0.2.14 includes a breaking on-disk storage change; existing databases from earlier releases must be recreated by re-importing the source data.
 - Starting with the `0.3.x` series, we intend to guarantee internal database compatibility within the branch.
 
-### Schema version 5 compatibility
+### Schema version 6 compatibility
 
-This release's current on-disk schema is version 5. Supported older databases
+This release's current on-disk schema is version 6. Supported older databases
 can be opened with `Velr::open` or `Velr::open_readonly` without changing the
 file. Reads continue to work on those databases, but writes (`CREATE`, `MERGE`,
 `SET`, `DELETE`, `DETACH DELETE`, and other mutating queries) are only available
-after migrating to schema version 5. This is intentional: migration is an
-explicit maintenance operation, not a side effect of opening a database.
+after migrating to the current schema version. This is intentional: migration
+is an explicit maintenance operation, not a side effect of opening a database.
 
 Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
 
@@ -117,10 +118,10 @@ fn main() -> velr::Result<()> {
 
 `open_readonly` requires an existing file-backed database at a supported Velr
 schema version. It does not create files, run schema DDL, or migrate older
-databases. Older supported databases, such as schema version 3 or 4 databases
-opened by a schema version 5 runtime, remain available for reads. Writes and
-features that require schema version 5 fail with a normal query error until the
-database is explicitly migrated.
+databases. Older supported databases, such as schema version 3, 4, or 5
+databases opened by a schema version 6 runtime, remain available for reads.
+Writes and features that require the current schema fail with a normal query
+error until the database is explicitly migrated.
 
 ---
 
@@ -129,7 +130,7 @@ database is explicitly migrated.
 Velr does not migrate supported older databases automatically on open. Use the
 driver migration API, or run `MIGRATE DATABASE`, from maintenance code when you
 intend to update the on-disk schema. See the release-status note above for the
-schema version 5 read/write compatibility behavior.
+schema version 6 read/write compatibility behavior.
 
 ```rust,no_run
 use velr::{MigrationStatus, Velr};
@@ -172,9 +173,9 @@ reports the shape present in stored data: node labels, relationship types,
 properties, observed value types, and counts. It is an observed shape surface,
 not a declared GQL graph type.
 
-`SHOW CURRENT GRAPH SHAPE` is available on schema version 5 databases. Older
-supported databases can still be opened for reads, but must be migrated
-explicitly before this command is valid. Schema version 5 maintains this
+`SHOW CURRENT GRAPH SHAPE` is available on schema version 5 or newer databases.
+Older supported databases can still be opened for reads, but must be migrated
+explicitly before this command is valid. Schema version 5 introduced this
 inventory through the write planner instead of persistent graph-shape triggers.
 
 The default projection returns `element_kind`, `element_name`, `property_name`,
@@ -204,14 +205,58 @@ full current row shape.
 
 ---
 
+## Fulltext Search
+
+Fulltext search is available through normal Cypher execution. Define indexes
+with `CREATE FULLTEXT INDEX` and query them with
+`CALL db.index.fulltext.queryNodes(...)`.
+
+```rust,no_run
+let db = Velr::open(Some("mygraph.db"))?;
+
+db.run(
+    "CREATE FULLTEXT INDEX paperText
+     FOR (n:Paper) ON EACH [n.title, n.abstract]",
+)?;
+
+let mut rows = db.exec_one(
+    "CALL db.index.fulltext.queryNodes('paperText', 'abstract:vector')
+     YIELD node, score
+     RETURN node, score",
+)?;
+```
+
+The query string supports this fulltext grammar:
+
+- Terms: `vector search`
+- Phrases: `"vector search"`
+- Field scoping by indexed property: `title:graph`, `abstract:"vector search"`
+- Boolean operators and grouping: `graph AND (vector OR semantic)`
+- Default `OR` between adjacent terms: `vector search`
+- Required and excluded terms: `+vector -draft`
+- Phrase slop: `"vector search"~2`
+- Phrase prefix on the last phrase term: `"vector sea"*`
+- Boosts: `title:graph^2.0`
+- Match all indexed nodes: `*`
+
+Field scoping applies to the next term or phrase only. For example,
+`title:graph search` searches `graph` in `title` and `search` in the default
+fulltext field.
+
+`score` is a non-normalized relevance score. Higher scores are better within a
+single query result set; scores are not guaranteed to be in `0..1` or
+comparable across different queries.
+
+Fulltext indexes use a sidecar next to file-backed databases. The sidecar is
+kept up to date by writes and rebuilt on open if it is missing or corrupt.
+
+---
+
 ## Query language support
 
-Velr supports **most of openCypher**, but some features are not yet implemented.
-
-Notable current limitations:
-
-* Driver-level query parameters (for example `$name`)
-* The query planner does not yet use indexes in all cases where expected.
+Velr supports the openCypher query language. Exact error semantics, including
+error messages, categories, and timing, are not guaranteed to match other
+openCypher implementations.
 
 ---
 
