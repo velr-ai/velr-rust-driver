@@ -21,16 +21,16 @@ We’d love to have you join the Velr community.
 
 This release is **alpha**.
 
-- The API and query support are still evolving.
-- Velr targets openCypher compatibility, but exact error semantics are not
-  guaranteed to match other openCypher implementations.
+- The Rust API is still evolving.
+- Velr supports openCypher and passes all positive openCypher TCK tests. Exact
+  error semantics are not guaranteed to match other openCypher implementations.
 - During the `0.2.x` series, we do **not** guarantee database migration or on-disk database compatibility between releases.
 - Velr 0.2.14 includes a breaking on-disk storage change; existing databases from earlier releases must be recreated by re-importing the source data.
 - Starting with the `0.3.x` series, we intend to guarantee internal database compatibility within the branch.
 
-### Schema version 6 compatibility
+### Schema version 7 compatibility
 
-This release's current on-disk schema is version 6. Supported older databases
+This release's current on-disk schema is version 7. Supported older databases
 can be opened with `Velr::open` or `Velr::open_readonly` without changing the
 file. Reads continue to work on those databases, but writes (`CREATE`, `MERGE`,
 `SET`, `DELETE`, `DETACH DELETE`, and other mutating queries) are only available
@@ -39,8 +39,8 @@ is an explicit maintenance operation, not a side effect of opening a database.
 
 Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
 
-**Velr 1.0 is focused on strong openCypher compatibility.**  
-**Vector search**, **time-series**, and **federation** are planned as post-1.0 capabilities.
+Fulltext search and vector search are available today through Cypher DDL and
+`CALL` syntax. API details may still evolve while Velr remains alpha.
 
 ---
 
@@ -51,13 +51,13 @@ Add to `Cargo.toml`:
 ```toml
 [dependencies]
 velr = "0.2"
-````
+```
 
-Enable Arrow IPC support (binding Arrow arrays + exporting result tables as Arrow IPC):
+Arrow IPC support is enabled by default. To build without Arrow IPC support, opt out of default features:
 
 ```toml
 [dependencies]
-velr = { version = "0.2", features = ["arrow-ipc"] }
+velr = { version = "0.2", default-features = false }
 ```
 
 ---
@@ -118,8 +118,8 @@ fn main() -> velr::Result<()> {
 
 `open_readonly` requires an existing file-backed database at a supported Velr
 schema version. It does not create files, run schema DDL, or migrate older
-databases. Older supported databases, such as schema version 3, 4, or 5
-databases opened by a schema version 6 runtime, remain available for reads.
+databases. Older supported databases, such as schema version 3, 4, 5, or 6
+databases opened by a schema version 7 runtime, remain available for reads.
 Writes and features that require the current schema fail with a normal query
 error until the database is explicitly migrated.
 
@@ -130,7 +130,7 @@ error until the database is explicitly migrated.
 Velr does not migrate supported older databases automatically on open. Use the
 driver migration API, or run `MIGRATE DATABASE`, from maintenance code when you
 intend to update the on-disk schema. See the release-status note above for the
-schema version 6 read/write compatibility behavior.
+schema version 7 read/write compatibility behavior.
 
 ```rust,no_run
 use velr::{MigrationStatus, Velr};
@@ -252,11 +252,75 @@ kept up to date by writes and rebuilt on open if it is missing or corrupt.
 
 ---
 
+## Vector Search
+
+Register an embedding callback, then reference it from `CREATE VECTOR INDEX`.
+Velr invokes the callback for index maintenance when indexed source values
+change and for text queries passed to `CALL db.index.vector.queryNodes(...)`.
+
+```rust,no_run
+use velr::{PropertyValue, VectorEmbeddingPurpose, Velr};
+
+fn embed_text(_text: &str, dimensions: usize) -> Vec<f32> {
+    // Call your embedding model here.
+    vec![0.0; dimensions]
+}
+
+fn main() -> velr::Result<()> {
+    let db = Velr::open(Some("mygraph.db"))?;
+
+    db.register_vector_embedder("text", |inputs| {
+        Ok(inputs
+            .iter()
+            .map(|input| {
+                let text = input
+                    .fields
+                    .iter()
+                    .filter_map(|field| match &field.value {
+                        PropertyValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let prefix = match input.purpose {
+                    VectorEmbeddingPurpose::IndexEntity => "passage: ",
+                    VectorEmbeddingPurpose::Query => "query: ",
+                };
+                embed_text(&format!("{prefix}{text}"), input.dimensions)
+            })
+            .collect())
+    })?;
+
+    db.run(
+        "CREATE VECTOR INDEX paperEmbedding IF NOT EXISTS
+         FOR (n:Paper)
+         ON EACH [n.title, n.abstract]
+         OPTIONS { indexConfig: { dimensions: 384, metric: 'cosine', embedder: 'text' } }",
+    )?;
+
+    let mut _rows = db.exec_one(
+        "CALL db.index.vector.queryNodes('paperEmbedding', 10, 'paper about greek letters')
+         YIELD node, score
+         RETURN node, score",
+    )?;
+
+    Ok(())
+}
+```
+
+`ON EACH [n.title, n.abstract]` passes both property values to the callback in
+that order. Query text is passed as one unnamed string field. Vector `score` is
+metric-dependent and non-normalized; higher scores are better within a single
+query result set.
+
+---
+
 ## Query language support
 
-Velr supports the openCypher query language. Exact error semantics, including
-error messages, categories, and timing, are not guaranteed to match other
-openCypher implementations.
+Velr supports the openCypher query language and passes all positive openCypher
+TCK tests. Exact error semantics, including error messages, categories, and
+timing, are not guaranteed to match other openCypher implementations.
 
 ---
 
@@ -439,11 +503,12 @@ The returned `ExplainTrace` can be inspected programmatically or rendered as a c
 
 ---
 
-## Arrow IPC (optional)
+## Arrow IPC
 
-With `features = ["arrow-ipc"]` you can:
+Arrow IPC support is enabled by default. With the default feature set you can:
 
 * Bind Arrow arrays as a logical table (`bind_arrow`, `bind_arrow_chunks`)
+* Bind Arrow IPC file / Feather v2 bytes as a logical table (`bind_arrow_ipc`)
 * Export a result table as an Arrow IPC file (`to_arrow_ipc_file()`)
 
 ```rust,no_run
@@ -471,9 +536,9 @@ fn arrow_example() -> velr::Result<()> {
 
 ---
 
-## Supported functions
+## OpenCypher functions
 
-Velr currently supports these openCypher functions and constructors:
+The following openCypher functions and constructors are available:
 
 **Graph and path**
 

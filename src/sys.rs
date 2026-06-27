@@ -1,7 +1,11 @@
+// GENERATED FILE - DO NOT EDIT BY HAND.
+// Source of truth: rust/velr-ffi/src/ffi_c.rs
+// Edit the FFI source, then regenerate with: cargo run -p xtask -- gen-sys
+
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
 #[cfg(feature = "arrow-ipc")]
 use arrow2::ffi::{ArrowArray, ArrowSchema};
 /// Discriminant for [`velr_cell`].
@@ -81,6 +85,103 @@ pub struct velr_migration_report {
     pub step_count: usize,
     pub steps: *mut c_char,
 }
+/// Why Velr is requesting vectors from a registered embedder.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum velr_vector_embedding_purpose {
+    VELR_VECTOR_EMBEDDING_INDEX_ENTITY = 0,
+    VELR_VECTOR_EMBEDDING_QUERY = 1,
+}
+/// Graph entity kind for vector embedding inputs.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum velr_vector_entity_kind {
+    VELR_VECTOR_ENTITY_NONE = 0,
+    VELR_VECTOR_ENTITY_NODE = 1,
+    VELR_VECTOR_ENTITY_RELATIONSHIP = 2,
+}
+/// Public Velr property value kind.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum velr_property_value_type {
+    VELR_PROPERTY_NULL = 0,
+    VELR_PROPERTY_BOOL = 1,
+    VELR_PROPERTY_INT64 = 2,
+    VELR_PROPERTY_DOUBLE = 3,
+    VELR_PROPERTY_STRING = 4,
+    VELR_PROPERTY_DATE = 5,
+    VELR_PROPERTY_LOCAL_TIME = 6,
+    VELR_PROPERTY_ZONED_TIME = 7,
+    VELR_PROPERTY_LOCAL_DATETIME = 8,
+    VELR_PROPERTY_ZONED_DATETIME = 9,
+    VELR_PROPERTY_DURATION = 10,
+    VELR_PROPERTY_POINT = 11,
+    VELR_PROPERTY_GEOMETRY = 12,
+    VELR_PROPERTY_GEOGRAPHY = 13,
+    VELR_PROPERTY_LIST = 14,
+    VELR_PROPERTY_VECTOR = 15,
+    VELR_PROPERTY_BYTES = 16,
+}
+/// SQLite-compatible storage kind for exact property reconstruction.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum velr_storage_value_type {
+    VELR_STORAGE_NULL = 0,
+    VELR_STORAGE_INT64 = 1,
+    VELR_STORAGE_DOUBLE = 2,
+    VELR_STORAGE_TEXT = 3,
+    VELR_STORAGE_BLOB = 4,
+}
+/// One source field passed to a vector embedding callback.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct velr_vector_embedding_field {
+    pub has_name: c_int,
+    pub name: velr_strview,
+    pub value_type: velr_property_value_type,
+    pub storage_type: velr_storage_value_type,
+    pub i64_: i64,
+    pub f64_: f64,
+    /// TEXT or BLOB storage payload. For BLOB values this is the canonical Velr encoded blob.
+    pub bytes: velr_strview,
+    /// Canonical JSON rendering of the Velr property value.
+    pub json: velr_strview,
+    /// Display rendering of the Velr property value.
+    pub display: velr_strview,
+}
+/// One source row passed to a vector embedding callback.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct velr_vector_embedding_input {
+    pub index_name: velr_strview,
+    pub dimensions: usize,
+    pub purpose: velr_vector_embedding_purpose,
+    pub entity_kind: velr_vector_entity_kind,
+    pub has_entity_id: c_int,
+    pub entity_id: i64,
+    pub fields: *const velr_vector_embedding_field,
+    pub field_count: usize,
+}
+#[allow(non_camel_case_types)]
+pub type velr_vector_embedder_callback = unsafe extern "C" fn(
+    user_data: *mut c_void,
+    inputs: *const velr_vector_embedding_input,
+    input_count: usize,
+    dimensions: usize,
+    out_vectors: *mut f32,
+    err_buf: *mut c_char,
+    err_buf_len: usize,
+) -> velr_code;
+#[allow(non_camel_case_types)]
+pub type velr_vector_embedder_free_callback = unsafe extern "C" fn(
+    user_data: *mut c_void,
+);
 /// Result codes returned by most ABI functions.
 #[allow(non_camel_case_types)]
 #[repr(C)]

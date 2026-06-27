@@ -100,7 +100,7 @@
 //!
 //! # Schema migration and introspection
 //!
-//! This runtime's current on-disk schema is version 6. Supported older databases can be opened
+//! This runtime's current on-disk schema is version 7. Supported older databases can be opened
 //! without automatic migration. Reads remain available on those databases, but writes and
 //! features that require the current schema return a query error until the user explicitly
 //! migrates. `SHOW CURRENT GRAPH SHAPE` is available once a database has reached schema version 5.
@@ -133,13 +133,22 @@ use std::{
     fmt,
     hash::BuildHasher,
     marker::PhantomData,
-    os::raw::c_char,
+    os::raw::{c_char, c_void},
+    panic::{catch_unwind, AssertUnwindSafe},
     ptr::NonNull,
     rc::Rc,
 };
 
 use serde_json::Value as JsonValue;
 use sys as ffi;
+use velr_types::{decode_property_value, StorageValueRef};
+
+pub use velr_types::{
+    DateValue, DurationValue, GeographyValue, GeometryShape, GeometryValue, LineStringValue,
+    LinearRingValue, ListIter, ListValue, LocalDateTimeValue, LocalTimeValue, PointValue,
+    PolygonValue, Position, PropertyValue, PropertyValueRef, VectorElem, VectorIter, VectorStorage,
+    VectorType, VectorValue, ZonedDateTimeValue, ZonedTimeValue,
+};
 
 /// Convenience result type used throughout the public API.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -850,6 +859,50 @@ pub struct MigrationReport {
     pub steps: Vec<String>,
 }
 
+/// Why Velr is asking an embedder to produce vectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorEmbeddingPurpose {
+    /// Embedding source values from a graph entity for index maintenance.
+    IndexEntity,
+    /// Embedding a query payload supplied to `db.index.vector.queryNodes`.
+    Query,
+}
+
+/// Graph entity kind for indexed vector embedding inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorEntityKind {
+    Node,
+    Relationship,
+}
+
+/// One named Velr value passed to a registered vector embedding callback.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct VectorEmbeddingField {
+    /// Property name for indexed entity values. Query payloads may be unnamed.
+    pub name: Option<String>,
+    /// The typed Velr value to embed.
+    pub value: PropertyValue,
+}
+
+/// One source row passed to a registered vector embedding callback.
+///
+/// For indexed entities, `fields` follows the `CREATE VECTOR INDEX ... ON EACH [...]`
+/// property order. For `n.*`, fields are ordered by property name. For query text,
+/// Velr passes one unnamed `PropertyValue::String` field.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct VectorEmbeddingInput {
+    pub index_name: String,
+    pub dimensions: usize,
+    pub purpose: VectorEmbeddingPurpose,
+    pub entity_kind: Option<VectorEntityKind>,
+    pub entity_id: Option<i64>,
+    pub fields: Vec<VectorEmbeddingField>,
+}
+
+pub type VectorEmbeddingBatchResult = std::result::Result<Vec<Vec<f32>>, String>;
+
 /// Get a reference to the loaded runtime API.
 ///
 /// This ensures the runtime is initialized (via [`runtime::runtime`]) and then returns the
@@ -970,6 +1023,215 @@ fn opt_strview_to_string(v: ffi::velr_strview, what: &str) -> Result<Option<Stri
         return Ok(None);
     }
     Ok(Some(strview_to_string(v, what)?))
+}
+
+unsafe fn vector_strview_bytes<'a>(
+    v: ffi::velr_strview,
+    what: &str,
+) -> std::result::Result<&'a [u8], String> {
+    if v.len == 0 {
+        return Ok(&[]);
+    }
+    if v.ptr.is_null() {
+        return Err(format!("{what} is null with non-zero length"));
+    }
+    Ok(std::slice::from_raw_parts(v.ptr, v.len))
+}
+
+unsafe fn vector_strview_to_string(
+    v: ffi::velr_strview,
+    what: &str,
+) -> std::result::Result<String, String> {
+    let bytes = vector_strview_bytes(v, what)?;
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|_| format!("{what} is not valid UTF-8"))
+}
+
+fn vector_purpose_from_raw(value: ffi::velr_vector_embedding_purpose) -> VectorEmbeddingPurpose {
+    match value {
+        ffi::velr_vector_embedding_purpose::VELR_VECTOR_EMBEDDING_INDEX_ENTITY => {
+            VectorEmbeddingPurpose::IndexEntity
+        }
+        ffi::velr_vector_embedding_purpose::VELR_VECTOR_EMBEDDING_QUERY => {
+            VectorEmbeddingPurpose::Query
+        }
+    }
+}
+
+fn vector_entity_kind_from_raw(value: ffi::velr_vector_entity_kind) -> Option<VectorEntityKind> {
+    match value {
+        ffi::velr_vector_entity_kind::VELR_VECTOR_ENTITY_NODE => Some(VectorEntityKind::Node),
+        ffi::velr_vector_entity_kind::VELR_VECTOR_ENTITY_RELATIONSHIP => {
+            Some(VectorEntityKind::Relationship)
+        }
+        ffi::velr_vector_entity_kind::VELR_VECTOR_ENTITY_NONE => None,
+    }
+}
+
+unsafe fn vector_property_value_from_raw(
+    field: &ffi::velr_vector_embedding_field,
+) -> std::result::Result<PropertyValue, String> {
+    let storage = match field.storage_type {
+        ffi::velr_storage_value_type::VELR_STORAGE_NULL => StorageValueRef::Null,
+        ffi::velr_storage_value_type::VELR_STORAGE_INT64 => StorageValueRef::Integer(field.i64_),
+        ffi::velr_storage_value_type::VELR_STORAGE_DOUBLE => StorageValueRef::Real(field.f64_),
+        ffi::velr_storage_value_type::VELR_STORAGE_TEXT => {
+            let bytes = vector_strview_bytes(field.bytes, "vector field text storage")?;
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| "vector field text storage is not valid UTF-8".to_string())?;
+            StorageValueRef::Text(text)
+        }
+        ffi::velr_storage_value_type::VELR_STORAGE_BLOB => StorageValueRef::Blob(
+            vector_strview_bytes(field.bytes, "vector field blob storage")?,
+        ),
+    };
+    decode_property_value(storage).map_err(|err| format!("decode vector field value: {err}"))
+}
+
+unsafe fn vector_inputs_from_raw(
+    inputs: *const ffi::velr_vector_embedding_input,
+    input_count: usize,
+) -> std::result::Result<Vec<VectorEmbeddingInput>, String> {
+    if input_count == 0 {
+        return Ok(Vec::new());
+    }
+    if inputs.is_null() {
+        return Err("vector embedding inputs pointer is null with non-zero count".to_string());
+    }
+
+    let raw_inputs = std::slice::from_raw_parts(inputs, input_count);
+    let mut out = Vec::with_capacity(input_count);
+    for (input_idx, input) in raw_inputs.iter().enumerate() {
+        let fields = if input.field_count == 0 {
+            &[][..]
+        } else {
+            if input.fields.is_null() {
+                return Err(format!(
+                    "vector embedding input {input_idx} fields pointer is null with non-zero count"
+                ));
+            }
+            std::slice::from_raw_parts(input.fields, input.field_count)
+        };
+        let mut decoded_fields = Vec::with_capacity(fields.len());
+        for field in fields {
+            let name = if field.has_name != 0 {
+                Some(vector_strview_to_string(field.name, "vector field name")?)
+            } else {
+                None
+            };
+            decoded_fields.push(VectorEmbeddingField {
+                name,
+                value: vector_property_value_from_raw(field)?,
+            });
+        }
+        out.push(VectorEmbeddingInput {
+            index_name: vector_strview_to_string(input.index_name, "vector index name")?,
+            dimensions: input.dimensions,
+            purpose: vector_purpose_from_raw(input.purpose),
+            entity_kind: vector_entity_kind_from_raw(input.entity_kind),
+            entity_id: if input.has_entity_id != 0 {
+                Some(input.entity_id)
+            } else {
+                None
+            },
+            fields: decoded_fields,
+        });
+    }
+    Ok(out)
+}
+
+fn write_vector_callback_error(err_buf: *mut c_char, err_buf_len: usize, msg: &str) {
+    if err_buf.is_null() || err_buf_len == 0 {
+        return;
+    }
+    let bytes = msg.as_bytes();
+    let copy_len = bytes.len().min(err_buf_len.saturating_sub(1));
+    unsafe {
+        if copy_len > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), err_buf.cast::<u8>(), copy_len);
+        }
+        *err_buf.add(copy_len) = 0;
+    }
+}
+
+unsafe extern "C" fn vector_embedder_trampoline<F>(
+    user_data: *mut c_void,
+    inputs: *const ffi::velr_vector_embedding_input,
+    input_count: usize,
+    dimensions: usize,
+    out_vectors: *mut f32,
+    err_buf: *mut c_char,
+    err_buf_len: usize,
+) -> ffi::velr_code
+where
+    F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + 'static,
+{
+    let result = catch_unwind(AssertUnwindSafe(|| -> std::result::Result<(), String> {
+        if user_data.is_null() {
+            return Err("vector embedder user data is null".to_string());
+        }
+        let output_len = input_count
+            .checked_mul(dimensions)
+            .ok_or_else(|| "vector embedding output length overflowed".to_string())?;
+        if output_len > 0 && out_vectors.is_null() {
+            return Err("vector embedding output pointer is null".to_string());
+        }
+
+        let embedder = &*(user_data as *const F);
+        let decoded = vector_inputs_from_raw(inputs, input_count)?;
+        let vectors = embedder(&decoded)?;
+        if vectors.len() != input_count {
+            return Err(format!(
+                "vector embedder returned {} embeddings for {} inputs",
+                vectors.len(),
+                input_count
+            ));
+        }
+
+        for (row_idx, vector) in vectors.iter().enumerate() {
+            if vector.len() != dimensions {
+                return Err(format!(
+                    "vector embedder returned {} dimensions for input {} but the index expects {}",
+                    vector.len(),
+                    row_idx,
+                    dimensions
+                ));
+            }
+            for (dim_idx, value) in vector.iter().copied().enumerate() {
+                if !value.is_finite() {
+                    return Err(format!(
+                        "vector embedder returned a non-finite value for input {row_idx} at dimension {dim_idx}: {value}"
+                    ));
+                }
+                if output_len > 0 {
+                    *out_vectors.add(row_idx * dimensions + dim_idx) = value;
+                }
+            }
+        }
+        Ok(())
+    }));
+
+    match result {
+        Ok(Ok(())) => ffi::velr_code::VELR_OK,
+        Ok(Err(err)) => {
+            write_vector_callback_error(err_buf, err_buf_len, &err);
+            ffi::velr_code::VELR_EERR
+        }
+        Err(_) => {
+            write_vector_callback_error(err_buf, err_buf_len, "vector embedder callback panicked");
+            ffi::velr_code::VELR_EERR
+        }
+    }
+}
+
+unsafe extern "C" fn vector_embedder_free_trampoline<F>(user_data: *mut c_void)
+where
+    F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + 'static,
+{
+    if !user_data.is_null() {
+        drop(Box::from_raw(user_data as *mut F));
+    }
 }
 
 /// Owned plan metadata returned from an [`ExplainTrace`].
@@ -1632,6 +1894,50 @@ impl Velr {
         result
     }
 
+    /// Register a named embedding callback for vector indexes.
+    ///
+    /// Vector indexes refer to this name with
+    /// `OPTIONS { indexConfig: { embedder: 'name' } }`. Velr calls the matching
+    /// callback when indexed source values change and when embedding query text
+    /// supplied to `CALL db.index.vector.queryNodes(...)`.
+    ///
+    /// The callback receives a batch of [`VectorEmbeddingInput`] values and must
+    /// return one vector per input. Each returned vector must contain exactly
+    /// `input.dimensions` finite `f32` values.
+    ///
+    pub fn register_vector_embedder<F>(&self, name: &str, embedder: F) -> Result<()>
+    where
+        F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + 'static,
+    {
+        if name.trim().is_empty() {
+            return Err(Error::new(
+                ffi::velr_code::VELR_EARG as i32,
+                "vector embedder name cannot be empty",
+            ));
+        }
+
+        let a = velr_api()?;
+        let register = a.velr_register_vector_embedder;
+
+        let name_view = raw_strview(name.as_bytes());
+        let boxed = Box::new(embedder);
+        let user_data = Box::into_raw(boxed) as *mut c_void;
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let rc = unsafe {
+            register(
+                self.db.as_ptr(),
+                name_view,
+                Some(vector_embedder_trampoline::<F>),
+                user_data,
+                Some(vector_embedder_free_trampoline::<F>),
+                &mut err,
+            )
+        };
+        // Ownership of user_data crosses into the runtime once the ABI call is made.
+        rc_to_result(rc, err)
+    }
+
     /// Execute `openCypher` and return a stream of result tables.
     ///
     /// Use [`ExecTables::next_table`] to pull tables until it returns `Ok(None)`.
@@ -1939,6 +2245,17 @@ impl Velr {
         arrays: Vec<Box<dyn arrow2::array::Array>>,
     ) -> Result<()> {
         arrow_bind::bind_arrow_db(self.db.as_ptr(), logical, col_names, arrays)
+    }
+
+    /// Bind Arrow IPC file bytes (Feather v2) to a logical name.
+    ///
+    /// Available only when built with the `arrow-ipc` feature.
+    ///
+    /// The IPC byte slice is borrowed only for the duration of the call. Velr decodes the IPC file
+    /// and owns the resulting Arrow arrays before this returns.
+    #[cfg(feature = "arrow-ipc")]
+    pub fn bind_arrow_ipc(&self, logical: &str, ipc_file: &[u8]) -> Result<()> {
+        arrow_bind::bind_arrow_ipc_db(self.db.as_ptr(), logical, ipc_file)
     }
 
     /// Bind chunked Arrow arrays per column to a logical name.
@@ -2864,6 +3181,18 @@ impl<'db> VelrTx<'db> {
         arrow_bind::bind_arrow_tx(tx.as_ptr(), logical, col_names, arrays)
     }
 
+    /// Bind Arrow IPC file bytes (Feather v2) to a logical name inside this transaction.
+    ///
+    /// Available only when built with the `arrow-ipc` feature.
+    ///
+    /// The IPC byte slice is borrowed only for the duration of the call. Velr decodes the IPC file
+    /// and owns the resulting Arrow arrays before this returns.
+    #[cfg(feature = "arrow-ipc")]
+    pub fn bind_arrow_ipc(&self, logical: &str, ipc_file: &[u8]) -> Result<()> {
+        let tx = self.ptr()?;
+        arrow_bind::bind_arrow_ipc_tx(tx.as_ptr(), logical, ipc_file)
+    }
+
     /// Bind chunked Arrow arrays per column to a logical name.
     ///
     /// Available only when built with the `arrow-ipc` feature.
@@ -3090,6 +3419,51 @@ mod arrow_bind {
             col_names,
             arrays,
         )
+    }
+
+    pub fn bind_arrow_ipc_db(db: *mut ffi::velr_db, logical: &str, ipc_file: &[u8]) -> Result<()> {
+        let a = super::velr_api()?;
+        bind_arrow_ipc_common(
+            |logical_ptr, ipc_ptr, ipc_len, err| unsafe {
+                (a.velr_bind_arrow_ipc)(db, logical_ptr, ipc_ptr, ipc_len, err)
+            },
+            logical,
+            ipc_file,
+        )
+    }
+
+    pub fn bind_arrow_ipc_tx(tx: *mut ffi::velr_tx, logical: &str, ipc_file: &[u8]) -> Result<()> {
+        let a = super::velr_api()?;
+        bind_arrow_ipc_common(
+            |logical_ptr, ipc_ptr, ipc_len, err| unsafe {
+                (a.velr_tx_bind_arrow_ipc)(tx, logical_ptr, ipc_ptr, ipc_len, err)
+            },
+            logical,
+            ipc_file,
+        )
+    }
+
+    fn bind_arrow_ipc_common(
+        f: impl FnOnce(*const c_char, *const u8, usize, *mut *mut c_char) -> ffi::velr_code,
+        logical: &str,
+        ipc_file: &[u8],
+    ) -> Result<()> {
+        if ipc_file.is_empty() {
+            return Err(Error::new(
+                ffi::velr_code::VELR_EARG as i32,
+                "bind_arrow_ipc: empty IPC buffer",
+            ));
+        }
+
+        let logical_c = cstring(logical, "logical")?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = f(
+            logical_c.as_ptr(),
+            ipc_file.as_ptr(),
+            ipc_file.len(),
+            &mut err,
+        );
+        super::rc_to_result(rc, err)
     }
 
     fn bind_arrow_common(

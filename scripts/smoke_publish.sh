@@ -23,6 +23,28 @@ crate_version() {
   awk -F '"' '/^version[[:space:]]*=/ { print $2; exit }' "$1"
 }
 
+if [[ -d velr-types ]]; then
+  echo "Packaging velr-types crate..."
+  types_name="$(crate_name velr-types/Cargo.toml)"
+  types_version="$(crate_version velr-types/Cargo.toml)"
+  types_crate="$CARGO_TARGET_DIR/package/$types_name-$types_version.crate"
+
+  cargo package --manifest-path velr-types/Cargo.toml --allow-dirty --no-verify
+
+  if [[ ! -f "$types_crate" ]]; then
+    echo "ERROR: expected package file missing: $types_crate" >&2
+    exit 1
+  fi
+
+  types_size="$(wc -c < "$types_crate" | tr -d ' ')"
+  echo "$types_name-$types_version.crate size=$types_size bytes"
+
+  if (( types_size > MAX_CRATE_BYTES )); then
+    echo "ERROR: $types_crate exceeds MAX_CRATE_BYTES=$MAX_CRATE_BYTES" >&2
+    exit 1
+  fi
+fi
+
 echo "Packaging Velr runtime crates..."
 for manifest in "${manifests[@]}"; do
   name="$(crate_name "$manifest")"
@@ -71,6 +93,11 @@ if [[ "${VELR_SMOKE_SKIP_TESTS:-0}" == "1" ]]; then
   exit 0
 fi
 
+if [[ -d velr-types ]]; then
+  echo "Testing velr-types crate..."
+  cargo test --manifest-path velr-types/Cargo.toml
+fi
+
 echo "Testing runtime crates..."
 for manifest in "${manifests[@]}"; do
   cargo test --manifest-path "$manifest"
@@ -78,4 +105,4 @@ done
 
 echo "Testing public velr crate..."
 cargo test --manifest-path Cargo.toml
-cargo test --manifest-path Cargo.toml --features arrow-ipc
+cargo test --manifest-path Cargo.toml --no-default-features

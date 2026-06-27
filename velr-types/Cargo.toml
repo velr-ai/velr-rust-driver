@@ -1,0 +1,28 @@
+[package]
+name = "velr-types"
+version = "0.1.0"
+edition = "2021"
+description = "Shared public value types for Velr drivers"
+license = "MIT"
+homepage = "https://velr.ai"
+repository = "https://github.com/velr-ai/velr-rust-driver"
+documentation = "https://docs.rs/velr-types"
+keywords = ["database", "graph", "types"]
+categories = ["database"]
+
+[features]
+default = ["tzdb-system"]
+tzdb-system = [
+    "jiff/tz-system",
+    "jiff/tz-fat",
+    "jiff/tzdb-zoneinfo",
+    "jiff/tzdb-concatenated",
+]
+tzdb-bundled = ["tzdb-system", "jiff/tzdb-bundle-always"]
+
+[dependencies]
+jiff = { version = "0.2.23", default-features = false, features = ["std", "alloc"] }
+serde_json = "1.0"
+
+[lib]
+crate-type = ["rlib"]

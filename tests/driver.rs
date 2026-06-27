@@ -1,7 +1,17 @@
-use std::collections::BTreeMap;
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    fs,
+    path::PathBuf,
+    rc::Rc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::Value;
-use velr::{CellRef, QueryOptions, QueryParams, QueryValue, Velr};
+use velr::{
+    CellRef, PropertyValue, PropertyValueRef, QueryOptions, QueryParams, QueryValue,
+    VectorEmbeddingInput, VectorEmbeddingPurpose, VectorEntityKind, Velr,
+};
 
 #[derive(Debug, PartialEq)]
 enum Owned {
@@ -31,6 +41,144 @@ fn assert_f64(a: f64, b: f64) {
 
 fn missing_options_symbol(e: &velr::Error) -> bool {
     e.message.contains("does not expose") && e.message.contains("_with_options")
+}
+
+fn vector_feature_unavailable(e: &velr::Error) -> bool {
+    e.message.contains("requires the vector-usearch feature")
+}
+
+fn fulltext_feature_unavailable(e: &velr::Error) -> bool {
+    e.message.contains("requires the fulltext-tantivy feature")
+}
+
+struct TempDbPath {
+    path: PathBuf,
+}
+
+impl TempDbPath {
+    fn new(name: &str) -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "velr-rust-driver-{name}-{}-{nonce}.sqlite",
+                std::process::id()
+            )),
+        }
+    }
+}
+
+impl Drop for TempDbPath {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(self.path.with_extension("sqlite-shm"));
+        let _ = fs::remove_file(self.path.with_extension("sqlite-wal"));
+        let _ = fs::remove_dir_all(PathBuf::from(format!(
+            "{}.velr-vector",
+            self.path.display()
+        )));
+        let _ = fs::remove_dir_all(PathBuf::from(format!("{}.velr-fts", self.path.display())));
+    }
+}
+
+fn vector_text(input: &VectorEmbeddingInput) -> String {
+    input
+        .fields
+        .iter()
+        .filter_map(|field| match &field.value {
+            PropertyValue::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VectorInputSnapshot {
+    index_name: String,
+    dimensions: usize,
+    purpose: VectorEmbeddingPurpose,
+    entity_kind: Option<VectorEntityKind>,
+    entity_id: Option<i64>,
+    fields: Vec<(Option<String>, String)>,
+    text: String,
+}
+
+fn property_ref_summary(value: PropertyValueRef<'_>) -> String {
+    match value {
+        PropertyValueRef::Null => "null".to_string(),
+        PropertyValueRef::Bool(value) => format!("bool:{value}"),
+        PropertyValueRef::Integer(value) => format!("integer:{value}"),
+        PropertyValueRef::Float(value) => format!("float:{value}"),
+        PropertyValueRef::String(value) => format!("string:{value}"),
+        PropertyValueRef::Date(value) => format!("date:{value}"),
+        PropertyValueRef::LocalTime(value) => format!("local_time:{value}"),
+        PropertyValueRef::ZonedTime(value) => format!("zoned_time:{value}"),
+        PropertyValueRef::LocalDateTime(value) => format!("local_datetime:{value}"),
+        PropertyValueRef::ZonedDateTime(value) => format!("zoned_datetime:{value}"),
+        PropertyValueRef::Duration(value) => format!("duration:{value}"),
+        PropertyValueRef::List(value) => {
+            let values = value
+                .iter()
+                .map(property_ref_summary)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("list:[{values}]")
+        }
+        PropertyValueRef::Vector(value) => format!("vector:{value:?}"),
+        PropertyValueRef::Point(value) => format!("point:{value:?}"),
+        PropertyValueRef::Geometry(value) => format!("geometry:{value:?}"),
+        PropertyValueRef::Geography(value) => format!("geography:{value:?}"),
+        PropertyValueRef::Bytes(value) => format!("bytes:{} bytes", value.len()),
+    }
+}
+
+fn snapshot_vector_input(input: &VectorEmbeddingInput) -> VectorInputSnapshot {
+    VectorInputSnapshot {
+        index_name: input.index_name.clone(),
+        dimensions: input.dimensions,
+        purpose: input.purpose,
+        entity_kind: input.entity_kind,
+        entity_id: input.entity_id,
+        fields: input
+            .fields
+            .iter()
+            .map(|field| {
+                (
+                    field.name.clone(),
+                    property_ref_summary(field.value.as_ref()),
+                )
+            })
+            .collect(),
+        text: vector_text(input),
+    }
+}
+
+fn toy_vector(text: &str) -> Vec<f32> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("alpha") {
+        vec![1.0, 0.0, 0.0]
+    } else if lower.contains("beta") {
+        vec![0.0, 1.0, 0.0]
+    } else {
+        vec![0.0, 0.0, 1.0]
+    }
+}
+
+fn title_from_node_cell(cell: &CellRef<'_>) -> String {
+    let node = match cell {
+        CellRef::Json(bytes) | CellRef::Text(bytes) => {
+            serde_json::from_slice::<Value>(bytes).expect("node cell should be JSON")
+        }
+        other => panic!("expected node JSON cell, got {other:?}"),
+    };
+    node.get("properties")
+        .and_then(|properties| properties.get("title"))
+        .and_then(Value::as_str)
+        .expect("node should contain properties.title")
+        .to_string()
 }
 
 #[test]
@@ -225,6 +373,178 @@ fn query_params_macro_supports_identifier_and_literal_keys() -> velr::Result<()>
             Owned::Int(7),
             Owned::Text(b"MATCH (n) RETURN n".to_vec())
         ]]
+    );
+    Ok(())
+}
+
+#[test]
+fn fulltext_public_api_indexes_and_queries_text() -> velr::Result<()> {
+    let temp = TempDbPath::new("fulltext");
+    let db = Velr::open(Some(
+        temp.path
+            .to_str()
+            .expect("temp database path should be valid UTF-8"),
+    ))?;
+
+    db.run(
+        "
+        CREATE
+          (:Paper {title: 'Vector Search', abstract: 'graph retrieval with embeddings'}),
+          (:Paper {title: 'Planner Notes', abstract: 'query planning internals'})
+        ",
+    )?;
+    match db.run(
+        "
+        CREATE FULLTEXT INDEX paperText IF NOT EXISTS
+        FOR (n:Paper) ON EACH [n.title, n.abstract]
+        ",
+    ) {
+        Ok(()) => {}
+        Err(e) if fulltext_feature_unavailable(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    }
+
+    let mut table = match db.exec_one(
+        "
+        CALL db.index.fulltext.queryNodes('paperText', 'title:vector')
+        YIELD node, score
+        RETURN node, score
+        ",
+    ) {
+        Ok(table) => table,
+        Err(e) if fulltext_feature_unavailable(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let rows = table.collect(|row| {
+        Ok((
+            title_from_node_cell(&row[0]),
+            match row[1] {
+                CellRef::Float(score) => score,
+                ref other => panic!("expected fulltext score float, got {other:?}"),
+            },
+        ))
+    })?;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "Vector Search");
+    assert!(rows[0].1.is_finite(), "score should be finite");
+    Ok(())
+}
+
+#[test]
+fn vector_embedder_public_api_indexes_and_queries_text() -> velr::Result<()> {
+    let temp = TempDbPath::new("vector");
+    let db = Velr::open(Some(
+        temp.path
+            .to_str()
+            .expect("temp database path should be valid UTF-8"),
+    ))?;
+
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_for_callback = Rc::clone(&seen);
+    db.register_vector_embedder("toy", move |inputs| {
+        seen_for_callback
+            .borrow_mut()
+            .extend(inputs.iter().map(snapshot_vector_input));
+        Ok(inputs
+            .iter()
+            .map(|input| toy_vector(&vector_text(input)))
+            .collect())
+    })?;
+
+    db.run(
+        "
+        CREATE
+          (:Paper {
+            title: 'Alpha Paper',
+            abstract: 'alpha graph',
+            rank: 7,
+            active: true,
+            published: date('2024-05-01'),
+            tags: ['graph', 'alpha']
+          }),
+          (:Paper {
+            title: 'Beta Paper',
+            abstract: 'beta graph',
+            rank: 8,
+            active: false,
+            published: date('2024-05-02'),
+            tags: ['graph', 'beta']
+          })
+        ",
+    )?;
+    match db.run(
+        "
+        CREATE VECTOR INDEX paperEmbedding IF NOT EXISTS
+        FOR (n:Paper)
+        ON EACH [n.title, n.abstract, n.rank, n.active, n.published, n.tags]
+        OPTIONS {
+          indexConfig: {
+            dimensions: 3,
+            metric: 'cosine',
+            embedder: 'toy'
+          }
+        }
+        ",
+    ) {
+        Ok(()) => {}
+        Err(e) if vector_feature_unavailable(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    }
+
+    let mut table = match db.exec_one(
+        "
+        CALL db.index.vector.queryNodes('paperEmbedding', 1, 'alpha query')
+        YIELD node, score
+        RETURN node, score
+        ",
+    ) {
+        Ok(table) => table,
+        Err(e) if vector_feature_unavailable(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let rows = table.collect(|row| Ok((own_cell(&row[0]), own_cell(&row[1]))))?;
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].1, Owned::F64(score) if score.is_finite()));
+
+    let seen = seen.borrow();
+    assert!(
+        seen.iter().any(|input| {
+            input.index_name == "paperEmbedding"
+                && input.dimensions == 3
+                && input.purpose == VectorEmbeddingPurpose::IndexEntity
+                && input.entity_kind == Some(VectorEntityKind::Node)
+                && input.fields
+                    == vec![
+                        (Some("title".to_string()), "string:Alpha Paper".to_string()),
+                        (
+                            Some("abstract".to_string()),
+                            "string:alpha graph".to_string(),
+                        ),
+                        (Some("rank".to_string()), "integer:7".to_string()),
+                        (Some("active".to_string()), "bool:true".to_string()),
+                        (Some("published".to_string()), "date:2024-05-01".to_string()),
+                        (
+                            Some("tags".to_string()),
+                            "list:[string:graph,string:alpha]".to_string(),
+                        ),
+                    ]
+                && input.text == "Alpha Paper\nalpha graph"
+                && input.entity_id.is_some()
+        }),
+        "expected indexed Alpha input, got {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|input| {
+            input.index_name == "paperEmbedding"
+                && input.dimensions == 3
+                && input.purpose == VectorEmbeddingPurpose::Query
+                && input.entity_kind.is_none()
+                && input.entity_id.is_none()
+                && input.fields == vec![(None, "string:alpha query".to_string())]
+                && input.text == "alpha query"
+        }),
+        "expected query input, got {seen:?}"
     );
     Ok(())
 }
@@ -631,6 +951,63 @@ mod arrow {
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[..6], b"ARROW1");
 
+        Ok(())
+    }
+
+    #[test]
+    fn arrow_ipc_bind_roundtrip() -> velr::Result<()> {
+        let db = Velr::open(None)?;
+        let mut source = db.exec_one("UNWIND [1,2,3] AS id RETURN id AS id ORDER BY id")?;
+        let bytes = source.to_arrow_ipc_file()?;
+        drop(source);
+
+        db.bind_arrow_ipc("_ids_ipc", &bytes)?;
+
+        let mut t = db.exec_one(
+            "UNWIND BIND('_ids_ipc') AS row
+             RETURN row.id AS id
+             ORDER BY id",
+        )?;
+        let mut ids = Vec::new();
+        t.for_each_row(|row| {
+            match row[0] {
+                CellRef::Integer(value) => ids.push(value),
+                other => panic!("expected integer id, got {other:?}"),
+            }
+            Ok(())
+        })?;
+
+        assert_eq!(ids, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn arrow_ipc_bind_tx_roundtrip() -> velr::Result<()> {
+        let db = Velr::open(None)?;
+        let mut source = db.exec_one("UNWIND [4,5,6] AS id RETURN id AS id ORDER BY id")?;
+        let bytes = source.to_arrow_ipc_file()?;
+        drop(source);
+
+        let tx = db.begin_tx()?;
+        tx.bind_arrow_ipc("_ids_ipc_tx", &bytes)?;
+
+        let mut t = tx.exec_one(
+            "UNWIND BIND('_ids_ipc_tx') AS row
+             RETURN row.id AS id
+             ORDER BY id",
+        )?;
+        let mut ids = Vec::new();
+        t.for_each_row(|row| {
+            match row[0] {
+                CellRef::Integer(value) => ids.push(value),
+                other => panic!("expected integer id, got {other:?}"),
+            }
+            Ok(())
+        })?;
+        drop(t);
+        tx.commit()?;
+
+        assert_eq!(ids, vec![4, 5, 6]);
         Ok(())
     }
 }

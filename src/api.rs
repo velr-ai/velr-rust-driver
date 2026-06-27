@@ -1,8 +1,12 @@
+// GENERATED FILE - DO NOT EDIT BY HAND.
+// Source of truth: rust/velr-ffi/src/ffi_c.rs
+// Edit the FFI source, then regenerate with: cargo run -p xtask -- gen-sys
+
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 use libloading::{Library, Symbol};
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
 use crate::sys::*;
 #[cfg(feature = "arrow-ipc")]
 use arrow2::ffi::{ArrowArray, ArrowSchema};
@@ -21,6 +25,14 @@ pub struct Api {
         ) -> velr_code,
     >,
     pub velr_close: unsafe extern "C" fn(*mut velr_db),
+    pub velr_register_vector_embedder: unsafe extern "C" fn(
+        *mut velr_db,
+        velr_strview,
+        Option<velr_vector_embedder_callback>,
+        *mut c_void,
+        Option<velr_vector_embedder_free_callback>,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_query_params_new: unsafe extern "C" fn() -> *mut velr_query_params,
     pub velr_query_params_free: unsafe extern "C" fn(*mut velr_query_params),
     pub velr_query_params_set_null: unsafe extern "C" fn(
@@ -337,6 +349,22 @@ pub struct Api {
         usize,
         *mut *mut c_char,
     ) -> velr_code,
+    #[cfg(feature = "arrow-ipc")]
+    pub velr_bind_arrow_ipc: unsafe extern "C" fn(
+        *mut velr_db,
+        *const c_char,
+        *const u8,
+        usize,
+        *mut *mut c_char,
+    ) -> velr_code,
+    #[cfg(feature = "arrow-ipc")]
+    pub velr_tx_bind_arrow_ipc: unsafe extern "C" fn(
+        *mut velr_tx,
+        *const c_char,
+        *const u8,
+        usize,
+        *mut *mut c_char,
+    ) -> velr_code,
 }
 impl Api {
     pub unsafe fn load(lib: &Library) -> Result<Self, libloading::Error> {
@@ -364,6 +392,10 @@ impl Api {
                 concat!(stringify!(velr_open_existing_readonly), "\0").as_bytes(),
             ),
             velr_close: get(lib, concat!(stringify!(velr_close), "\0").as_bytes())?,
+            velr_register_vector_embedder: get(
+                lib,
+                concat!(stringify!(velr_register_vector_embedder), "\0").as_bytes(),
+            )?,
             velr_query_params_new: get(
                 lib,
                 concat!(stringify!(velr_query_params_new), "\0").as_bytes(),
@@ -618,6 +650,16 @@ impl Api {
             velr_tx_bind_arrow_chunks: get(
                 lib,
                 concat!(stringify!(velr_tx_bind_arrow_chunks), "\0").as_bytes(),
+            )?,
+            #[cfg(feature = "arrow-ipc")]
+            velr_bind_arrow_ipc: get(
+                lib,
+                concat!(stringify!(velr_bind_arrow_ipc), "\0").as_bytes(),
+            )?,
+            #[cfg(feature = "arrow-ipc")]
+            velr_tx_bind_arrow_ipc: get(
+                lib,
+                concat!(stringify!(velr_tx_bind_arrow_ipc), "\0").as_bytes(),
             )?,
         })
     }
