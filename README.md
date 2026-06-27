@@ -24,7 +24,6 @@ This release is **alpha**.
 - The Rust API is still evolving.
 - Velr supports openCypher and passes all positive openCypher TCK tests. Exact
   error semantics are not guaranteed to match other openCypher implementations.
-- During the `0.2.x` series, we do **not** guarantee database migration or on-disk database compatibility between releases.
 - Velr 0.2.14 includes a breaking on-disk storage change; existing databases from earlier releases must be recreated by re-importing the source data.
 - Starting with the `0.3.x` series, we intend to guarantee internal database compatibility within the branch.
 

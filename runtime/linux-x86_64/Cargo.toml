@@ -1,6 +1,6 @@
 [package]
 name = "velr-runtime-linux-x86_64"
-version = "0.2.28"
+version = "0.2.29"
 edition = "2021"
 
 description = "Velr native runtime for Linux x86_64"
