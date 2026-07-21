@@ -223,10 +223,35 @@ pub struct Api {
         *mut *mut c_char,
     ) -> velr_code,
     pub velr_rows_close: unsafe extern "C" fn(*mut velr_rows),
+    pub velr_table_json_rows_malloc: unsafe extern "C" fn(
+        *mut velr_table,
+        c_int,
+        *mut *mut u8,
+        *mut usize,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_table_json_rows_with_options_malloc: unsafe extern "C" fn(
+        *mut velr_table,
+        c_int,
+        *const usize,
+        usize,
+        *mut *mut u8,
+        *mut usize,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_rows_next: unsafe extern "C" fn(
         *mut velr_rows,
         *mut velr_cell,
         usize,
+        *mut usize,
+        *mut *mut c_char,
+    ) -> c_int,
+    pub velr_rows_next_batch: unsafe extern "C" fn(
+        *mut velr_rows,
+        *mut velr_cell,
+        usize,
+        usize,
+        *mut usize,
         *mut usize,
         *mut *mut c_char,
     ) -> c_int,
@@ -309,6 +334,24 @@ pub struct Api {
         *mut velr_table,
         *mut *mut u8,
         *mut usize,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_bind_cells: unsafe extern "C" fn(
+        *mut velr_db,
+        *const c_char,
+        *const velr_strview,
+        usize,
+        *const velr_cell,
+        usize,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_tx_bind_cells: unsafe extern "C" fn(
+        *mut velr_tx,
+        *const c_char,
+        *const velr_strview,
+        usize,
+        *const velr_cell,
+        usize,
         *mut *mut c_char,
     ) -> velr_code,
     #[cfg(feature = "arrow-ipc")]
@@ -555,9 +598,22 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_rows_close), "\0").as_bytes(),
             )?,
+            velr_table_json_rows_malloc: get(
+                lib,
+                concat!(stringify!(velr_table_json_rows_malloc), "\0").as_bytes(),
+            )?,
+            velr_table_json_rows_with_options_malloc: get(
+                lib,
+                concat!(stringify!(velr_table_json_rows_with_options_malloc), "\0")
+                    .as_bytes(),
+            )?,
             velr_rows_next: get(
                 lib,
                 concat!(stringify!(velr_rows_next), "\0").as_bytes(),
+            )?,
+            velr_rows_next_batch: get(
+                lib,
+                concat!(stringify!(velr_rows_next_batch), "\0").as_bytes(),
             )?,
             velr_tx_begin: get(
                 lib,
@@ -630,6 +686,14 @@ impl Api {
             velr_table_ipc_file_malloc: get(
                 lib,
                 concat!(stringify!(velr_table_ipc_file_malloc), "\0").as_bytes(),
+            )?,
+            velr_bind_cells: get(
+                lib,
+                concat!(stringify!(velr_bind_cells), "\0").as_bytes(),
+            )?,
+            velr_tx_bind_cells: get(
+                lib,
+                concat!(stringify!(velr_tx_bind_cells), "\0").as_bytes(),
             )?,
             #[cfg(feature = "arrow-ipc")]
             velr_bind_arrow: get(
