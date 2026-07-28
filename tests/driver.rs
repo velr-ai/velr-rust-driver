@@ -378,6 +378,35 @@ fn query_params_macro_supports_identifier_and_literal_keys() -> velr::Result<()>
 }
 
 #[test]
+fn vacuum_public_api_compacts_file_backed_database() -> velr::Result<()> {
+    let temp = TempDbPath::new("vacuum");
+    let db = Velr::open(Some(
+        temp.path
+            .to_str()
+            .expect("temp database path should be valid UTF-8"),
+    ))?;
+
+    db.run("CREATE (:Tmp {id: 1})")?;
+    db.run("MATCH (n:Tmp) DETACH DELETE n")?;
+    match db.vacuum() {
+        Ok(()) => {}
+        Err(e) if e.message.contains("does not expose velr_vacuum") => return Ok(()),
+        Err(e) => return Err(e),
+    }
+
+    let mut table = db.exec_one("MATCH (n:Tmp) RETURN count(n) AS n")?;
+    let rows = table.collect(|row| {
+        Ok(match row[0] {
+            CellRef::Integer(n) => n,
+            ref other => panic!("expected integer count, got {other:?}"),
+        })
+    })?;
+    assert_eq!(rows, vec![0]);
+
+    Ok(())
+}
+
+#[test]
 fn fulltext_public_api_indexes_and_queries_text() -> velr::Result<()> {
     let temp = TempDbPath::new("fulltext");
     let db = Velr::open(Some(
@@ -546,6 +575,62 @@ fn vector_embedder_public_api_indexes_and_queries_text() -> velr::Result<()> {
         }),
         "expected query input, got {seen:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn stored_vector_public_api_queries_numeric_vector_params() -> velr::Result<()> {
+    let temp = TempDbPath::new("stored-vector");
+    let db = Velr::open(Some(
+        temp.path
+            .to_str()
+            .expect("temp database path should be valid UTF-8"),
+    ))?;
+
+    db.run(
+        "
+        CREATE
+          (:Chunk {title: 'Alpha', embedding: [1.0, 0.0, 0.0]}),
+          (:Chunk {title: 'Beta', embedding: [0.0, 1.0, 0.0]}),
+          (:Chunk {title: 'Gamma', embedding: [0.0, 0.0, 1.0]})
+        ",
+    )?;
+    match db.run(
+        "
+        CREATE VECTOR INDEX chunkEmbedding IF NOT EXISTS
+        FOR (n:Chunk)
+        ON (n.embedding)
+        OPTIONS {
+          indexConfig: {
+            dimensions: 3,
+            metric: 'cosine'
+          }
+        }
+        ",
+    ) {
+        Ok(()) => {}
+        Err(e) if vector_feature_unavailable(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    }
+
+    let params = QueryParams::new().with("embedding", vec![0.0_f64, 1.0, 0.0])?;
+    let mut table = match db.exec_one_with_params(
+        "
+        CALL db.index.vector.queryNodes('chunkEmbedding', 1, $embedding)
+        YIELD node, score
+        RETURN node.title AS title, score
+        ",
+        params,
+    ) {
+        Ok(table) => table,
+        Err(e) if vector_feature_unavailable(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let rows = table.collect(|row| Ok((own_cell(&row[0]), own_cell(&row[1]))))?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, Owned::Text(b"Beta".to_vec()));
+    assert!(matches!(rows[0].1, Owned::F64(score) if score.is_finite() && score > 0.0));
+
     Ok(())
 }
 
@@ -879,7 +964,11 @@ fn scoped_savepoint_rollback_semantics() -> velr::Result<()> {
 #[cfg(feature = "arrow-ipc")]
 mod arrow {
     use super::*;
-    use arrow2::array::{Array, BooleanArray, PrimitiveArray, Utf8Array};
+    use arrow2::{
+        array::{Array, BooleanArray, ListArray, PrimitiveArray, Utf8Array},
+        datatypes::DataType,
+        offset::OffsetsBuffer,
+    };
 
     #[test]
     fn arrow_bind_non_tx_roundtrip() -> velr::Result<()> {
@@ -1008,6 +1097,138 @@ mod arrow {
         tx.commit()?;
 
         assert_eq!(ids, vec![4, 5, 6]);
+        Ok(())
+    }
+
+    fn embedding_array(rows: usize) -> Box<dyn Array> {
+        let mut offsets = Vec::with_capacity(rows + 1);
+        let mut values = Vec::with_capacity(rows * 3);
+        offsets.push(0_i64);
+        for row in 0..rows {
+            values.push(Some(if row % 3 == 0 { 1.0 } else { 0.0 }));
+            values.push(Some(if row % 3 == 1 { 1.0 } else { 0.0 }));
+            values.push(Some(if row % 3 == 2 { 1.0 } else { 0.0 }));
+            offsets.push(values.len() as i64);
+        }
+        ListArray::<i64>::try_new(
+            ListArray::<i64>::default_datatype(DataType::Float64),
+            OffsetsBuffer::<i64>::try_from(offsets).expect("offsets"),
+            PrimitiveArray::<f64>::from(values).boxed(),
+            None,
+        )
+        .expect("embedding array")
+        .boxed()
+    }
+
+    #[test]
+    fn arrow_bound_create_set_then_tag_phase_reuses_connection_without_stale_padding_view(
+    ) -> velr::Result<()> {
+        let temp = TempDbPath::new("arrow-bound-temp-view-reuse");
+        let db = Velr::open(Some(temp.path.to_str().expect("utf-8 temp path")))?;
+
+        let point_tx = db.begin_tx()?;
+        for batch in 0..5 {
+            let ids = (0..2)
+                .map(|offset| Some(format!("chunk-{}", batch * 2 + offset)))
+                .collect::<Vec<_>>();
+            let texts = (0..2)
+                .map(|offset| Some(format!("chunk text {}", batch * 2 + offset)))
+                .collect::<Vec<_>>();
+            point_tx.bind_arrow(
+                &format!("_cognee_vector_points_{batch}"),
+                vec![
+                    "id".into(),
+                    "collection_name".into(),
+                    "text".into(),
+                    "payload".into(),
+                    "belongs_to_set_json".into(),
+                    "embedding".into(),
+                ],
+                vec![
+                    Utf8Array::<i64>::from(ids.clone()).boxed(),
+                    Utf8Array::<i64>::from(vec![
+                        Some("DocumentChunk_text"),
+                        Some("DocumentChunk_text"),
+                    ])
+                    .boxed(),
+                    Utf8Array::<i64>::from(texts).boxed(),
+                    Utf8Array::<i64>::from(
+                        ids.iter()
+                            .map(|id| id.as_ref().map(|id| format!("{{\"id\":\"{id}\"}}")))
+                            .collect::<Vec<_>>(),
+                    )
+                    .boxed(),
+                    Utf8Array::<i64>::from(vec![
+                        Some("[\"product_notes\"]"),
+                        Some("[\"research_notes\"]"),
+                    ])
+                    .boxed(),
+                    embedding_array(2),
+                ],
+            )?;
+            point_tx.run(&format!(
+                "
+                UNWIND BIND('_cognee_vector_points_{batch}') AS row
+                CREATE (point:VectorPoint:`VectorPoint_7a4c8217db462d1d`)
+                SET point.id = row.id,
+                    point.collection_name = row.collection_name,
+                    point.text = row.text,
+                    point.payload = row.payload,
+                    point.belongs_to_set_json = row.belongs_to_set_json,
+                    point.embedding = row.embedding
+                "
+            ))?;
+        }
+        point_tx.commit()?;
+
+        db.run(
+            "
+            CREATE VECTOR INDEX cognee_vector_7a4c8217db462d1d IF NOT EXISTS
+            FOR (n:`VectorPoint_7a4c8217db462d1d`)
+            ON (n.embedding)
+            OPTIONS {
+              indexConfig: {
+                `vector.dimensions`: 3,
+                `vector.similarity_function`: 'cosine'
+              }
+            }
+            ",
+        )?;
+
+        let tag_tx = db.begin_tx()?;
+        tag_tx.bind_arrow(
+            "_cognee_vector_point_tags_0",
+            vec!["id".into(), "tag".into()],
+            vec![
+                Utf8Array::<i64>::from(vec![Some("chunk-0"), Some("chunk-1")]).boxed(),
+                Utf8Array::<i64>::from(vec![Some("product_notes"), Some("research_notes")]).boxed(),
+            ],
+        )?;
+        tag_tx.run(
+            "
+            UNWIND BIND('_cognee_vector_point_tags_0') AS row
+            MATCH (point:`VectorPoint_7a4c8217db462d1d` {id: row.id})
+            MERGE (node_set:VectorNodeSet {name: row.tag})
+            CREATE (point)-[:belongs_to_set]->(node_set)
+            ",
+        )?;
+        tag_tx.commit()?;
+
+        let mut table = db.exec_one(
+            "
+            MATCH (:VectorPoint)-[r:belongs_to_set]->(:VectorNodeSet)
+            RETURN count(r) AS count
+            ",
+        )?;
+        let mut count = None;
+        table.for_each_row(|row| {
+            count = Some(match row[0] {
+                CellRef::Integer(value) => value,
+                ref other => panic!("expected integer count, got {other:?}"),
+            });
+            Ok(())
+        })?;
+        assert_eq!(count, Some(2));
         Ok(())
     }
 }

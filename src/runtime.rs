@@ -81,7 +81,7 @@ static MATERIALIZE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// - `_lib` is intentionally kept to extend the lifetime of the loaded dynamic library.
 /// - `api` provides access to the runtime's resolved ABI symbols.
-/// - `path` indicates the filesystem location of the loaded runtime library (either cached bundled
+/// - `_path` records the filesystem location of the loaded runtime library (either cached bundled
 ///   bytes or a user-provided path via `VELR_RUNTIME_PATH`).
 pub struct Runtime {
     /// Keep the library alive for the lifetime of the process.
@@ -89,7 +89,7 @@ pub struct Runtime {
     /// ABI entrypoints resolved from the loaded runtime library.
     pub api: Api,
     /// Filesystem path from which the runtime library was loaded.
-    pub path: PathBuf,
+    _path: PathBuf,
 }
 
 /// Get the process-wide Velr runtime singleton.
@@ -172,7 +172,7 @@ impl Runtime {
         Ok(Self {
             _lib: lib,
             api,
-            path,
+            _path: path,
         })
     }
 }

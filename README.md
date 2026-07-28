@@ -27,9 +27,9 @@ This release is **alpha**.
 - Velr 0.2.14 includes a breaking on-disk storage change; existing databases from earlier releases must be recreated by re-importing the source data.
 - Starting with the `0.3.x` series, we intend to guarantee internal database compatibility within the branch.
 
-### Schema version 7 compatibility
+### Schema version 8 compatibility
 
-This release's current on-disk schema is version 7. Supported older databases
+This release's current on-disk schema is version 8. Supported older databases
 can be opened with `Velr::open` or `Velr::open_readonly` without changing the
 file. Reads continue to work on those databases, but writes (`CREATE`, `MERGE`,
 `SET`, `DELETE`, `DETACH DELETE`, and other mutating queries) are only available
@@ -117,8 +117,8 @@ fn main() -> velr::Result<()> {
 
 `open_readonly` requires an existing file-backed database at a supported Velr
 schema version. It does not create files, run schema DDL, or migrate older
-databases. Older supported databases, such as schema version 3, 4, 5, or 6
-databases opened by a schema version 7 runtime, remain available for reads.
+databases. Older supported databases, such as schema version 3, 4, 5, 6, or 7
+databases opened by a schema version 8 runtime, remain available for reads.
 Writes and features that require the current schema fail with a normal query
 error until the database is explicitly migrated.
 
@@ -129,7 +129,7 @@ error until the database is explicitly migrated.
 Velr does not migrate supported older databases automatically on open. Use the
 driver migration API, or run `MIGRATE DATABASE`, from maintenance code when you
 intend to update the on-disk schema. See the release-status note above for the
-schema version 7 read/write compatibility behavior.
+schema version 8 read/write compatibility behavior.
 
 ```rust,no_run
 use velr::{MigrationStatus, Velr};
@@ -246,16 +246,92 @@ fulltext field.
 single query result set; scores are not guaranteed to be in `0..1` or
 comparable across different queries.
 
-Fulltext indexes use a sidecar next to file-backed databases. The sidecar is
-kept up to date by writes and rebuilt on open if it is missing or corrupt.
+Fulltext indexes are kept up to date by writes. For file-backed databases,
+Velr repairs missing or corrupt fulltext index data automatically when the
+database is opened.
 
 ---
 
 ## Vector Search
 
-Register an embedding callback, then reference it from `CREATE VECTOR INDEX`.
-Velr invokes the callback for index maintenance when indexed source values
-change and for text queries passed to `CALL db.index.vector.queryNodes(...)`.
+Velr supports two vector index shapes.
+
+If your application already computes embeddings, store them as a vector/list
+property and index that property. No embedder is needed, and queries pass a
+numeric vector/list:
+
+```rust,no_run
+use velr::Velr;
+
+fn main() -> velr::Result<()> {
+    let db = Velr::open(Some("mygraph.db"))?;
+
+    db.run(
+        "CREATE (:Chunk {
+           id: 'chunk-1',
+           text: 'Graph databases store connected data',
+           embedding: [0.12, 0.34, 0.56]
+         })",
+    )?;
+
+    db.run(
+        "CREATE VECTOR INDEX chunkEmbedding IF NOT EXISTS
+         FOR (n:Chunk)
+         ON (n.embedding)
+         OPTIONS { indexConfig: { dimensions: 3, metric: 'cosine' } }",
+    )?;
+
+    let mut _rows = db.exec_one(
+        "CALL db.index.vector.queryNodes('chunkEmbedding', 10, [0.10, 0.30, 0.50])
+         YIELD node, score
+         RETURN node, score",
+    )?;
+
+    Ok(())
+}
+```
+
+For text-to-vector search, register an embedding callback and reference it from
+`CREATE VECTOR INDEX`. Velr invokes the callback for index maintenance when
+indexed source values change and for text queries passed to
+`CALL db.index.vector.queryNodes(...)`.
+
+`OPTIONS { indexConfig: ... }` configures Velr vector indexes. Prefer the
+Neo4j-style names where they exist; shorter aliases are accepted for existing
+queries and examples.
+
+```cypher
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 384,
+    `vector.similarity_function`: 'cosine',
+    embedder: 'text',
+    cache_policy: 'required',
+    `vector.hnsw.ef_search`: 128
+  }
+}
+```
+
+Core options:
+
+| Option | Accepted aliases | Meaning |
+|---|---|---|
+| `` `vector.dimensions` `` | `dimensions` | Required vector width. Every stored vector, embedder output, and query vector must contain exactly this many values. |
+| `` `vector.similarity_function` `` | `metric`, `similarity_function` | Distance function. Use `cosine` for most semantic embeddings, `l2`/`euclidean` for geometric distance, and `dot`/`inner_product`/`max_inner_product` for inner-product retrieval. Default: `cosine`. |
+| `embedder` | `velr.embedder` | Name of a registered callback for `ON EACH [...]` indexes. Omit it for stored-vector indexes such as `ON (n.embedding)`. |
+| `embedder_fingerprint` | `embedderFingerprint`, `velr.embedder_fingerprint` | Optional model/version metadata stored with the index definition. Velr does not use it to call the embedder. |
+| `cache_policy` | `cachePolicy` | Embedder-backed indexes only. `required` stores generated embeddings in the database so index files can be rebuilt without recomputing them; `best_effort` skips cache write errors; `none` stores no generated embedding cache. Defaults: `required` with `embedder`, `none` without. Stored-vector indexes require `none` because the vector property is already the durable source. |
+
+HNSW tuning options:
+
+| Option | Integer count | Meaning |
+|---|---:|---|
+| `` `vector.hnsw.m` `` | `1..512` neighbors | Maximum graph connectivity per vector. For example, `16` means each vector keeps roughly 16 HNSW neighbor links. Higher values can improve recall on difficult datasets, with more memory, larger index files, and slower builds. |
+| `` `vector.hnsw.ef_construction` `` | `1..3200` candidates | Build-time candidate pool per inserted vector. For example, `320` means the builder considers a working set of 320 candidate neighbors while placing each vector. Higher values can improve index quality and recall, usually with slower index creation. |
+| `` `vector.hnsw.ef_search` `` | `1..3200` candidates | Query-time candidate pool. For example, `128` means each search keeps a working set of 128 candidate vectors while traversing the HNSW graph. Higher values can improve recall, usually with slower searches. Velr's default is `64`. |
+
+Velr manages the vector scalar format and storage/cache engines internally. Use
+the options above for application configuration.
 
 ```rust,no_run
 use velr::{PropertyValue, VectorEmbeddingPurpose, Velr};
@@ -312,6 +388,10 @@ fn main() -> velr::Result<()> {
 that order. Query text is passed as one unnamed string field. Vector `score` is
 metric-dependent and non-normalized; higher scores are better within a single
 query result set.
+
+For file-backed databases, Velr can repair missing or corrupt vector index data
+from stored vector properties or from registered embedders, depending on how
+the index was created.
 
 ---
 

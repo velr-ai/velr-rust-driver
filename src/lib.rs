@@ -100,7 +100,7 @@
 //!
 //! # Schema migration and introspection
 //!
-//! This runtime's current on-disk schema is version 7. Supported older databases can be opened
+//! This runtime's current on-disk schema is version 8. Supported older databases can be opened
 //! without automatic migration. Reads remain available on those databases, but writes and
 //! features that require the current schema return a query error until the user explicitly
 //! migrates. `SHOW CURRENT GRAPH SHAPE` is available once a database has reached schema version 5.
@@ -114,12 +114,45 @@
 //! `RETURN`, or `YIELD *` to inspect the full row shape.
 //!
 //! Fulltext search is also available through normal Cypher execution. Use `CREATE FULLTEXT INDEX`
-//! to define an index and `CALL db.index.fulltext.queryNodes(...)` to search it. Fulltext indexes
-//! use a sidecar next to file-backed databases, and no dedicated driver methods are required. The
-//! query grammar supports terms, phrases, field scoping, boolean grouping, required/excluded
-//! terms, phrase slop, phrase-prefix, boosts, and `*` match-all. `score` is a non-normalized
-//! relevance score. Higher scores are better within a single query result set; scores are not
-//! guaranteed to be in `0..1` or comparable across different queries.
+//! to define an index and `CALL db.index.fulltext.queryNodes(...)` to search it. For file-backed
+//! databases, Velr repairs missing or corrupt fulltext index data automatically when the database
+//! is opened. The query grammar supports terms, phrases, field scoping, boolean grouping,
+//! required/excluded terms, phrase slop, phrase-prefix, boosts, and `*` match-all. `score` is a
+//! non-normalized relevance score. Higher scores are better within a single query result set;
+//! scores are not guaranteed to be in `0..1` or comparable across different queries.
+//!
+//! # Vector search
+//!
+//! Velr supports two vector index shapes through Cypher:
+//!
+//! - Stored vectors: `CREATE VECTOR INDEX chunkEmbedding FOR (n:Chunk) ON (n.embedding) ...`
+//!   indexes an existing vector/list property. Queries pass a numeric vector/list to
+//!   `CALL db.index.vector.queryNodes(...)`.
+//! - Embedder-backed vectors: `CREATE VECTOR INDEX paperEmbedding FOR (n:Paper) ON EACH
+//!   [n.title, n.abstract] OPTIONS { indexConfig: { embedder: 'text', dimensions: 384 } }`
+//!   uses a callback registered with [`Velr::register_vector_embedder`]. Queries may pass text
+//!   payloads, which Velr sends to the same registered embedder.
+//!
+//! For file-backed databases, Velr can repair missing or corrupt vector index data from stored
+//! vector properties or from registered embedders, depending on how the index was created.
+//!
+//! `OPTIONS { indexConfig: ... }` configures Velr vector indexes. Prefer the Neo4j-style names
+//! where they exist; shorter aliases are accepted for existing queries and examples.
+//!
+//! | Option | Accepted aliases | Meaning |
+//! |---|---|---|
+//! | `` `vector.dimensions` `` | `dimensions` | Required vector width. Every stored vector, embedder output, and query vector must contain exactly this many values. |
+//! | `` `vector.similarity_function` `` | `metric`, `similarity_function` | Distance function: `cosine`, `l2`/`euclidean`, or `dot`/`inner_product`/`max_inner_product`. |
+//! | `embedder` | `velr.embedder` | Name of a registered callback for `ON EACH [...]` indexes. Omit it for stored-vector indexes such as `ON (n.embedding)`. |
+//! | `embedder_fingerprint` | `embedderFingerprint`, `velr.embedder_fingerprint` | Optional model/version metadata stored with the index definition. |
+//! | `cache_policy` | `cachePolicy` | Embedder-backed indexes only. `required` stores generated embeddings so index files can be rebuilt without recomputing them; `best_effort` skips cache write errors; `none` stores no generated embedding cache. Defaults: `required` with `embedder`, `none` without. Stored-vector indexes require `none`. |
+//!
+//! HNSW tuning options are `` `vector.hnsw.m` `` (`1..512` neighbor links per vector),
+//! `` `vector.hnsw.ef_construction` `` (`1..3200` build candidates per inserted vector), and
+//! `` `vector.hnsw.ef_search` `` (`1..3200` query candidates) for graph traversal. Higher values
+//! can improve recall, usually with more memory, larger index files, slower builds, or slower
+//! queries. Velr's default query-time candidate pool is `64`. Velr manages the vector scalar
+//! format and storage/cache engines internally.
 #![allow(unsafe_code)]
 
 mod api;
@@ -860,6 +893,10 @@ pub struct MigrationReport {
 }
 
 /// Why Velr is asking an embedder to produce vectors.
+///
+/// This enum is only used for embedder-backed indexes. Stored-vector indexes,
+/// such as `CREATE VECTOR INDEX ... ON (n.embedding)`, use the vector property
+/// directly and do not call a registered embedder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VectorEmbeddingPurpose {
     /// Embedding source values from a graph entity for index maintenance.
@@ -876,6 +913,10 @@ pub enum VectorEntityKind {
 }
 
 /// One named Velr value passed to a registered vector embedding callback.
+///
+/// For embedder-backed indexes, fields correspond to the properties named in
+/// `CREATE VECTOR INDEX ... ON EACH [...]`. Stored-vector indexes do not pass
+/// their vector property through this callback path.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct VectorEmbeddingField {
@@ -890,6 +931,10 @@ pub struct VectorEmbeddingField {
 /// For indexed entities, `fields` follows the `CREATE VECTOR INDEX ... ON EACH [...]`
 /// property order. For `n.*`, fields are ordered by property name. For query text,
 /// Velr passes one unnamed `PropertyValue::String` field.
+///
+/// Stored-vector indexes, such as `CREATE VECTOR INDEX ... ON (n.embedding)`,
+/// do not produce `VectorEmbeddingInput` values. They index the stored vector
+/// property directly and vector queries pass a numeric vector/list.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct VectorEmbeddingInput {
@@ -1894,12 +1939,32 @@ impl Velr {
         result
     }
 
+    /// Compact the underlying SQLite database file.
+    ///
+    /// This is an explicit maintenance operation for file-backed databases
+    /// after large deletes or prune operations. It must run on a writable
+    /// current-schema connection outside any open transaction.
+    pub fn vacuum(&self) -> Result<()> {
+        let a = velr_api()?;
+        let vacuum = require_runtime_symbol(a.velr_vacuum, "velr_vacuum")?;
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { vacuum(self.db.as_ptr(), &mut err) };
+        rc_to_result(rc, err)
+    }
+
     /// Register a named embedding callback for vector indexes.
     ///
-    /// Vector indexes refer to this name with
+    /// Embedder-backed vector indexes refer to this name with
     /// `OPTIONS { indexConfig: { embedder: 'name' } }`. Velr calls the matching
     /// callback when indexed source values change and when embedding query text
     /// supplied to `CALL db.index.vector.queryNodes(...)`.
+    /// `indexConfig` also carries vector dimensions, metric, cache policy,
+    /// optional embedder fingerprint metadata, and HNSW tuning keys.
+    ///
+    /// Stored-vector indexes, such as `CREATE VECTOR INDEX ... ON (n.embedding)`,
+    /// do not use a registered embedder. They index the vector/list property
+    /// directly and vector queries pass a numeric vector/list.
     ///
     /// The callback receives a batch of [`VectorEmbeddingInput`] values and must
     /// return one vector per input. Each returned vector must contain exactly
@@ -2466,7 +2531,6 @@ impl TableResult {
 
         Ok(RowIter {
             rows: Some(nn),
-            col_count: self.col_count,
             buf: vec![
                 ffi::velr_cell {
                     ty: ffi::velr_cell_type::VELR_NULL,
@@ -2550,7 +2614,6 @@ impl Drop for TableResult {
 /// [`CellRef`].
 pub struct RowIter<'t> {
     rows: Option<NonNull<ffi::velr_rows>>,
-    col_count: usize,
     buf: Vec<ffi::velr_cell>,
     _table: PhantomData<&'t mut TableResult>,
     _nosend: PhantomData<Rc<()>>, // !Send + !Sync

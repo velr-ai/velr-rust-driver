@@ -86,6 +86,9 @@ pub struct Api {
             *mut *mut c_char,
         ) -> velr_code,
     >,
+    pub velr_vacuum: Option<
+        unsafe extern "C" fn(*mut velr_db, *mut *mut c_char) -> velr_code,
+    >,
     pub velr_migration_report_clear: Option<
         unsafe extern "C" fn(*mut velr_migration_report),
     >,
@@ -486,6 +489,10 @@ impl Api {
             velr_migrate: get_optional(
                 lib,
                 concat!(stringify!(velr_migrate), "\0").as_bytes(),
+            ),
+            velr_vacuum: get_optional(
+                lib,
+                concat!(stringify!(velr_vacuum), "\0").as_bytes(),
             ),
             velr_migration_report_clear: get_optional(
                 lib,
