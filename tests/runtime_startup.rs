@@ -5,10 +5,42 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use velr::{CellRef, Velr};
+use velr::{
+    CellRef, ExecTables, ExecTablesTx, ExplainTrace, RowIter, TableResult, Velr, VelrSavepoint,
+    VelrTx,
+};
 
 const CHILD_ENV: &str = "VELR_RUNTIME_STARTUP_CHILD";
 const WORKERS_ENV: &str = "VELR_RUNTIME_STARTUP_WORKERS";
+
+#[test]
+fn public_driver_threading_contract_is_send_not_sync() -> velr::Result<()> {
+    static_assertions::assert_impl_all!(Velr: Send);
+    static_assertions::assert_not_impl_any!(Velr: Sync);
+    static_assertions::assert_not_impl_any!(ExecTables<'static>: Send, Sync);
+    static_assertions::assert_not_impl_any!(TableResult: Send, Sync);
+    static_assertions::assert_not_impl_any!(RowIter<'static>: Send, Sync);
+    static_assertions::assert_not_impl_any!(VelrTx<'static>: Send, Sync);
+    static_assertions::assert_not_impl_any!(ExecTablesTx<'static>: Send, Sync);
+    static_assertions::assert_not_impl_any!(VelrSavepoint<'static>: Send, Sync);
+    static_assertions::assert_not_impl_any!(ExplainTrace: Send, Sync);
+
+    let db = Velr::open(None)?;
+    let handle = std::thread::spawn(move || -> velr::Result<i64> {
+        let mut table = db.exec_one("RETURN 1 AS n")?;
+        let mut value = 0;
+        table.for_each_row(|row| {
+            value = match row[0] {
+                CellRef::Integer(n) => n,
+                _ => panic!("expected integer row"),
+            };
+            Ok(())
+        })?;
+        Ok(value)
+    });
+    assert_eq!(handle.join().expect("connection worker joins")?, 1);
+    Ok(())
+}
 
 fn temp_cache_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()

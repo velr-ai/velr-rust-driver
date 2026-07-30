@@ -1,9 +1,8 @@
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     fs,
     path::PathBuf,
-    rc::Rc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -469,11 +468,12 @@ fn vector_embedder_public_api_indexes_and_queries_text() -> velr::Result<()> {
             .expect("temp database path should be valid UTF-8"),
     ))?;
 
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    let seen_for_callback = Rc::clone(&seen);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_for_callback = Arc::clone(&seen);
     db.register_vector_embedder("toy", move |inputs| {
         seen_for_callback
-            .borrow_mut()
+            .lock()
+            .expect("seen inputs lock")
             .extend(inputs.iter().map(snapshot_vector_input));
         Ok(inputs
             .iter()
@@ -536,7 +536,7 @@ fn vector_embedder_public_api_indexes_and_queries_text() -> velr::Result<()> {
     assert_eq!(rows.len(), 1);
     assert!(matches!(rows[0].1, Owned::F64(score) if score.is_finite()));
 
-    let seen = seen.borrow();
+    let seen = seen.lock().expect("seen inputs lock");
     assert!(
         seen.iter().any(|input| {
             input.index_name == "paperEmbedding"

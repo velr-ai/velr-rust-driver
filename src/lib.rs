@@ -1210,7 +1210,7 @@ unsafe extern "C" fn vector_embedder_trampoline<F>(
     err_buf_len: usize,
 ) -> ffi::velr_code
 where
-    F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + 'static,
+    F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + Send + 'static,
 {
     let result = catch_unwind(AssertUnwindSafe(|| -> std::result::Result<(), String> {
         if user_data.is_null() {
@@ -1272,7 +1272,7 @@ where
 
 unsafe extern "C" fn vector_embedder_free_trampoline<F>(user_data: *mut c_void)
 where
-    F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + 'static,
+    F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + Send + 'static,
 {
     if !user_data.is_null() {
         drop(Box::from_raw(user_data as *mut F));
@@ -1748,6 +1748,8 @@ pub struct Velr {
     _not_sync: PhantomData<Cell<()>>, // Send + !Sync
 }
 
+unsafe impl Send for Velr {}
+
 impl Velr {
     /// Open a Velr connection.
     ///
@@ -1970,9 +1972,13 @@ impl Velr {
     /// return one vector per input. Each returned vector must contain exactly
     /// `input.dimensions` finite `f32` values.
     ///
+    /// `Velr` connections are movable between owner threads, so registered
+    /// callbacks must be `Send`; callbacks are still invoked serially by the
+    /// connection that owns the operation.
+    ///
     pub fn register_vector_embedder<F>(&self, name: &str, embedder: F) -> Result<()>
     where
-        F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + 'static,
+        F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + Send + 'static,
     {
         if name.trim().is_empty() {
             return Err(Error::new(
