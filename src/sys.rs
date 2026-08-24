@@ -43,6 +43,18 @@ pub struct velr_cell {
     pub ptr: *const u8,
     pub len: usize,
 }
+/// One sparse map entry for a list-of-map query parameter.
+///
+/// `row_index` is zero-based. Missing entries are preserved as missing map keys; explicit nulls
+/// should be passed as `VELR_NULL` cells.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct velr_param_map_entry {
+    pub row_index: usize,
+    pub key: velr_strview,
+    pub value: velr_cell,
+}
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]

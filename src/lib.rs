@@ -100,7 +100,7 @@
 //!
 //! # Schema migration and introspection
 //!
-//! This runtime's current on-disk schema is version 8. Supported older databases can be opened
+//! This runtime's current on-disk schema is version 9. Supported older databases can be opened
 //! without automatic migration. Reads remain available on those databases, but writes and
 //! features that require the current schema return a query error until the user explicitly
 //! migrates. `SHOW CURRENT GRAPH SHAPE` is available once a database has reached schema version 5.
@@ -108,6 +108,8 @@
 //! Use [`Velr::schema_version`], [`Velr::current_schema_version`], and
 //! [`Velr::needs_migration`] to inspect the connection state. Use [`Velr::migrate`] or execute
 //! `MIGRATE DATABASE` from maintenance code when upgrading is intended.
+//! Use [`Velr::vacuum`] or execute `VACUUM DATABASE` from maintenance code to compact a writable,
+//! current-schema database outside an open transaction.
 //!
 //! `SHOW CURRENT GRAPH SHAPE` exposes Velr's observed graph schema: labels, relationship types,
 //! properties, observed value types, and counts. Use `YIELD` to compose it with `WHERE` and
@@ -161,7 +163,7 @@ mod sys;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::{CStr, CString},
     fmt,
     hash::BuildHasher,
@@ -768,8 +770,19 @@ struct RawQueryParams {
     free: unsafe extern "C" fn(*mut ffi::velr_query_params),
 }
 
+type RowMapColumnHints = HashMap<String, Vec<String>>;
+
 impl RawQueryParams {
-    fn from_query_params(params: &QueryParams) -> Result<Option<Self>> {
+    fn from_query_params_with_cypher(params: &QueryParams, cypher: &str) -> Result<Option<Self>> {
+        let a = velr_api()?;
+        let hints = row_map_column_hints_for_cypher(a, cypher, params)?;
+        Self::from_query_params_with_hints(params, hints.as_ref())
+    }
+
+    fn from_query_params_with_hints(
+        params: &QueryParams,
+        row_map_column_hints: Option<&RowMapColumnHints>,
+    ) -> Result<Option<Self>> {
         if params.is_empty() {
             return Ok(None);
         }
@@ -788,12 +801,23 @@ impl RawQueryParams {
             free: a.velr_query_params_free,
         };
         for (name, value) in params.iter() {
-            out.set(name, value)?;
+            out.set(
+                name,
+                value,
+                row_map_column_hints
+                    .and_then(|hints| hints.get(name))
+                    .map(Vec::as_slice),
+            )?;
         }
         Ok(Some(out))
     }
 
-    fn set(&self, name: &str, value: &QueryValue) -> Result<()> {
+    fn set(
+        &self,
+        name: &str,
+        value: &QueryValue,
+        row_map_columns: Option<&[String]>,
+    ) -> Result<()> {
         let a = velr_api()?;
         let name = raw_strview(name.as_bytes());
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -820,24 +844,689 @@ impl RawQueryParams {
                     raw_strview(value.as_bytes()),
                     &mut err,
                 ),
-                QueryValue::List(_) | QueryValue::Map(_) => {
-                    let json = serde_json::to_vec(&query_value_to_json(value)).map_err(|e| {
-                        Error::new(
-                            ffi::velr_code::VELR_EERR as i32,
-                            format!("failed to encode query parameter JSON: {e}"),
-                        )
-                    })?;
-                    (a.velr_query_params_set_json)(
-                        self.ptr.as_ptr(),
-                        name,
-                        raw_strview(&json),
-                        &mut err,
-                    )
+                QueryValue::List(values) => {
+                    match self.try_set_row_maps(a, name, values, row_map_columns, &mut err)? {
+                        Some(rc) => rc,
+                        None => self.set_json_param(a, name, value, &mut err)?,
+                    }
                 }
+                QueryValue::Map(_) => self.set_json_param(a, name, value, &mut err)?,
             }
         };
         rc_to_result(rc, err)
     }
+
+    fn set_json_param(
+        &self,
+        a: &api::Api,
+        name: ffi::velr_strview,
+        value: &QueryValue,
+        err: &mut *mut c_char,
+    ) -> Result<ffi::velr_code> {
+        let json = serde_json::to_vec(&query_value_to_json(value)).map_err(|e| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                format!("failed to encode query parameter JSON: {e}"),
+            )
+        })?;
+        Ok(unsafe {
+            (a.velr_query_params_set_json)(self.ptr.as_ptr(), name, raw_strview(&json), err)
+        })
+    }
+
+    fn try_set_row_maps(
+        &self,
+        a: &api::Api,
+        name: ffi::velr_strview,
+        values: &[QueryValue],
+        projected_columns: Option<&[String]>,
+        err: &mut *mut c_char,
+    ) -> Result<Option<ffi::velr_code>> {
+        if !values
+            .iter()
+            .all(|value| matches!(value, QueryValue::Map(_)))
+        {
+            return Ok(None);
+        }
+
+        if let Some(columns) = projected_columns {
+            if let Some(rc) =
+                self.try_set_projected_row_map_columns(a, name, values, columns, err)?
+            {
+                return Ok(Some(rc));
+            }
+        }
+
+        if let Some(rc) = self.try_set_dense_row_maps(a, name, values, err)? {
+            return Ok(Some(rc));
+        }
+        if let Some(rc) = self.try_set_sparse_row_map_columns(a, name, values, err)? {
+            return Ok(Some(rc));
+        }
+
+        let entry_count = values
+            .iter()
+            .map(|value| match value {
+                QueryValue::Map(row) => row.len(),
+                _ => 0,
+            })
+            .sum();
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut json_buffers = Vec::<Vec<u8>>::new();
+
+        for (row_index, value) in values.iter().enumerate() {
+            let QueryValue::Map(row) = value else {
+                unreachable!("row-map shape was checked above");
+            };
+            for (key, value) in row {
+                let cell = query_value_to_ffi_cell(value, &mut json_buffers)?;
+                entries.push(ffi::velr_param_map_entry {
+                    row_index,
+                    key: raw_strview(key.as_bytes()),
+                    value: cell,
+                });
+            }
+        }
+
+        Ok(Some(unsafe {
+            (a.velr_query_params_set_row_maps)(
+                self.ptr.as_ptr(),
+                name,
+                values.len(),
+                entries.as_ptr(),
+                entries.len(),
+                err,
+            )
+        }))
+    }
+
+    fn try_set_projected_row_map_columns(
+        &self,
+        a: &api::Api,
+        name: ffi::velr_strview,
+        values: &[QueryValue],
+        columns: &[String],
+        err: &mut *mut c_char,
+    ) -> Result<Option<ffi::velr_code>> {
+        let columns = columns
+            .iter()
+            .map(|column| column.as_bytes())
+            .collect::<Vec<_>>();
+        let total_cells = values.len().checked_mul(columns.len()).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EARG as i32,
+                "query parameter row-map cell count overflow",
+            )
+        })?;
+
+        if let Some(rc) = self.try_set_packed_sparse_row_maps(a, name, values, &columns, err)? {
+            return Ok(Some(rc));
+        }
+
+        let colnames = columns
+            .iter()
+            .map(|column| raw_strview(column))
+            .collect::<Vec<_>>();
+        let mut cells = Vec::with_capacity(total_cells);
+        let mut present = Vec::<u8>::with_capacity(total_cells);
+        let mut json_buffers = Vec::<Vec<u8>>::new();
+        let mut all_present = true;
+
+        for value in values {
+            let QueryValue::Map(row) = value else {
+                unreachable!("row-map shape was checked above");
+            };
+            for column in &columns {
+                let column = std::str::from_utf8(column).map_err(|_| {
+                    Error::new(
+                        ffi::velr_code::VELR_EUTF as i32,
+                        "query parameter row-map column is not utf-8",
+                    )
+                })?;
+                if let Some(value) = row.get(column) {
+                    present.push(1);
+                    cells.push(query_value_to_ffi_cell(value, &mut json_buffers)?);
+                } else {
+                    all_present = false;
+                    present.push(0);
+                    cells.push(null_ffi_cell());
+                }
+            }
+        }
+
+        Ok(Some(unsafe {
+            (a.velr_query_params_set_row_map_columns)(
+                self.ptr.as_ptr(),
+                name,
+                values.len(),
+                ptr_or_null(colnames.as_slice()),
+                colnames.len(),
+                ptr_or_null(cells.as_slice()),
+                if all_present {
+                    std::ptr::null()
+                } else {
+                    ptr_or_null(present.as_slice())
+                },
+                err,
+            )
+        }))
+    }
+
+    fn try_set_dense_row_maps(
+        &self,
+        a: &api::Api,
+        name: ffi::velr_strview,
+        values: &[QueryValue],
+        err: &mut *mut c_char,
+    ) -> Result<Option<ffi::velr_code>> {
+        let columns = match values.first() {
+            Some(QueryValue::Map(row)) => row.keys().map(|key| key.as_bytes()).collect::<Vec<_>>(),
+            Some(_) => return Ok(None),
+            None => Vec::new(),
+        };
+
+        for value in values {
+            let QueryValue::Map(row) = value else {
+                return Ok(None);
+            };
+            if row.len() != columns.len() {
+                return Ok(None);
+            }
+            for ((key, _), expected_key) in row.iter().zip(columns.iter()) {
+                if key.as_bytes() != *expected_key {
+                    return Ok(None);
+                }
+            }
+        }
+
+        if let Some(rc) = self.try_set_packed_dense_row_maps(a, name, values, &columns, err)? {
+            return Ok(Some(rc));
+        }
+
+        let mut cells = Vec::with_capacity(values.len() * columns.len());
+        let mut json_buffers = Vec::<Vec<u8>>::new();
+
+        for value in values {
+            let QueryValue::Map(row) = value else {
+                unreachable!("row-map shape was checked above");
+            };
+            for value in row.values() {
+                cells.push(query_value_to_ffi_cell(value, &mut json_buffers)?);
+            }
+        }
+
+        let colnames = columns
+            .iter()
+            .map(|column| raw_strview(column))
+            .collect::<Vec<_>>();
+
+        Ok(Some(unsafe {
+            (a.velr_query_params_set_row_map_columns)(
+                self.ptr.as_ptr(),
+                name,
+                values.len(),
+                ptr_or_null(colnames.as_slice()),
+                colnames.len(),
+                ptr_or_null(cells.as_slice()),
+                std::ptr::null(),
+                err,
+            )
+        }))
+    }
+
+    fn try_set_sparse_row_map_columns(
+        &self,
+        a: &api::Api,
+        name: ffi::velr_strview,
+        values: &[QueryValue],
+        err: &mut *mut c_char,
+    ) -> Result<Option<ffi::velr_code>> {
+        let mut columns = BTreeSet::<&str>::new();
+        let mut entry_count = 0usize;
+        for value in values {
+            let QueryValue::Map(row) = value else {
+                return Ok(None);
+            };
+            entry_count = entry_count.checked_add(row.len()).ok_or_else(|| {
+                Error::new(
+                    ffi::velr_code::VELR_EARG as i32,
+                    "query parameter row-map entry count overflow",
+                )
+            })?;
+            for key in row.keys() {
+                columns.insert(key.as_str());
+            }
+        }
+        let columns = columns.into_iter().map(str::as_bytes).collect::<Vec<_>>();
+        let total_cells = values.len().checked_mul(columns.len()).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EARG as i32,
+                "query parameter row-map cell count overflow",
+            )
+        })?;
+        if total_cells > entry_count.saturating_mul(2) {
+            return Ok(None);
+        }
+
+        if let Some(rc) = self.try_set_packed_sparse_row_maps(a, name, values, &columns, err)? {
+            return Ok(Some(rc));
+        }
+
+        let colnames = columns
+            .iter()
+            .map(|column| raw_strview(column))
+            .collect::<Vec<_>>();
+        let mut cells = Vec::with_capacity(total_cells);
+        let mut present = Vec::<u8>::with_capacity(total_cells);
+        let mut json_buffers = Vec::<Vec<u8>>::new();
+        let mut all_present = true;
+
+        for value in values {
+            let QueryValue::Map(row) = value else {
+                unreachable!("row-map shape was checked above");
+            };
+            for column in &columns {
+                let column = std::str::from_utf8(column).map_err(|_| {
+                    Error::new(
+                        ffi::velr_code::VELR_EUTF as i32,
+                        "query parameter row-map column is not utf-8",
+                    )
+                })?;
+                if let Some(value) = row.get(column) {
+                    present.push(1);
+                    cells.push(query_value_to_ffi_cell(value, &mut json_buffers)?);
+                } else {
+                    all_present = false;
+                    present.push(0);
+                    cells.push(null_ffi_cell());
+                }
+            }
+        }
+
+        Ok(Some(unsafe {
+            (a.velr_query_params_set_row_map_columns)(
+                self.ptr.as_ptr(),
+                name,
+                values.len(),
+                ptr_or_null(colnames.as_slice()),
+                colnames.len(),
+                ptr_or_null(cells.as_slice()),
+                if all_present {
+                    std::ptr::null()
+                } else {
+                    ptr_or_null(present.as_slice())
+                },
+                err,
+            )
+        }))
+    }
+
+    fn try_set_packed_dense_row_maps(
+        &self,
+        a: &api::Api,
+        name: ffi::velr_strview,
+        values: &[QueryValue],
+        columns: &[&[u8]],
+        err: &mut *mut c_char,
+    ) -> Result<Option<ffi::velr_code>> {
+        let total_cells = values.len().checked_mul(columns.len()).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EARG as i32,
+                "query parameter row-map cell count overflow",
+            )
+        })?;
+        let colnames = columns
+            .iter()
+            .map(|column| raw_strview(column))
+            .collect::<Vec<_>>();
+        let mut cell_types = Vec::<ffi::velr_cell_type>::with_capacity(total_cells);
+        let mut i64_values = Vec::<i64>::with_capacity(total_cells);
+        let mut f64_values = Vec::<f64>::with_capacity(total_cells);
+        let mut bytes_offsets = Vec::<usize>::with_capacity(total_cells);
+        let mut bytes_lens = Vec::<usize>::with_capacity(total_cells);
+        let mut bytes = Vec::<u8>::new();
+
+        for value in values {
+            let QueryValue::Map(row) = value else {
+                unreachable!("row-map shape was checked above");
+            };
+            for value in row.values() {
+                push_packed_param_cell(
+                    value,
+                    &mut cell_types,
+                    &mut i64_values,
+                    &mut f64_values,
+                    &mut bytes_offsets,
+                    &mut bytes_lens,
+                    &mut bytes,
+                )?;
+            }
+        }
+
+        Ok(Some(call_packed_row_map_columns(
+            a,
+            self.ptr.as_ptr(),
+            name,
+            values.len(),
+            &colnames,
+            &cell_types,
+            &i64_values,
+            &f64_values,
+            &bytes_offsets,
+            &bytes_lens,
+            &bytes,
+            std::ptr::null(),
+            err,
+        )))
+    }
+
+    fn try_set_packed_sparse_row_maps(
+        &self,
+        a: &api::Api,
+        name: ffi::velr_strview,
+        values: &[QueryValue],
+        columns: &[&[u8]],
+        err: &mut *mut c_char,
+    ) -> Result<Option<ffi::velr_code>> {
+        let total_cells = values.len().checked_mul(columns.len()).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EARG as i32,
+                "query parameter row-map cell count overflow",
+            )
+        })?;
+        let colnames = columns
+            .iter()
+            .map(|column| raw_strview(column))
+            .collect::<Vec<_>>();
+        let mut cell_types = Vec::<ffi::velr_cell_type>::with_capacity(total_cells);
+        let mut i64_values = Vec::<i64>::with_capacity(total_cells);
+        let mut f64_values = Vec::<f64>::with_capacity(total_cells);
+        let mut bytes_offsets = Vec::<usize>::with_capacity(total_cells);
+        let mut bytes_lens = Vec::<usize>::with_capacity(total_cells);
+        let mut bytes = Vec::<u8>::new();
+        let mut present = Vec::<u8>::with_capacity(total_cells);
+        let mut all_present = true;
+
+        for value in values {
+            let QueryValue::Map(row) = value else {
+                unreachable!("row-map shape was checked above");
+            };
+            for column in columns {
+                let column = std::str::from_utf8(column).map_err(|_| {
+                    Error::new(
+                        ffi::velr_code::VELR_EUTF as i32,
+                        "query parameter row-map column is not utf-8",
+                    )
+                })?;
+                if let Some(value) = row.get(column) {
+                    present.push(1);
+                    push_packed_param_cell(
+                        value,
+                        &mut cell_types,
+                        &mut i64_values,
+                        &mut f64_values,
+                        &mut bytes_offsets,
+                        &mut bytes_lens,
+                        &mut bytes,
+                    )?;
+                } else {
+                    all_present = false;
+                    present.push(0);
+                    push_packed_null_cell(
+                        &mut cell_types,
+                        &mut i64_values,
+                        &mut f64_values,
+                        &mut bytes_offsets,
+                        &mut bytes_lens,
+                    );
+                }
+            }
+        }
+
+        Ok(Some(call_packed_row_map_columns(
+            a,
+            self.ptr.as_ptr(),
+            name,
+            values.len(),
+            &colnames,
+            &cell_types,
+            &i64_values,
+            &f64_values,
+            &bytes_offsets,
+            &bytes_lens,
+            &bytes,
+            if all_present {
+                std::ptr::null()
+            } else {
+                ptr_or_null(present.as_slice())
+            },
+            err,
+        )))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_packed_row_map_columns(
+    a: &api::Api,
+    params: *mut ffi::velr_query_params,
+    name: ffi::velr_strview,
+    row_count: usize,
+    colnames: &[ffi::velr_strview],
+    cell_types: &[ffi::velr_cell_type],
+    i64_values: &[i64],
+    f64_values: &[f64],
+    bytes_offsets: &[usize],
+    bytes_lens: &[usize],
+    bytes: &[u8],
+    present: *const u8,
+    err: &mut *mut c_char,
+) -> ffi::velr_code {
+    if let (Some(bytes_offsets), Some(bytes_lens)) = (
+        packed_offsets_to_u32(bytes_offsets),
+        packed_offsets_to_u32(bytes_lens),
+    ) {
+        let cell_types = packed_cell_types_to_u8(cell_types);
+        return unsafe {
+            (a.velr_query_params_set_row_map_packed_columns_u8_u32)(
+                params,
+                name,
+                row_count,
+                ptr_or_null(colnames),
+                colnames.len(),
+                ptr_or_null(cell_types.as_slice()),
+                ptr_or_null(i64_values),
+                ptr_or_null(f64_values),
+                ptr_or_null(bytes_offsets.as_slice()),
+                ptr_or_null(bytes_lens.as_slice()),
+                ptr_or_null(bytes),
+                bytes.len(),
+                present,
+                err,
+            )
+        };
+    }
+
+    unsafe {
+        (a.velr_query_params_set_row_map_packed_columns)(
+            params,
+            name,
+            row_count,
+            ptr_or_null(colnames),
+            colnames.len(),
+            ptr_or_null(cell_types),
+            ptr_or_null(i64_values),
+            ptr_or_null(f64_values),
+            ptr_or_null(bytes_offsets),
+            ptr_or_null(bytes_lens),
+            ptr_or_null(bytes),
+            bytes.len(),
+            present,
+            err,
+        )
+    }
+}
+
+fn packed_offsets_to_u32(values: &[usize]) -> Option<Vec<u32>> {
+    let mut converted = Vec::with_capacity(values.len());
+    for &value in values {
+        converted.push(u32::try_from(value).ok()?);
+    }
+    Some(converted)
+}
+
+fn packed_cell_types_to_u8(values: &[ffi::velr_cell_type]) -> Vec<u8> {
+    values.iter().map(|value| *value as u8).collect()
+}
+
+fn push_packed_null_cell(
+    cell_types: &mut Vec<ffi::velr_cell_type>,
+    i64_values: &mut Vec<i64>,
+    f64_values: &mut Vec<f64>,
+    bytes_offsets: &mut Vec<usize>,
+    bytes_lens: &mut Vec<usize>,
+) {
+    cell_types.push(ffi::velr_cell_type::VELR_NULL);
+    i64_values.push(0);
+    f64_values.push(0.0);
+    bytes_offsets.push(0);
+    bytes_lens.push(0);
+}
+
+fn push_packed_param_cell(
+    value: &QueryValue,
+    cell_types: &mut Vec<ffi::velr_cell_type>,
+    i64_values: &mut Vec<i64>,
+    f64_values: &mut Vec<f64>,
+    bytes_offsets: &mut Vec<usize>,
+    bytes_lens: &mut Vec<usize>,
+    bytes: &mut Vec<u8>,
+) -> Result<()> {
+    match value {
+        QueryValue::Null => push_packed_null_cell(
+            cell_types,
+            i64_values,
+            f64_values,
+            bytes_offsets,
+            bytes_lens,
+        ),
+        QueryValue::Bool(value) => {
+            cell_types.push(ffi::velr_cell_type::VELR_BOOL);
+            i64_values.push(i64::from(*value));
+            f64_values.push(0.0);
+            bytes_offsets.push(0);
+            bytes_lens.push(0);
+        }
+        QueryValue::Integer(value) => {
+            cell_types.push(ffi::velr_cell_type::VELR_INT64);
+            i64_values.push(*value);
+            f64_values.push(0.0);
+            bytes_offsets.push(0);
+            bytes_lens.push(0);
+        }
+        QueryValue::Float(value) => {
+            cell_types.push(ffi::velr_cell_type::VELR_DOUBLE);
+            i64_values.push(0);
+            f64_values.push(*value);
+            bytes_offsets.push(0);
+            bytes_lens.push(0);
+        }
+        QueryValue::String(value) => {
+            cell_types.push(ffi::velr_cell_type::VELR_TEXT);
+            i64_values.push(0);
+            f64_values.push(0.0);
+            bytes_offsets.push(bytes.len());
+            bytes_lens.push(value.len());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        QueryValue::List(_) | QueryValue::Map(_) => {
+            let json = serde_json::to_vec(&query_value_to_json(value)).map_err(|e| {
+                Error::new(
+                    ffi::velr_code::VELR_EERR as i32,
+                    format!("failed to encode query parameter JSON: {e}"),
+                )
+            })?;
+            cell_types.push(ffi::velr_cell_type::VELR_JSON);
+            i64_values.push(0);
+            f64_values.push(0.0);
+            bytes_offsets.push(bytes.len());
+            bytes_lens.push(json.len());
+            bytes.extend_from_slice(&json);
+        }
+    }
+    Ok(())
+}
+
+fn ptr_or_null<T>(slice: &[T]) -> *const T {
+    if slice.is_empty() {
+        std::ptr::null()
+    } else {
+        slice.as_ptr()
+    }
+}
+
+fn null_ffi_cell() -> ffi::velr_cell {
+    ffi::velr_cell {
+        ty: ffi::velr_cell_type::VELR_NULL,
+        i64_: 0,
+        f64_: 0.0,
+        ptr: std::ptr::null(),
+        len: 0,
+    }
+}
+
+fn query_value_to_ffi_cell(
+    value: &QueryValue,
+    json_buffers: &mut Vec<Vec<u8>>,
+) -> Result<ffi::velr_cell> {
+    let cell = match value {
+        QueryValue::Null => null_ffi_cell(),
+        QueryValue::Bool(value) => ffi::velr_cell {
+            ty: ffi::velr_cell_type::VELR_BOOL,
+            i64_: i64::from(*value),
+            f64_: 0.0,
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        QueryValue::Integer(value) => ffi::velr_cell {
+            ty: ffi::velr_cell_type::VELR_INT64,
+            i64_: *value,
+            f64_: 0.0,
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        QueryValue::Float(value) => ffi::velr_cell {
+            ty: ffi::velr_cell_type::VELR_DOUBLE,
+            i64_: 0,
+            f64_: *value,
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        QueryValue::String(value) => ffi::velr_cell {
+            ty: ffi::velr_cell_type::VELR_TEXT,
+            i64_: 0,
+            f64_: 0.0,
+            ptr: value.as_ptr(),
+            len: value.len(),
+        },
+        QueryValue::List(_) | QueryValue::Map(_) => {
+            let json = serde_json::to_vec(&query_value_to_json(value)).map_err(|e| {
+                Error::new(
+                    ffi::velr_code::VELR_EERR as i32,
+                    format!("failed to encode query parameter JSON: {e}"),
+                )
+            })?;
+            json_buffers.push(json);
+            let json = json_buffers.last().expect("just pushed JSON buffer");
+            ffi::velr_cell {
+                ty: ffi::velr_cell_type::VELR_JSON,
+                i64_: 0,
+                f64_: 0.0,
+                ptr: json.as_ptr(),
+                len: json.len(),
+            }
+        }
+    };
+    Ok(cell)
 }
 
 impl Drop for RawQueryParams {
@@ -855,10 +1544,65 @@ fn raw_strview(bytes: &[u8]) -> ffi::velr_strview {
     }
 }
 
+fn row_map_column_hints_for_cypher(
+    a: &api::Api,
+    cypher: &str,
+    params: &QueryParams,
+) -> Result<Option<RowMapColumnHints>> {
+    let mut hints = RowMapColumnHints::new();
+    for (name, value) in params.iter() {
+        let QueryValue::List(values) = value else {
+            continue;
+        };
+        if !values
+            .iter()
+            .all(|value| matches!(value, QueryValue::Map(_)))
+        {
+            continue;
+        }
+
+        let mut out_json: *mut c_char = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            (a.velr_query_param_row_map_required_columns)(
+                raw_strview(cypher.as_bytes()),
+                raw_strview(name.as_bytes()),
+                &mut out_json,
+                &mut err,
+            )
+        };
+        rc_to_result(rc, err)?;
+        if out_json.is_null() {
+            continue;
+        }
+
+        let json = unsafe { CStr::from_ptr(out_json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            (a.velr_string_free)(out_json);
+        }
+        let columns = serde_json::from_str::<Vec<String>>(&json).map_err(|e| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                format!("failed to decode row-map required columns: {e}"),
+            )
+        })?;
+        hints.insert(name.to_string(), columns);
+    }
+
+    if hints.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hints))
+    }
+}
+
 fn raw_query_options(
+    cypher: &str,
     options: &QueryOptions,
 ) -> Result<(ffi::velr_query_options, Option<RawQueryParams>)> {
-    let params = RawQueryParams::from_query_params(&options.params)?;
+    let params = RawQueryParams::from_query_params_with_cypher(&options.params, cypher)?;
     let raw = ffi::velr_query_options {
         has_max_result_rows: i32::from(options.max_result_rows.is_some()),
         max_result_rows: options.max_result_rows.unwrap_or(0),
@@ -2070,7 +2814,7 @@ impl Velr {
 
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
-        let (raw_options, _raw_params) = raw_query_options(&options)?;
+        let (raw_options, _raw_params) = raw_query_options(cypher, &options)?;
 
         let mut out_stream: *mut ffi::velr_stream = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -2150,7 +2894,7 @@ impl Velr {
 
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
-        let (raw_options, _raw_params) = raw_query_options(&options)?;
+        let (raw_options, _raw_params) = raw_query_options(cypher, &options)?;
 
         let mut out_table: *mut ffi::velr_table = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -2170,31 +2914,35 @@ impl Velr {
 
     /// Execute a query and discard all results.
     ///
-    /// This is a convenience wrapper around [`Velr::exec`] that drains all tables and rows.
+    /// This uses the runtime's direct run ABI and does not materialize result tables.
     pub fn run(&self, cypher: &str) -> Result<()> {
-        let mut st = self.exec(cypher)?;
-        while let Some(mut t) = st.next_table()? {
-            t.for_each_row(|_| Ok(()))?;
-        }
-        Ok(())
+        let a = velr_api()?;
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { (a.velr_run)(self.db.as_ptr(), cy.as_ptr(), &mut err) };
+        rc_to_result(rc, err)
     }
 
     /// Execute a query with options and discard emitted results.
     ///
-    /// This drains all result tables like [`Velr::run`]. Query options still affect the rows that
-    /// are drained, but they do not skip side effects from write queries. For example, a
-    /// read-write query with `max_result_rows = 1` may emit one row while still applying all writes
-    /// required by the query.
+    /// Query options still affect emitted rows, but they do not skip side effects from write
+    /// queries. For example, a read-write query with `max_result_rows = 1` may emit one row while
+    /// still applying all writes required by the query.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if [`Velr::exec_with_options`] or row draining fails.
+    /// Returns an [`Error`] if the runtime reports an execution error.
     pub fn run_with_options(&self, cypher: &str, options: QueryOptions) -> Result<()> {
-        let mut st = self.exec_with_options(cypher, options)?;
-        while let Some(mut t) = st.next_table()? {
-            t.for_each_row(|_| Ok(()))?;
-        }
-        Ok(())
+        let a = velr_api()?;
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+        let (raw_options, _raw_params) = raw_query_options(cypher, &options)?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            (a.velr_run_with_options)(self.db.as_ptr(), cy.as_ptr(), &raw_options, &mut err)
+        };
+        rc_to_result(rc, err)
     }
 
     /// Execute `openCypher` with bound parameters and return a stream of result tables.
@@ -2831,7 +3579,7 @@ impl<'db> VelrTx<'db> {
         let tx = self.ptr()?;
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
-        let (raw_options, _raw_params) = raw_query_options(&options)?;
+        let (raw_options, _raw_params) = raw_query_options(cypher, &options)?;
 
         let mut out_stream: *mut ffi::velr_stream_tx = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -2924,28 +3672,36 @@ impl<'db> VelrTx<'db> {
     }
 
     /// Execute a query within this transaction and discard all results.
+    ///
+    /// This uses the runtime's direct transaction run ABI and does not materialize result tables.
     pub fn run(&self, cypher: &str) -> Result<()> {
-        let mut st = self.exec(cypher)?;
-        while let Some(mut t) = st.next_table()? {
-            t.for_each_row(|_| Ok(()))?;
-        }
-        Ok(())
+        let a = velr_api()?;
+        let tx = self.ptr()?;
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { (a.velr_tx_run)(tx.as_ptr(), cy.as_ptr(), &mut err) };
+        rc_to_result(rc, err)
     }
 
     /// Execute a query with options inside this transaction and discard results.
     ///
-    /// This drains all result tables like [`VelrTx::run`]. Query options cap only emitted rows;
-    /// they do not skip query side effects.
+    /// Query options cap only emitted rows; they do not skip query side effects.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if [`VelrTx::exec_with_options`] or row draining fails.
+    /// Returns an [`Error`] if the runtime reports an execution error.
     pub fn run_with_options(&self, cypher: &str, options: QueryOptions) -> Result<()> {
-        let mut st = self.exec_with_options(cypher, options)?;
-        while let Some(mut t) = st.next_table()? {
-            t.for_each_row(|_| Ok(()))?;
-        }
-        Ok(())
+        let a = velr_api()?;
+        let tx = self.ptr()?;
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+        let (raw_options, _raw_params) = raw_query_options(cypher, &options)?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            (a.velr_tx_run_with_options)(tx.as_ptr(), cy.as_ptr(), &raw_options, &mut err)
+        };
+        rc_to_result(rc, err)
     }
 
     /// Execute `openCypher` with bound parameters inside this transaction.

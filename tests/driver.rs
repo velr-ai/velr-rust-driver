@@ -326,6 +326,99 @@ fn query_params_shortcut_preserves_string_values_non_tx() -> velr::Result<()> {
 }
 
 #[test]
+fn query_params_list_of_maps_preserves_map_shape() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+
+    let mut first = BTreeMap::new();
+    first.insert("id".to_string(), QueryValue::Integer(1));
+    first.insert(
+        "name".to_string(),
+        QueryValue::String("explicit".to_string()),
+    );
+    first.insert("value".to_string(), QueryValue::Null);
+
+    let mut second = BTreeMap::new();
+    second.insert("id".to_string(), QueryValue::Integer(2));
+    second.insert(
+        "name".to_string(),
+        QueryValue::String("missing".to_string()),
+    );
+
+    let params = QueryParams::new().with(
+        "rows",
+        QueryValue::List(vec![QueryValue::Map(first), QueryValue::Map(second)]),
+    )?;
+    let mut t = db.exec_one_with_params(
+        "UNWIND $rows AS row RETURN row AS row ORDER BY row.id",
+        params,
+    )?;
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Owned::Json(serde_json::json!({
+                "id": 1,
+                "name": "explicit",
+                "value": null
+            }))],
+            vec![Owned::Json(serde_json::json!({
+                "id": 2,
+                "name": "missing"
+            }))],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn query_params_projected_list_of_maps_with_extra_fields_imports() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+
+    let mut first = BTreeMap::new();
+    first.insert("id".to_string(), QueryValue::String("a".to_string()));
+    first.insert("name".to_string(), QueryValue::String("Ada".to_string()));
+    first.insert(
+        "ignored".to_string(),
+        QueryValue::String("unused".to_string()),
+    );
+
+    let mut second = BTreeMap::new();
+    second.insert("id".to_string(), QueryValue::String("b".to_string()));
+    second.insert("name".to_string(), QueryValue::String("Grace".to_string()));
+    second.insert(
+        "ignored".to_string(),
+        QueryValue::String("unused".to_string()),
+    );
+
+    let params = QueryParams::new().with(
+        "rows",
+        QueryValue::List(vec![QueryValue::Map(first), QueryValue::Map(second)]),
+    )?;
+    db.run_with_params(
+        r#"
+        UNWIND $rows AS row
+        WITH row.id AS id, row.name AS name
+        MERGE (thing:ProjectedParam {id: id})
+        SET thing.name = name
+        "#,
+        params,
+    )?;
+
+    let mut t = db.exec_one(
+        "MATCH (thing:ProjectedParam) RETURN thing.id AS id, thing.name AS name ORDER BY id",
+    )?;
+    let rows = t.collect(|r| Ok(r.iter().map(own_cell).collect::<Vec<_>>()))?;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Owned::Text(b"a".to_vec()), Owned::Text(b"Ada".to_vec())],
+            vec![Owned::Text(b"b".to_vec()), Owned::Text(b"Grace".to_vec())],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn query_params_shortcuts_work_in_tx() -> velr::Result<()> {
     let db = Velr::open(None)?;
     let tx = db.begin_tx()?;

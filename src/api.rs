@@ -35,6 +35,12 @@ pub struct Api {
     ) -> velr_code,
     pub velr_query_params_new: unsafe extern "C" fn() -> *mut velr_query_params,
     pub velr_query_params_free: unsafe extern "C" fn(*mut velr_query_params),
+    pub velr_query_param_row_map_required_columns: unsafe extern "C" fn(
+        velr_strview,
+        velr_strview,
+        *mut *mut c_char,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_query_params_set_null: unsafe extern "C" fn(
         *mut velr_query_params,
         velr_strview,
@@ -70,6 +76,72 @@ pub struct Api {
         velr_strview,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_query_params_set_row_maps: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        usize,
+        *const velr_param_map_entry,
+        usize,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_query_params_set_row_map_columns: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        usize,
+        *const velr_strview,
+        usize,
+        *const velr_cell,
+        *const u8,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_query_params_set_row_map_packed_columns: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        usize,
+        *const velr_strview,
+        usize,
+        *const velr_cell_type,
+        *const i64,
+        *const f64,
+        *const usize,
+        *const usize,
+        *const u8,
+        usize,
+        *const u8,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_query_params_set_row_map_packed_columns_u32: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        usize,
+        *const velr_strview,
+        usize,
+        *const velr_cell_type,
+        *const i64,
+        *const f64,
+        *const u32,
+        *const u32,
+        *const u8,
+        usize,
+        *const u8,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_query_params_set_row_map_packed_columns_u8_u32: unsafe extern "C" fn(
+        *mut velr_query_params,
+        velr_strview,
+        usize,
+        *const velr_strview,
+        usize,
+        *const u8,
+        *const i64,
+        *const f64,
+        *const u32,
+        *const u32,
+        *const u8,
+        usize,
+        *const u8,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_schema_version: Option<
         unsafe extern "C" fn(*mut velr_db, *mut i32, *mut *mut c_char) -> velr_code,
     >,
@@ -103,6 +175,17 @@ pub struct Api {
         *const c_char,
         *const velr_query_options,
         *mut *mut velr_stream,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_run: unsafe extern "C" fn(
+        *mut velr_db,
+        *const c_char,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_run_with_options: unsafe extern "C" fn(
+        *mut velr_db,
+        *const c_char,
+        *const velr_query_options,
         *mut *mut c_char,
     ) -> velr_code,
     pub velr_exec_close: unsafe extern "C" fn(*mut velr_stream),
@@ -285,6 +368,17 @@ pub struct Api {
         *mut *mut velr_stream_tx,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_tx_run: unsafe extern "C" fn(
+        *mut velr_tx,
+        *const c_char,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_tx_run_with_options: unsafe extern "C" fn(
+        *mut velr_tx,
+        *const c_char,
+        *const velr_query_options,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_exec_tx_close: unsafe extern "C" fn(*mut velr_stream_tx),
     pub velr_stream_tx_next_table: unsafe extern "C" fn(
         *mut velr_stream_tx,
@@ -450,6 +544,11 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_query_params_free), "\0").as_bytes(),
             )?,
+            velr_query_param_row_map_required_columns: get(
+                lib,
+                concat!(stringify!(velr_query_param_row_map_required_columns), "\0")
+                    .as_bytes(),
+            )?,
             velr_query_params_set_null: get(
                 lib,
                 concat!(stringify!(velr_query_params_set_null), "\0").as_bytes(),
@@ -473,6 +572,34 @@ impl Api {
             velr_query_params_set_json: get(
                 lib,
                 concat!(stringify!(velr_query_params_set_json), "\0").as_bytes(),
+            )?,
+            velr_query_params_set_row_maps: get(
+                lib,
+                concat!(stringify!(velr_query_params_set_row_maps), "\0").as_bytes(),
+            )?,
+            velr_query_params_set_row_map_columns: get(
+                lib,
+                concat!(stringify!(velr_query_params_set_row_map_columns), "\0")
+                    .as_bytes(),
+            )?,
+            velr_query_params_set_row_map_packed_columns: get(
+                lib,
+                concat!(stringify!(velr_query_params_set_row_map_packed_columns), "\0")
+                    .as_bytes(),
+            )?,
+            velr_query_params_set_row_map_packed_columns_u32: get(
+                lib,
+                concat!(
+                    stringify!(velr_query_params_set_row_map_packed_columns_u32), "\0"
+                )
+                    .as_bytes(),
+            )?,
+            velr_query_params_set_row_map_packed_columns_u8_u32: get(
+                lib,
+                concat!(
+                    stringify!(velr_query_params_set_row_map_packed_columns_u8_u32), "\0"
+                )
+                    .as_bytes(),
             )?,
             velr_schema_version: get_optional(
                 lib,
@@ -505,6 +632,11 @@ impl Api {
             velr_exec_start_with_options: get(
                 lib,
                 concat!(stringify!(velr_exec_start_with_options), "\0").as_bytes(),
+            )?,
+            velr_run: get(lib, concat!(stringify!(velr_run), "\0").as_bytes())?,
+            velr_run_with_options: get(
+                lib,
+                concat!(stringify!(velr_run_with_options), "\0").as_bytes(),
             )?,
             velr_exec_close: get(
                 lib,
@@ -645,6 +777,11 @@ impl Api {
             velr_tx_exec_start_with_options: get(
                 lib,
                 concat!(stringify!(velr_tx_exec_start_with_options), "\0").as_bytes(),
+            )?,
+            velr_tx_run: get(lib, concat!(stringify!(velr_tx_run), "\0").as_bytes())?,
+            velr_tx_run_with_options: get(
+                lib,
+                concat!(stringify!(velr_tx_run_with_options), "\0").as_bytes(),
             )?,
             velr_exec_tx_close: get(
                 lib,

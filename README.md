@@ -27,9 +27,9 @@ This release is **alpha**.
 - Velr 0.2.14 includes a breaking on-disk storage change; existing databases from earlier releases must be recreated by re-importing the source data.
 - Starting with the `0.3.x` series, we intend to guarantee internal database compatibility within the branch.
 
-### Schema version 8 compatibility
+### Schema version 9 compatibility
 
-This release's current on-disk schema is version 8. Supported older databases
+This release's current on-disk schema is version 9. Supported older databases
 can be opened with `Velr::open` or `Velr::open_readonly` without changing the
 file. Reads continue to work on those databases, but writes (`CREATE`, `MERGE`,
 `SET`, `DELETE`, `DETACH DELETE`, and other mutating queries) are only available
@@ -117,8 +117,8 @@ fn main() -> velr::Result<()> {
 
 `open_readonly` requires an existing file-backed database at a supported Velr
 schema version. It does not create files, run schema DDL, or migrate older
-databases. Older supported databases, such as schema version 3, 4, 5, 6, or 7
-databases opened by a schema version 8 runtime, remain available for reads.
+databases. Older supported databases, such as schema version 3, 4, 5, 6, 7, or
+8 databases opened by a schema version 9 runtime, remain available for reads.
 Writes and features that require the current schema fail with a normal query
 error until the database is explicitly migrated.
 
@@ -129,7 +129,7 @@ error until the database is explicitly migrated.
 Velr does not migrate supported older databases automatically on open. Use the
 driver migration API, or run `MIGRATE DATABASE`, from maintenance code when you
 intend to update the on-disk schema. See the release-status note above for the
-schema version 8 read/write compatibility behavior.
+schema version 9 read/write compatibility behavior.
 
 ```rust,no_run
 use velr::{MigrationStatus, Velr};
@@ -162,6 +162,25 @@ let db = Velr::open(Some("mygraph.db"))?;
 let mut report = db.exec_one("MIGRATE DATABASE")?;
 println!("{:?}", report.column_names());
 ```
+
+## Maintenance
+
+After large deletes or prune operations on a file-backed database, call
+`db.vacuum()` from maintenance code when you want to compact the database file:
+
+```rust,no_run
+use velr::Velr;
+
+fn main() -> velr::Result<()> {
+    let db = Velr::open(Some("mygraph.db"))?;
+    db.run("MATCH (n:Expired) DETACH DELETE n")?;
+    db.vacuum()?;
+    Ok(())
+}
+```
+
+`vacuum()` must run on a writable current-schema connection outside an open
+transaction. The equivalent command for scripts is `VACUUM DATABASE`.
 
 ---
 
@@ -290,6 +309,10 @@ fn main() -> velr::Result<()> {
     Ok(())
 }
 ```
+
+For exact query-time scoring without a native vector index, use the
+Neo4j-compatible scalar function `vector.similarity.cosine(left, right)` inside
+`WITH`, `WHERE`, `RETURN`, and `ORDER BY`.
 
 For text-to-vector search, register an embedding callback and reference it from
 `CREATE VECTOR INDEX`. Velr invokes the callback for index maintenance when
