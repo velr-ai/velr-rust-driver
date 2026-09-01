@@ -3780,6 +3780,9 @@ impl<'db> VelrTx<'db> {
 
     /// Commit this transaction.
     ///
+    /// Any still-active named savepoints are released from newest to oldest before the outer
+    /// transaction is committed, preserving all writes that have not been rolled back.
+    ///
     /// Consumes the transaction handle. After this call, the transaction is finalized and cannot be
     /// used again.
     ///
@@ -3787,8 +3790,14 @@ impl<'db> VelrTx<'db> {
     pub fn commit(mut self) -> Result<()> {
         let a = velr_api()?;
 
-        // After commit the runtime transaction owns final cleanup of any outstanding named savepoints.
-        self.named_savepoints.get_mut().clear();
+        // The runtime treats an open savepoint as an uncommitted nested scope during transaction
+        // finalization. Release transaction-owned named savepoints in stack order so every
+        // surviving write is included in the outer commit.
+        while let Some(entry) = self.named_savepoints.get_mut().pop() {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let rc = unsafe { (a.velr_sp_release)(entry.sp.as_ptr(), &mut err) };
+            rc_to_result(rc, err)?;
+        }
 
         let tx = self
             .tx

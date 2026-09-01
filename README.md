@@ -29,12 +29,11 @@ This release is **alpha**.
 
 ### Schema version 9 compatibility
 
-This release's current on-disk schema is version 9. Supported older databases
-can be opened with `Velr::open` or `Velr::open_readonly` without changing the
-file. Reads continue to work on those databases, but writes (`CREATE`, `MERGE`,
-`SET`, `DELETE`, `DETACH DELETE`, and other mutating queries) are only available
-after migrating to the current schema version. This is intentional: migration
-is an explicit maintenance operation, not a side effect of opening a database.
+This release uses on-disk schema version 9. Database files at supported schema
+versions 8 or earlier can still be opened for reads without changing the file,
+but they must be explicitly migrated to schema version 9 before writes or
+features that require the current schema. Opening a database never migrates it
+automatically.
 
 Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
 
@@ -537,6 +536,8 @@ Velr supports transactions together with two kinds of savepoints:
 * **Named savepoints** via `savepoint_named(name)`, which remain active in the transaction until released or the transaction ends
 
 Calling `rollback_to(name)` rolls back to the named savepoint, discards any newer named savepoints, and keeps the target savepoint active.
+`commit()` releases any still-active named savepoints from newest to oldest so
+that all surviving transaction changes are committed.
 
 ### Scoped savepoint
 

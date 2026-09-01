@@ -993,6 +993,54 @@ fn named_savepoints_can_be_released_from_top_of_stack() -> velr::Result<()> {
     tx.commit()?;
     Ok(())
 }
+
+#[test]
+fn commit_releases_active_named_savepoints_and_persists_all_surviving_writes() -> velr::Result<()> {
+    let temp = TempDbPath::new("commit-active-named-savepoints");
+    let path = temp.path.to_string_lossy().into_owned();
+
+    {
+        let db = Velr::open(Some(&path))?;
+
+        let tx = db.begin_tx()?;
+        tx.run("CREATE (:CommitSavepoint {k:'before'})")?;
+        tx.savepoint_named("outer")?;
+        tx.run("CREATE (:CommitSavepoint {k:'middle'})")?;
+        tx.savepoint_named("inner")?;
+        tx.run("CREATE (:CommitSavepoint {k:'after'})")?;
+        tx.commit()?;
+
+        let tx = db.begin_tx()?;
+        tx.run("CREATE (:CommitRetained {k:'before'})")?;
+        tx.savepoint_named("retained")?;
+        tx.run("CREATE (:CommitRetained {k:'discarded'})")?;
+        tx.rollback_to("retained")?;
+        tx.run("CREATE (:CommitRetained {k:'surviving'})")?;
+        tx.commit()?;
+    }
+
+    let reopened = Velr::open(Some(&path))?;
+    let values = |label: &str| -> velr::Result<Vec<String>> {
+        let mut table =
+            reopened.exec_one(&format!("MATCH (n:{label}) RETURN n.k AS k ORDER BY k"))?;
+        let mut values = Vec::new();
+        table.for_each_row(|row| {
+            if let CellRef::Text(bytes) = row[0] {
+                values.push(std::str::from_utf8(bytes).unwrap().to_string());
+            }
+            Ok(())
+        })?;
+        Ok(values)
+    };
+
+    assert_eq!(
+        values("CommitSavepoint")?,
+        vec!["after", "before", "middle"]
+    );
+    assert_eq!(values("CommitRetained")?, vec!["before", "surviving"]);
+    Ok(())
+}
+
 #[test]
 fn named_savepoint_rollback_to_earlier_marker_semantics() -> velr::Result<()> {
     let db = Velr::open(None)?;
