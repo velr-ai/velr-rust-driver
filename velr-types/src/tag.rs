@@ -48,6 +48,9 @@ pub const RUNTIME_NODE_REF: u8 = 0x80;
 pub const RUNTIME_REL_REF: u8 = 0x81;
 pub const RUNTIME_PATH_REF: u8 = 0x82;
 pub const RUNTIME_NAN: u8 = 0x83;
+/// Transient heterogeneous query list containing values unavailable in
+/// canonical JSON (for example NaN). Never a persisted property encoding.
+pub const RUNTIME_LIST: u8 = 0x84;
 
 pub fn classify_tag(tag: u8) -> TagKind {
     match tag {

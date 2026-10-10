@@ -337,10 +337,36 @@ fn append_path_element_key(out: &mut Vec<u8>, value: &Value) -> Result<(), Order
 }
 
 fn append_list_key(out: &mut Vec<u8>, list: &ListValue) -> Result<(), OrderKeyError> {
-    out.push(RANK_LIST);
-    for value in list.iter() {
-        append_property_key(out, value)?;
+    append_list_key_with(out, |out| {
+        for value in list.iter() {
+            append_property_key(out, value)?;
+        }
+        Ok(())
+    })
+}
+
+/// Compose a list ordering key from already encoded element keys. Transient
+/// query values use the same framing as canonical property lists.
+pub fn list_order_key_from_item_keys(keys: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let result: Result<(), std::convert::Infallible> = append_list_key_with(&mut out, |out| {
+        for key in keys {
+            out.extend(key);
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => out,
+        Err(impossible) => match impossible {},
     }
+}
+
+fn append_list_key_with<E>(
+    out: &mut Vec<u8>,
+    append_items: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+) -> Result<(), E> {
+    out.push(RANK_LIST);
+    append_items(out)?;
     out.push(RANK_EMPTY);
     Ok(())
 }

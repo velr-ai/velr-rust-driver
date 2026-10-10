@@ -304,11 +304,13 @@ fn append_vector_json(out: &mut String, vector: &VectorValue) {
 }
 
 fn push_json_real(out: &mut String, f: f64) {
-    if f == 0.0 && f.is_sign_negative() {
-        out.push_str("-0.0");
-    } else if f.fract() == 0.0 {
-        let _ = write!(out, "{f:.1}");
+    if let Some(number) = serde_json::Number::from_f64(f) {
+        // Preserve the float type and negative zero while using compact,
+        // round-trip notation for large integral floats such as f64::MAX.
+        let _ = write!(out, "{number}");
     } else {
+        // Public scalar/property renderers reject non-finite values before
+        // this helper; retain the existing behavior of unchecked vector input.
         push_json_f64(out, f);
     }
 }
@@ -397,6 +399,81 @@ mod tests {
             storage_value_to_display_text(StorageValueRef::Text("Ada")).unwrap(),
             "Ada"
         );
+    }
+
+    fn finite_float_boundaries() -> [f64; 10] {
+        [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.123_456_789_012_345_66,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            -f64::MIN_POSITIVE,
+            f64::MAX,
+            -f64::MAX,
+        ]
+    }
+
+    #[test]
+    fn json_float_boundaries_preserve_map_values_and_exact_bits() {
+        for value in finite_float_boundaries() {
+            let json = storage_value_to_json_text(StorageValueRef::Real(value)).unwrap();
+            assert!(json.len() <= 32, "unbounded finite float JSON: {json}");
+            let map: serde_json::Value =
+                serde_json::from_str(&format!("{{\"value\":{json}}}")).unwrap();
+            assert_eq!(
+                map["value"].as_f64().unwrap().to_bits(),
+                value.to_bits(),
+                "{json}"
+            );
+            assert_eq!(
+                property_value_to_json_text(&PropertyValue::Float(value)).unwrap(),
+                json
+            );
+        }
+        assert_eq!(
+            storage_value_to_json_text(StorageValueRef::Real(-0.0)).unwrap(),
+            "-0.0"
+        );
+        // JSON formatting must not change scalar display/toString semantics.
+        assert_eq!(
+            storage_value_to_display_text(StorageValueRef::Real(1.0)).unwrap(),
+            "1"
+        );
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(storage_value_to_json_text(StorageValueRef::Real(value)).is_err());
+            assert!(property_value_to_json_text(&PropertyValue::Float(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn json_float_boundaries_round_trip_through_list_and_vector_storage() {
+        let values = finite_float_boundaries();
+        for property in [
+            PropertyValue::List(ListValue::Float64(
+                values.iter().copied().map(Some).collect(),
+            )),
+            PropertyValue::Vector(VectorValue {
+                coord_type: VectorType::Float64,
+                values: VectorStorage::F64(values.to_vec()),
+            }),
+        ] {
+            let stored = encode_property_value(&property).unwrap();
+            let json = storage_value_to_json_text(stored.as_ref()).unwrap();
+            let decoded: Vec<f64> = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                decoded
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

@@ -1,10 +1,9 @@
 //! Bundled Velr native runtime for macOS universal.
 
 pub const FILENAME: &str = "libvelrc.dylib";
-pub const BYTES: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/prebuilt/libvelrc.dylib"
-));
+// The published payload is expanded at build time. Consumers still receive
+// the original dylib bytes, with no decoding in the runtime loader.
+pub const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libvelrc.dylib"));
 
 pub fn bytes_and_name() -> (&'static [u8], &'static str) {
     (BYTES, FILENAME)

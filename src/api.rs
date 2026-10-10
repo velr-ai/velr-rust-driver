@@ -145,6 +145,9 @@ pub struct Api {
     pub velr_schema_version: Option<
         unsafe extern "C" fn(*mut velr_db, *mut i32, *mut *mut c_char) -> velr_code,
     >,
+    pub velr_temp_storage_bytes: Option<
+        unsafe extern "C" fn(*mut velr_db, *mut u64, *mut *mut c_char) -> velr_code,
+    >,
     pub velr_current_schema_version: Option<
         unsafe extern "C" fn(*mut velr_db, *mut i32, *mut *mut c_char) -> velr_code,
     >,
@@ -201,6 +204,15 @@ pub struct Api {
         *mut *mut velr_explain_trace,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_explain_with_params: Option<
+        unsafe extern "C" fn(
+            *mut velr_db,
+            *const c_char,
+            *const velr_query_params,
+            *mut *mut velr_explain_trace,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
     pub velr_explain_analyze: unsafe extern "C" fn(
         *mut velr_db,
         *const c_char,
@@ -605,6 +617,10 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_schema_version), "\0").as_bytes(),
             ),
+            velr_temp_storage_bytes: get_optional(
+                lib,
+                concat!(stringify!(velr_temp_storage_bytes), "\0").as_bytes(),
+            ),
             velr_current_schema_version: get_optional(
                 lib,
                 concat!(stringify!(velr_current_schema_version), "\0").as_bytes(),
@@ -647,6 +663,10 @@ impl Api {
                 concat!(stringify!(velr_stream_next_table), "\0").as_bytes(),
             )?,
             velr_explain: get(lib, concat!(stringify!(velr_explain), "\0").as_bytes())?,
+            velr_explain_with_params: get_optional(
+                lib,
+                concat!(stringify!(velr_explain_with_params), "\0").as_bytes(),
+            ),
             velr_explain_analyze: get(
                 lib,
                 concat!(stringify!(velr_explain_analyze), "\0").as_bytes(),

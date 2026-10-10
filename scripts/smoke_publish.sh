@@ -46,6 +46,7 @@ if [[ -d velr-types ]]; then
 fi
 
 echo "Packaging Velr runtime crates..."
+python3 runtime/macos-universal/prepare_payload.py
 for manifest in "${manifests[@]}"; do
   name="$(crate_name "$manifest")"
   version="$(crate_version "$manifest")"

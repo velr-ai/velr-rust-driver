@@ -2596,6 +2596,18 @@ impl Velr {
         Ok(out)
     }
 
+    /// Return live bytes currently owned by SQLite's TEMP database.
+    pub fn temp_storage_bytes(&self) -> Result<u64> {
+        let a = velr_api()?;
+        let temp_storage_bytes =
+            require_runtime_symbol(a.velr_temp_storage_bytes, "velr_temp_storage_bytes")?;
+        let mut out = 0u64;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { temp_storage_bytes(self.db.as_ptr(), &mut out, &mut err) };
+        rc_to_result(rc, err)?;
+        Ok(out)
+    }
+
     /// Return the current schema version supported by this runtime.
     pub fn current_schema_version(&self) -> Result<i32> {
         let a = velr_api()?;
@@ -2991,6 +3003,31 @@ impl Velr {
 
         let rc =
             unsafe { (a.velr_explain)(self.db.as_ptr(), cy.as_ptr(), &mut out_trace, &mut err) };
+        rc_to_result(rc, err)?;
+        ExplainTrace::from_raw(out_trace)
+    }
+
+    /// Build an EXPLAIN trace using the exact parameterized planning path used
+    /// by [`Velr::exec_with_params`].
+    pub fn explain_with_params(&self, cypher: &str, params: QueryParams) -> Result<ExplainTrace> {
+        let a = velr_api()?;
+        let explain_with_params =
+            require_runtime_symbol(a.velr_explain_with_params, "velr_explain_with_params")?;
+        let cy = CString::new(cypher)
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
+        let (raw_options, _raw_params) =
+            raw_query_options(cypher, &QueryOptions::new().with_params(params))?;
+        let mut out_trace: *mut ffi::velr_explain_trace = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            explain_with_params(
+                self.db.as_ptr(),
+                cy.as_ptr(),
+                raw_options.params,
+                &mut out_trace,
+                &mut err,
+            )
+        };
         rc_to_result(rc, err)?;
         ExplainTrace::from_raw(out_trace)
     }
