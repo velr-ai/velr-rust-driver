@@ -58,11 +58,9 @@ Arrow IPC support is enabled by default. To build without Arrow IPC support, opt
 velr = { version = "0.2", default-features = false }
 ```
 
-The macOS universal runtime crate stores its native payload compressed to fit
-the registry's package-size limit. Cargo restores the identical dylib at build
-time using Rust; runtime loading requires no decompression or external tools.
-For release packaging, `scripts/smoke_publish.sh` prepares the compressed payload
-from the freshly bundled universal dylib and checks the actual `.crate` size.
+Velr bundles the native runtime for your platform. On macOS, Cargo automatically
+selects the Apple Silicon (`aarch64`) or Intel (`x86_64`) runtime matching your
+build target.
 
 ---
 
@@ -732,7 +730,8 @@ velr = "0.2"
 
 Currently bundled targets:
 
-* macOS universal (arm64 + x86_64)
+* macOS aarch64 (Apple Silicon)
+* macOS x86_64 (Intel)
 * Linux x86_64
 * Linux aarch64
 * Windows x86_64

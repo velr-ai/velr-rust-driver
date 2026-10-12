@@ -11,7 +11,8 @@ export VELR_CACHE_DIR="${VELR_CACHE_DIR:-$CARGO_TARGET_DIR/cache}"
 manifests=(
   "runtime/linux-x86_64/Cargo.toml"
   "runtime/linux-aarch64/Cargo.toml"
-  "runtime/macos-universal/Cargo.toml"
+  "runtime/macos-aarch64/Cargo.toml"
+  "runtime/macos-x86_64/Cargo.toml"
   "runtime/windows-x86_64/Cargo.toml"
 )
 
@@ -46,7 +47,6 @@ if [[ -d velr-types ]]; then
 fi
 
 echo "Packaging Velr runtime crates..."
-python3 runtime/macos-universal/prepare_payload.py
 for manifest in "${manifests[@]}"; do
   name="$(crate_name "$manifest")"
   version="$(crate_version "$manifest")"

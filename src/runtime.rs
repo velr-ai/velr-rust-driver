@@ -46,11 +46,11 @@ use velr_runtime_linux_x86_64 as selected_runtime;
 #[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))]
 use velr_runtime_linux_aarch64 as selected_runtime;
 
-#[cfg(all(
-    target_os = "macos",
-    any(target_arch = "aarch64", target_arch = "x86_64")
-))]
-use velr_runtime_macos_universal as selected_runtime;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use velr_runtime_macos_aarch64 as selected_runtime;
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+use velr_runtime_macos_x86_64 as selected_runtime;
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]
 use velr_runtime_windows_x86_64 as selected_runtime;
