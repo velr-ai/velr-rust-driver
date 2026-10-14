@@ -1,6 +1,6 @@
 [package]
 name = "velr-runtime-macos-x86_64"
-version = "0.2.50"
+version = "0.2.51"
 edition = "2021"
 
 description = "Velr native runtime for macOS x86_64"
