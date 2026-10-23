@@ -1,6 +1,6 @@
 [package]
 name = "velr"
-version = "0.2.54"
+version = "0.2.55"
 edition = "2021"
 
 description = "Velr embedded property-graph database (Rust driver, beta)"
@@ -23,19 +23,19 @@ velr-types = { path = "velr-types", version = "0.1.0" }
 arrow2 = { version = "0.18", optional = true, default-features = false }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))'.dependencies]
-velr_runtime_linux_x86_64 = { package = "velr-runtime-linux-x86_64", version = "=0.2.54", path = "runtime/linux-x86_64" }
+velr_runtime_linux_x86_64 = { package = "velr-runtime-linux-x86_64", version = "=0.2.55", path = "runtime/linux-x86_64" }
 
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))'.dependencies]
-velr_runtime_linux_aarch64 = { package = "velr-runtime-linux-aarch64", version = "=0.2.54", path = "runtime/linux-aarch64" }
+velr_runtime_linux_aarch64 = { package = "velr-runtime-linux-aarch64", version = "=0.2.55", path = "runtime/linux-aarch64" }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-velr_runtime_macos_aarch64 = { package = "velr-runtime-macos-aarch64", version = "=0.2.54", path = "runtime/macos-aarch64" }
+velr_runtime_macos_aarch64 = { package = "velr-runtime-macos-aarch64", version = "=0.2.55", path = "runtime/macos-aarch64" }
 
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
-velr_runtime_macos_x86_64 = { package = "velr-runtime-macos-x86_64", version = "=0.2.54", path = "runtime/macos-x86_64" }
+velr_runtime_macos_x86_64 = { package = "velr-runtime-macos-x86_64", version = "=0.2.55", path = "runtime/macos-x86_64" }
 
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))'.dependencies]
-velr_runtime_windows_x86_64 = { package = "velr-runtime-windows-x86_64", version = "=0.2.54", path = "runtime/windows-x86_64" }
+velr_runtime_windows_x86_64 = { package = "velr-runtime-windows-x86_64", version = "=0.2.55", path = "runtime/windows-x86_64" }
 
 [features]
 default = ["arrow-ipc"]
