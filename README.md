@@ -35,6 +35,22 @@ but they must be explicitly migrated to schema version 9 before writes or
 features that require the current schema. Opening a database never migrates it
 automatically.
 
+Unfiltered single-label property TopK and `min()`/`max()` reads can use the
+existing numeric or full-value text indexes without a schema upgrade. The
+read checks property types and null coverage using the existing graph-shape
+inventory, maintained transactionally by supported driver writes and imports.
+First reads, reopened connections and reads after writes use the same small
+metadata lookups, without a label validation scan or separate connection cache.
+Numeric domains containing REAL values also use bounded index endpoint checks
+for non-finite numbers. Unsupported domains or incomplete index trials use the
+ordinary scan. No tables, indexes, triggers or write hooks are added. Direct
+SQLite edits that bypass Velr's driver and inventory maintenance are unsupported.
+
+Scoped and graph-ordered property reads also check numeric storage domains
+through the maintained inventory rather than counting every property row.
+Dictionary lookups resolve requested names and label groups through existing
+indexes; whole-catalog loading remains an explicit preload operation.
+
 Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
 
 Fulltext search and vector search are available today through Cypher DDL and

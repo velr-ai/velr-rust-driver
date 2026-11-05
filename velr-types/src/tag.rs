@@ -51,6 +51,9 @@ pub const RUNTIME_NAN: u8 = 0x83;
 /// Transient heterogeneous query list containing values unavailable in
 /// canonical JSON (for example NaN). Never a persisted property encoding.
 pub const RUNTIME_LIST: u8 = 0x84;
+/// Transient map of typed SQLite cells, sharing the raw-cell list framing.
+/// Never a persisted property encoding.
+pub const RUNTIME_MAP: u8 = 0x85;
 
 pub fn classify_tag(tag: u8) -> TagKind {
     match tag {

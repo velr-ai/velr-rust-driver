@@ -361,6 +361,25 @@ pub fn list_order_key_from_item_keys(keys: impl IntoIterator<Item = Vec<u8>>) ->
     }
 }
 
+/// Compose the existing map ordering key without rendering typed query cells
+/// through JSON. Entry names are canonicalized in the same order as JSON maps.
+pub fn map_order_key_from_entry_keys(
+    entries: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> Vec<u8> {
+    let mut entries = entries
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut out = vec![RANK_MAP];
+    append_u64_be(&mut out, entries.len() as u64);
+    for name in entries.keys() {
+        append_string_payload(&mut out, name);
+    }
+    for (_, key) in std::mem::take(&mut entries) {
+        out.extend(key);
+    }
+    out
+}
+
 fn append_list_key_with<E>(
     out: &mut Vec<u8>,
     append_items: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
