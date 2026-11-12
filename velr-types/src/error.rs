@@ -1,18 +1,44 @@
+//! Errors returned when constructing, encoding, or decoding property values.
+//!
+//! [`EncodeError`] reports an invalid value supplied to a value constructor or encoder.
+//! [`DecodeError`] reports input that cannot be read as the requested value type.
+//! Query validation and execution failures are returned by the database driver's error type.
+
+#![warn(missing_docs)]
+
 use std::fmt;
 
+/// A property value could not be decoded from its input representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
+    /// No input bytes were supplied.
     EmptyInput,
+    /// The input identifies an unknown value type.
     UnknownTag(u8),
+    /// Text bytes are not valid UTF-8.
     InvalidUtf8,
+    /// JSON text is invalid; the message describes the failure.
     InvalidJson(String),
+    /// A temporal value is invalid; the message describes the failure.
     InvalidTemporal(String),
+    /// A spatial value is invalid; the message describes the failure.
     InvalidSpatial(String),
+    /// A list value is invalid; the message describes the failure.
     InvalidList(String),
+    /// A vector value is invalid; the message describes the failure.
     InvalidVector(String),
+    /// The input representation does not support the requested value type.
     InvalidStorageClass(&'static str),
-    UnexpectedTag { expected: &'static str, actual: u8 },
+    /// A value has a different type identifier from the one required by the decoder.
+    UnexpectedTag {
+        /// The expected value type or type family.
+        expected: &'static str,
+        /// The type identifier found in the input.
+        actual: u8,
+    },
+    /// The input ends before a complete value can be read.
     Truncated,
+    /// The input is not in an accepted canonical form.
     NonCanonical(&'static str),
 }
 
@@ -39,12 +65,18 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+/// A property value could not be constructed or encoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
+    /// Temporal components are invalid or out of range.
     InvalidTemporal(&'static str),
+    /// Spatial coordinates or shape constraints are invalid.
     InvalidSpatial(&'static str),
+    /// List elements cannot be represented in the requested format.
     InvalidList(&'static str),
+    /// Vector length, coordinate type, or storage is invalid.
     InvalidVector(&'static str),
+    /// The value has no accepted canonical representation, for example a non-finite vector coordinate.
     NonCanonicalValue(&'static str),
 }
 

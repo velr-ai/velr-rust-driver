@@ -1,3 +1,7 @@
+//! Calendar, clock, timezone, and duration values with checked constructors and arithmetic.
+
+#![warn(missing_docs)]
+
 use crate::error::{DecodeError, EncodeError};
 use crate::property::{PropertyValue, PropertyValueRef};
 use jiff::civil::{Date, DateTime, Time};
@@ -6,28 +10,42 @@ use jiff::{Span, Timestamp};
 use std::fmt;
 use std::str::FromStr;
 
+/// Nanoseconds in one second.
 pub const NANOS_PER_SECOND: i64 = 1_000_000_000;
+/// Nanoseconds in one minute.
 pub const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SECOND;
+/// Nanoseconds in one hour.
 pub const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
+/// Nanoseconds in one day.
 pub const NANOS_PER_DAY: i64 = 86_400 * NANOS_PER_SECOND;
 const DAYS_PER_AVERAGE_YEAR: f64 = 365.2425;
 const DAYS_PER_AVERAGE_MONTH: f64 = DAYS_PER_AVERAGE_YEAR / 12.0;
 
+/// The temporal value type to construct from a timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurrentTemporalKind {
+    /// A calendar date.
     Date,
+    /// A local time without an offset.
     LocalTime,
+    /// A time with a UTC offset.
     Time,
+    /// A local date and time without an offset.
     LocalDateTime,
+    /// A date and time with timezone information.
     DateTime,
 }
 
+/// A calendar date without a time or timezone. Parse ISO date text with `str::parse` or use
+/// [`Self::new`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DateValue {
     inner: Date,
 }
 
 impl DateValue {
+    /// Constructs a valid calendar date. Returns an error for an invalid date or a year outside
+    /// `-9999..=9999`.
     pub fn new(year: i32, month: u8, day: u8) -> Result<Self, EncodeError> {
         let year = i16::try_from(year)
             .map_err(|_| EncodeError::InvalidTemporal("year must be in -9999..=9999"))?;
@@ -40,6 +58,8 @@ impl DateValue {
         Ok(Self { inner })
     }
 
+    /// Constructs a calendar date; omitted month or day defaults to 1. Returns an error for an
+    /// invalid date.
     pub fn from_calendar(
         year: i32,
         month: Option<u8>,
@@ -48,6 +68,8 @@ impl DateValue {
         Self::new(year, month.unwrap_or(1), day.unwrap_or(1))
     }
 
+    /// Constructs an ISO week date. Weeks start Monday; omitted weekday defaults to 1. Returns an
+    /// error for an invalid ISO week or weekday.
     pub fn from_iso_week(
         year: i32,
         week: u8,
@@ -70,6 +92,8 @@ impl DateValue {
         Ok(value)
     }
 
+    /// Constructs a date from a year and a one-based day of year. Returns an error if the day is
+    /// invalid for that year.
     pub fn from_ordinal_day(year: i32, ordinal_day: u16) -> Result<Self, EncodeError> {
         let jan1 = Self::new(year, 1, 1)?;
         let days_in_year = if is_leap_year(year) { 366 } else { 365 };
@@ -81,6 +105,8 @@ impl DateValue {
         Self::from_epoch_day(jan1.epoch_day() + i64::from(ordinal_day) - 1)
     }
 
+    /// Constructs a date from a year, quarter (`1..=4`), and optional one-based day within the
+    /// quarter, defaulting to 1. Returns an error for invalid components.
     pub fn from_quarter(
         year: i32,
         quarter: u8,
@@ -107,31 +133,40 @@ impl DateValue {
         Ok(value)
     }
 
+    /// Constructs a date from signed days since 1970-01-01. Returns an error outside the supported
+    /// date range.
     pub fn from_epoch_day(epoch_day: i64) -> Result<Self, EncodeError> {
         let (year, month, day) = ymd_from_epoch_day(epoch_day)?;
         Self::new(year, month, day)
     }
 
+    /// Returns the calendar year.
     pub fn year(&self) -> i32 {
         i32::from(self.inner.year())
     }
 
+    /// Returns the calendar month in `1..=12`.
     pub fn month(&self) -> u8 {
         self.inner.month() as u8
     }
 
+    /// Returns the day of the month in `1..=31`.
     pub fn day(&self) -> u8 {
         self.inner.day() as u8
     }
 
+    /// Returns the corresponding Jiff value.
     pub fn as_jiff(&self) -> Date {
         self.inner
     }
 
+    /// Returns signed days since 1970-01-01.
     pub fn epoch_day(&self) -> i64 {
         epoch_day_from_ymd(self.year(), self.month(), self.day())
     }
 
+    /// Returns the ISO week-numbering year, which can differ from the calendar year near January 1.
+    /// Returns an error if a required boundary date is out of range.
     pub fn iso_week_year(&self) -> Result<i32, EncodeError> {
         let day = self.epoch_day();
         let year = self.year();
@@ -144,30 +179,39 @@ impl DateValue {
         }
     }
 
+    /// Returns the ISO weekday: Monday is 1 and Sunday is 7.
     pub fn iso_day_of_week(&self) -> u8 {
         day_of_week_from_epoch_day(self.epoch_day())
     }
 
+    /// Returns the ISO week number in `1..=53`, or an error if a required boundary date is out of
+    /// range.
     pub fn iso_week(&self) -> Result<u8, EncodeError> {
         let week_year = self.iso_week_year()?;
         let week_one = iso_week_one_monday_epoch_day(week_year)?;
         Ok(((self.epoch_day() - week_one) / 7 + 1) as u8)
     }
 
+    /// Returns the calendar quarter in `1..=4`.
     pub fn quarter(&self) -> u8 {
         (self.month() - 1) / 3 + 1
     }
 
+    /// Returns the one-based day of year, or an error if a required boundary date is out of range.
     pub fn ordinal_day(&self) -> Result<u16, EncodeError> {
         let jan1 = Self::new(self.year(), 1, 1)?;
         Ok((self.epoch_day() - jan1.epoch_day() + 1) as u16)
     }
 
+    /// Returns the one-based day of the current quarter, or an error if a required boundary date is
+    /// out of range.
     pub fn day_of_quarter(&self) -> Result<u16, EncodeError> {
         let start = Self::new(self.year(), (self.quarter() - 1) * 3 + 1, 1)?;
         Ok((self.epoch_day() - start.epoch_day() + 1) as u16)
     }
 
+    /// Adds a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_add_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         self.checked_add_duration_groups(
             duration.total_months(),
@@ -176,6 +220,8 @@ impl DateValue {
         )
     }
 
+    /// Subtracts a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_sub_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         self.checked_add_duration_groups(
             checked_i64_from_i128(-i128::from(duration.total_months()))?,
@@ -242,12 +288,15 @@ impl FromStr for DateValue {
     }
 }
 
+/// A time of day without a date or timezone, with nanosecond precision.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalTimeValue {
     inner: Time,
 }
 
 impl LocalTimeValue {
+    /// Constructs a time of day. Returns an error unless hour is `0..=23`, minute and second are
+    /// `0..=59`, and nanos is below one billion.
     pub fn new(hour: u8, minute: u8, second: u8, nanos: u32) -> Result<Self, EncodeError> {
         let hour = i8::try_from(hour)
             .map_err(|_| EncodeError::InvalidTemporal("hour must be in 0..=23"))?;
@@ -262,32 +311,40 @@ impl LocalTimeValue {
         Ok(Self { inner })
     }
 
+    /// Returns the hour in `0..=23`.
     pub fn hour(&self) -> u8 {
         self.inner.hour() as u8
     }
 
+    /// Returns the minute in `0..=59`.
     pub fn minute(&self) -> u8 {
         self.inner.minute() as u8
     }
 
+    /// Returns the second in `0..=59`.
     pub fn second(&self) -> u8 {
         self.inner.second() as u8
     }
 
+    /// Returns the fractional second in nanoseconds, in `0..1_000_000_000`.
     pub fn nanos(&self) -> u32 {
         self.inner.subsec_nanosecond() as u32
     }
 
+    /// Returns the corresponding Jiff value.
     pub fn as_jiff(&self) -> Time {
         self.inner
     }
 
+    /// Returns nanoseconds elapsed since local midnight.
     pub fn nanos_since_midnight(&self) -> i64 {
         (((self.hour() as i64 * 60 + self.minute() as i64) * 60 + self.second() as i64)
             * NANOS_PER_SECOND)
             + self.nanos() as i64
     }
 
+    /// Constructs a time from nanoseconds since midnight. Returns an error outside
+    /// `0..86_400_000_000_000`.
     pub fn from_nanos_since_midnight(nanos: i64) -> Result<Self, EncodeError> {
         if !(0..NANOS_PER_DAY).contains(&nanos) {
             return Err(EncodeError::InvalidTemporal(
@@ -303,10 +360,14 @@ impl LocalTimeValue {
         Self::new(hour as u8, minute as u8, second as u8, nanos as u32)
     }
 
+    /// Adds a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_add_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         self.checked_add_time_nanos(duration.total_time_nanos())
     }
 
+    /// Subtracts a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_sub_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         self.checked_add_time_nanos(
             duration
@@ -344,30 +405,37 @@ impl FromStr for LocalTimeValue {
     }
 }
 
+/// A fixed UTC offset measured in seconds east of UTC.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UtcOffsetValue {
     seconds_east: i32,
 }
 
 impl UtcOffsetValue {
+    /// Returns a zero UTC offset.
     pub fn utc() -> Self {
         Self { seconds_east: 0 }
     }
 
+    /// Constructs a UTC offset from signed seconds east of UTC. Returns an error outside the
+    /// supported offset range.
     pub fn new(seconds_east: i32) -> Result<Self, EncodeError> {
         Offset::from_seconds(seconds_east)
             .map_err(|_| EncodeError::InvalidTemporal("offset out of range"))?;
         Ok(Self { seconds_east })
     }
 
+    /// Returns signed seconds east of UTC.
     pub fn seconds_east(&self) -> i32 {
         self.seconds_east
     }
 
+    /// Returns whether the offset is zero.
     pub fn is_utc(&self) -> bool {
         self.seconds_east == 0
     }
 
+    /// Returns the corresponding Jiff value.
     pub fn as_jiff(&self) -> Offset {
         Offset::from_seconds(self.seconds_east)
             .expect("UtcOffsetValue should always store a validated offset")
@@ -400,23 +468,31 @@ impl FromStr for UtcOffsetValue {
     }
 }
 
+/// A time of day paired with a fixed UTC offset, without a date.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ZonedTimeValue {
+    /// The local time of day.
     pub time: LocalTimeValue,
+    /// The fixed UTC offset.
     pub offset: UtcOffsetValue,
 }
 
 impl ZonedTimeValue {
+    /// Pairs a local time with a fixed UTC offset.
     pub fn new(time: LocalTimeValue, offset: UtcOffsetValue) -> Self {
         Self { time, offset }
     }
 
+    /// Returns local nanoseconds since midnight minus the UTC offset; the result may fall outside a
+    /// single day.
     pub fn utc_nanos_since_midnight(&self) -> i64 {
         let local = self.time.nanos_since_midnight();
         let offset = self.offset.seconds_east() as i64 * NANOS_PER_SECOND;
         (local - offset).rem_euclid(NANOS_PER_DAY)
     }
 
+    /// Changes the UTC offset while preserving the represented instant. Returns an error if the
+    /// result is out of range.
     pub fn with_offset_same_instant(&self, offset: UtcOffsetValue) -> Result<Self, EncodeError> {
         let local =
             self.utc_nanos_since_midnight() + offset.seconds_east() as i64 * NANOS_PER_SECOND;
@@ -426,6 +502,8 @@ impl ZonedTimeValue {
         })
     }
 
+    /// Adds a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_add_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         Ok(Self {
             time: self.time.checked_add_duration(duration)?,
@@ -433,6 +511,8 @@ impl ZonedTimeValue {
         })
     }
 
+    /// Subtracts a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_sub_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         Ok(Self {
             time: self.time.checked_sub_duration(duration)?,
@@ -460,12 +540,15 @@ impl FromStr for ZonedTimeValue {
     }
 }
 
+/// A calendar date and time without a timezone, with nanosecond precision.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalDateTimeValue {
     inner: DateTime,
 }
 
 impl LocalDateTimeValue {
+    /// Constructs a local date and time. Returns an error for invalid calendar/time components or a
+    /// year outside `-9999..=9999`.
     pub fn new(
         year: i32,
         month: u8,
@@ -494,6 +577,8 @@ impl LocalDateTimeValue {
         Ok(Self { inner })
     }
 
+    /// Combines a date and a local time, returning an error if the combination is not
+    /// representable.
     pub fn from_date_and_time(date: DateValue, time: LocalTimeValue) -> Result<Self, EncodeError> {
         Self::new(
             date.year(),
@@ -506,28 +591,35 @@ impl LocalDateTimeValue {
         )
     }
 
+    /// Returns the calendar date.
     pub fn date(&self) -> DateValue {
         DateValue {
             inner: self.inner.date(),
         }
     }
 
+    /// Returns the local time of day.
     pub fn time(&self) -> LocalTimeValue {
         LocalTimeValue {
             inner: self.inner.time(),
         }
     }
 
+    /// Returns the corresponding Jiff value.
     pub fn as_jiff(&self) -> DateTime {
         self.inner
     }
 
+    /// Returns local days since 1970-01-01 and nanoseconds since midnight, without applying a
+    /// timezone.
     pub fn local_epoch_day_and_nanos(&self) -> (i64, i64) {
         let date = self.date();
         let time = self.time();
         (date.epoch_day(), time.nanos_since_midnight())
     }
 
+    /// Adds a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_add_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         self.checked_add_duration_groups(
             duration.total_months(),
@@ -536,6 +628,8 @@ impl LocalDateTimeValue {
         )
     }
 
+    /// Subtracts a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_sub_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         self.checked_add_duration_groups(
             checked_i64_from_i128(-i128::from(duration.total_months()))?,
@@ -596,14 +690,21 @@ impl FromStr for LocalDateTimeValue {
     }
 }
 
+/// A local date and time with a UTC offset and optional named timezone. Constructors validate
+/// named-zone offsets.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ZonedDateTimeValue {
+    /// The local calendar date and time.
     pub datetime: LocalDateTimeValue,
+    /// The fixed UTC offset.
     pub offset: UtcOffsetValue,
+    /// An optional named timezone identifier, such as `Europe/Lisbon`.
     pub zone_id: Option<Box<str>>,
 }
 
 impl ZonedDateTimeValue {
+    /// Combines a local datetime, offset, and optional zone identifier. Returns an error if the
+    /// zone is invalid or its offset does not match.
     pub fn new(
         datetime: LocalDateTimeValue,
         offset: UtcOffsetValue,
@@ -621,6 +722,8 @@ impl ZonedDateTimeValue {
         })
     }
 
+    /// Interprets a local datetime in a named timezone. Returns an error if the zone or local
+    /// datetime cannot be resolved.
     pub fn in_named_zone(
         datetime: LocalDateTimeValue,
         zone_id: impl Into<Box<str>>,
@@ -637,6 +740,8 @@ impl ZonedDateTimeValue {
         })
     }
 
+    /// Constructs a UTC datetime from Unix seconds plus fractional nanoseconds. Returns an error
+    /// outside the supported timestamp range.
     pub fn from_epoch(seconds: i64, nanoseconds: u32) -> Result<Self, EncodeError> {
         let nanoseconds = i32::try_from(nanoseconds)
             .map_err(|_| EncodeError::InvalidTemporal("nanoseconds out of range"))?;
@@ -645,6 +750,8 @@ impl ZonedDateTimeValue {
         Ok(Self::from_utc_timestamp(timestamp))
     }
 
+    /// Constructs a UTC datetime from Unix milliseconds. Returns an error outside the supported
+    /// timestamp range.
     pub fn from_epoch_millis(milliseconds: i64) -> Result<Self, EncodeError> {
         let timestamp = Timestamp::from_millisecond(milliseconds)
             .map_err(|_| EncodeError::InvalidTemporal("epoch datetime out of range"))?;
@@ -662,6 +769,7 @@ impl ZonedDateTimeValue {
         }
     }
 
+    /// Returns UTC days since 1970-01-01 and nanoseconds within that UTC day.
     pub fn utc_epoch_day_and_nanos(&self) -> (i64, i64) {
         let (day, nanos) = self.datetime.local_epoch_day_and_nanos();
         let offset = self.offset.seconds_east() as i64 * NANOS_PER_SECOND;
@@ -672,11 +780,15 @@ impl ZonedDateTimeValue {
         )
     }
 
+    /// Changes the UTC offset while preserving the represented instant. Returns an error if the
+    /// result is out of range.
     pub fn with_offset_same_instant(&self, offset: UtcOffsetValue) -> Result<Self, EncodeError> {
         let (day, nanos) = self.utc_epoch_day_and_nanos();
         Self::from_utc_epoch_day_and_nanos(day, nanos, offset, None::<Box<str>>)
     }
 
+    /// Changes the named timezone while preserving the instant. Returns an error for an invalid
+    /// zone, an out-of-range result, or a build without named-zone support.
     #[cfg(any(feature = "tzdb-system", feature = "tzdb-bundled"))]
     pub fn with_named_zone_same_instant(
         &self,
@@ -697,6 +809,8 @@ impl ZonedDateTimeValue {
         })
     }
 
+    /// Changes the named timezone while preserving the instant. Returns an error for an invalid
+    /// zone, an out-of-range result, or a build without named-zone support.
     #[cfg(not(any(feature = "tzdb-system", feature = "tzdb-bundled")))]
     pub fn with_named_zone_same_instant(
         &self,
@@ -725,6 +839,8 @@ impl ZonedDateTimeValue {
         })
     }
 
+    /// Adds a duration to a fixed-offset datetime. Returns an error for named-zone arithmetic or an
+    /// out-of-range result.
     pub fn checked_add_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         if self.zone_id.is_some() {
             return Err(EncodeError::InvalidTemporal(
@@ -738,6 +854,8 @@ impl ZonedDateTimeValue {
         })
     }
 
+    /// Subtracts a duration from a fixed-offset datetime. Returns an error for named-zone
+    /// arithmetic or an out-of-range result.
     pub fn checked_sub_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
         if self.zone_id.is_some() {
             return Err(EncodeError::InvalidTemporal(
@@ -799,6 +917,8 @@ impl FromStr for ZonedDateTimeValue {
     }
 }
 
+/// Constructs a temporal value from Unix milliseconds in the requested timezone (system timezone
+/// when omitted). Returns an error for invalid timestamps or timezones.
 pub fn current_temporal_value(
     kind: CurrentTemporalKind,
     epoch_millis: i64,
@@ -849,17 +969,29 @@ fn current_time_zone(timezone: Option<&str>) -> Result<(TimeZone, Option<Box<str
     Ok((timezone, zone_id))
 }
 
+/// Numeric components for an openCypher duration. Components default to zero and may contain
+/// fractions.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DurationMapParts {
+    /// The years component; fractional values are accepted.
     pub years: f64,
+    /// The months component; fractional values are accepted.
     pub months: f64,
+    /// The weeks component; fractional values are accepted.
     pub weeks: f64,
+    /// The days component; fractional values are accepted.
     pub days: f64,
+    /// The hours component; fractional values are accepted.
     pub hours: f64,
+    /// The minutes component; fractional values are accepted.
     pub minutes: f64,
+    /// The seconds component; fractional values are accepted.
     pub seconds: f64,
+    /// The milliseconds component; fractional values are accepted.
     pub milliseconds: f64,
+    /// The microseconds component; fractional values are accepted.
     pub microseconds: f64,
+    /// The nanoseconds component; fractional values are accepted.
     pub nanoseconds: f64,
 }
 
@@ -874,6 +1006,8 @@ struct DurationIntegerParts {
     seconds: i64,
 }
 
+/// A duration with separate calendar-month, calendar-day, and elapsed-time components. Parse ISO
+/// duration text with `str::parse`.
 #[derive(Debug, Clone)]
 pub struct DurationValue {
     inner: Span,
@@ -883,6 +1017,7 @@ pub struct DurationValue {
 }
 
 impl DurationValue {
+    /// Returns a duration with all components zero.
     pub fn zero() -> Self {
         Self {
             inner: Span::default(),
@@ -892,6 +1027,8 @@ impl DurationValue {
         }
     }
 
+    /// Constructs a duration from integer components. Years combine into months, weeks into days,
+    /// and time into nanoseconds. Returns an error on overflow.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         years: i64,
@@ -936,6 +1073,8 @@ impl DurationValue {
         })
     }
 
+    /// Constructs a duration from possibly fractional components using openCypher normalization.
+    /// Returns an error for non-finite components or overflow.
     pub fn from_open_cypher_parts(parts: DurationMapParts) -> Result<Self, EncodeError> {
         let (years, years_fraction) = split_whole_fraction(parts.years)?;
         let months_value = parts.months + years_fraction * 12.0;
@@ -974,74 +1113,91 @@ impl DurationValue {
         )
     }
 
+    /// Returns the whole-year component, truncating total months toward zero.
     pub fn years(&self) -> i64 {
         self.months / 12
     }
 
+    /// Returns the remaining month component after whole years.
     pub fn months(&self) -> i64 {
         self.months % 12
     }
 
+    /// Returns zero: supplied weeks are combined into the day component.
     pub fn weeks(&self) -> i64 {
         0
     }
 
+    /// Returns the calendar-day component, including supplied weeks.
     pub fn days(&self) -> i64 {
         self.days
     }
 
+    /// Returns the whole-hour component of the elapsed-time portion; it can exceed 23.
     pub fn hours(&self) -> i64 {
         split_time_nanos(self.time_nanos)
             .expect("DurationValue should store checked time")
             .0
     }
 
+    /// Returns the minute remainder after whole hours.
     pub fn minutes(&self) -> i64 {
         split_time_nanos(self.time_nanos)
             .expect("DurationValue should store checked time")
             .1
     }
 
+    /// Returns the second remainder after whole minutes.
     pub fn seconds(&self) -> i64 {
         split_time_nanos(self.time_nanos)
             .expect("DurationValue should store checked time")
             .2
     }
 
+    /// Returns the fractional-second component in whole milliseconds.
     pub fn milliseconds(&self) -> i64 {
         self.nanoseconds() / 1_000_000
     }
 
+    /// Returns the fractional-second component in whole microseconds.
     pub fn microseconds(&self) -> i64 {
         self.nanoseconds() / 1_000
     }
 
+    /// Returns the fractional-second component in nanoseconds.
     pub fn nanoseconds(&self) -> i64 {
         split_time_nanos(self.time_nanos)
             .expect("DurationValue should store checked time")
             .3
     }
 
+    /// Returns the combined calendar-month component, including supplied years.
     pub fn total_months(&self) -> i64 {
         self.months
     }
 
+    /// Returns the calendar-month component divided by three, truncating toward zero.
     pub fn total_quarters(&self) -> i64 {
         self.total_months() / 3
     }
 
+    /// Returns the calendar-day component divided by seven, truncating toward zero.
     pub fn total_weeks(&self) -> i64 {
         self.total_days() / 7
     }
 
+    /// Returns the combined calendar-day component, including supplied weeks.
     pub fn total_days(&self) -> i64 {
         self.days
     }
 
+    /// Returns the elapsed-time component in nanoseconds, excluding calendar months and days.
     pub fn total_time_nanos(&self) -> i128 {
         self.time_nanos
     }
 
+    /// Borrows an equivalent Jiff span, or returns `None` when Jiff cannot represent this duration
+    /// exactly.
     pub fn as_jiff(&self) -> Option<&Span> {
         Self::from_jiff_span(self.inner.clone())
             .ok()
@@ -1049,6 +1205,8 @@ impl DurationValue {
             .map(|_| &self.inner)
     }
 
+    /// Adds a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_add_duration(&self, other: &DurationValue) -> Result<Self, EncodeError> {
         let months = checked_i64_from_i128(i128::from(self.months) + i128::from(other.months))?;
         let days = checked_i64_from_i128(i128::from(self.days) + i128::from(other.days))?;
@@ -1059,6 +1217,8 @@ impl DurationValue {
         Self::from_groups(months, days, time_nanos)
     }
 
+    /// Subtracts a duration, returning an error if the result is out of range or the operation is
+    /// unsupported.
     pub fn checked_sub_duration(&self, other: &DurationValue) -> Result<Self, EncodeError> {
         let months = checked_i64_from_i128(i128::from(self.months) - i128::from(other.months))?;
         let days = checked_i64_from_i128(i128::from(self.days) - i128::from(other.days))?;
@@ -1069,10 +1229,14 @@ impl DurationValue {
         Self::from_groups(months, days, time_nanos)
     }
 
+    /// Scales all duration components by a finite number. Returns an error for a non-finite factor
+    /// or overflow.
     pub fn checked_mul_number(&self, factor: f64) -> Result<Self, EncodeError> {
         self.checked_scale(factor)
     }
 
+    /// Divides duration components by a finite nonzero number. Returns an error for zero, a
+    /// non-finite result, or overflow.
     pub fn checked_div_number(&self, divisor: f64) -> Result<Self, EncodeError> {
         if divisor == 0.0 {
             return Err(EncodeError::InvalidTemporal("duration division by zero"));
@@ -1203,6 +1367,8 @@ impl PartialEq for DurationValue {
 
 impl Eq for DurationValue {}
 
+/// Reads a named temporal component. Returns `None` for unsupported components or value types, a
+/// null value for null input, or an error on conversion overflow.
 pub fn temporal_component(
     value: PropertyValueRef<'_>,
     key: &str,

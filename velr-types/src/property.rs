@@ -1,3 +1,7 @@
+//! Owned and borrowed values returned by the Rust driver and passed to vector embedding callbacks.
+
+#![warn(missing_docs)]
+
 use crate::list::ListValue;
 use crate::spatial::{GeographyValue, GeometryValue, PointValue};
 use crate::temporal::{
@@ -6,55 +10,92 @@ use crate::temporal::{
 };
 use crate::vector::VectorValue;
 
+/// An owned property value, including scalar, temporal, spatial, list, vector, and byte values.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PropertyValue {
+    /// A null value.
     Null,
+    /// A Boolean value.
     Bool(bool),
+    /// A signed 64-bit integer.
     Integer(i64),
+    /// A 64-bit floating-point value.
     Float(f64),
+    /// UTF-8 text.
     String(String),
 
+    /// A calendar date.
     Date(DateValue),
+    /// A time without a timezone.
     LocalTime(LocalTimeValue),
+    /// A time with a UTC offset.
     ZonedTime(ZonedTimeValue),
+    /// A date and time without a timezone.
     LocalDateTime(LocalDateTimeValue),
+    /// A date and time with a UTC offset and optional named zone.
     ZonedDateTime(ZonedDateTimeValue),
+    /// A calendar and elapsed-time duration.
     Duration(DurationValue),
 
+    /// A single point.
     Point(PointValue),
+    /// A geometry value.
     Geometry(GeometryValue),
+    /// A geography value.
     Geography(GeographyValue),
 
+    /// A list of property values.
     List(ListValue),
+    /// A numeric vector.
     Vector(VectorValue),
+    /// An uninterpreted byte sequence.
     Bytes(Vec<u8>),
 }
 
+/// A borrowed view of a property value. References remain valid only while the owning value lives.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum PropertyValueRef<'a> {
+    /// A null value.
     Null,
+    /// A Boolean value.
     Bool(bool),
+    /// A signed 64-bit integer.
     Integer(i64),
+    /// A 64-bit floating-point value.
     Float(f64),
+    /// UTF-8 text.
     String(&'a str),
 
+    /// A calendar date.
     Date(&'a DateValue),
+    /// A time without a timezone.
     LocalTime(&'a LocalTimeValue),
+    /// A time with a UTC offset.
     ZonedTime(&'a ZonedTimeValue),
+    /// A date and time without a timezone.
     LocalDateTime(&'a LocalDateTimeValue),
+    /// A date and time with a UTC offset and optional named zone.
     ZonedDateTime(&'a ZonedDateTimeValue),
+    /// A calendar and elapsed-time duration.
     Duration(&'a DurationValue),
 
+    /// A single point.
     Point(&'a PointValue),
+    /// A geometry value.
     Geometry(&'a GeometryValue),
+    /// A geography value.
     Geography(&'a GeographyValue),
 
+    /// A list of property values.
     List(&'a ListValue),
+    /// A numeric vector.
     Vector(&'a VectorValue),
+    /// An uninterpreted byte sequence.
     Bytes(&'a [u8]),
 }
 
 impl PropertyValue {
+    /// Borrows this value without cloning its strings, collections, or structured values.
     pub fn as_ref(&self) -> PropertyValueRef<'_> {
         match self {
             Self::Null => PropertyValueRef::Null,

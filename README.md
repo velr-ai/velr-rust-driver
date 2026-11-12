@@ -1,11 +1,17 @@
 # Velr
 
-Velr is an embedded property-graph database from Velr.ai, written in Rust, built on top of SQLite3 (persisting to a standard SQLite database file) and queried using the openCypher language.
+Velr is an openCypher-compliant embedded property-graph database from Velr.ai.
 
-This crate provides the **Rust binding** for Velr. It links against a bundled native runtime with a C ABI, implemented in Rust.
+This crate provides the **Rust binding** for Velr and bundles the native runtime
+for supported platforms.
+
+Create fulltext and vector indexes with Cypher DDL and query them with `CALL`.
 
 For the main Velr public entry point, see [velr-ai/velr](https://github.com/velr-ai/velr).  
 For the Velr website, see [velr.ai](https://velr.ai/).
+
+The [Rust API reference](https://docs.rs/velr/latest/velr/) documents every public
+type and method, including parameters, errors, feature requirements, and lifetimes.
 
 ## Community
 
@@ -13,48 +19,15 @@ For the Velr website, see [velr.ai](https://velr.ai/).
 - **Bug reports and feature requests:** [GitHub Issues](https://github.com/velr-ai/velr/issues)
 - **Rust examples:** [velr-rust-examples](https://github.com/velr-ai/velr-rust-examples)
 
-We’d love to have you join the Velr community.
-
 ---
 
-## Release status
+## Database compatibility
 
-This release is **alpha**.
+Velr 0.2.14 changed the database format. Recreate databases from earlier
+releases by re-importing the source data.
 
-- The Rust API is still evolving.
-- Velr supports openCypher and passes all positive openCypher TCK tests. Exact
-  error semantics are not guaranteed to match other openCypher implementations.
-- Velr 0.2.14 includes a breaking on-disk storage change; existing databases from earlier releases must be recreated by re-importing the source data.
-- Starting with the `0.3.x` series, we intend to guarantee internal database compatibility within the branch.
-
-### Schema version 9 compatibility
-
-This release uses on-disk schema version 9. Database files at supported schema
-versions 8 or earlier can still be opened for reads without changing the file,
-but they must be explicitly migrated to schema version 9 before writes or
-features that require the current schema. Opening a database never migrates it
-automatically.
-
-Unfiltered single-label property TopK and `min()`/`max()` reads can use the
-existing numeric or full-value text indexes without a schema upgrade. The
-read checks property types and null coverage using the existing graph-shape
-inventory, maintained transactionally by supported driver writes and imports.
-First reads, reopened connections and reads after writes use the same small
-metadata lookups, without a label validation scan or separate connection cache.
-Numeric domains containing REAL values also use bounded index endpoint checks
-for non-finite numbers. Unsupported domains or incomplete index trials use the
-ordinary scan. No tables, indexes, triggers or write hooks are added. Direct
-SQLite edits that bypass Velr's driver and inventory maintenance are unsupported.
-
-Scoped and graph-ordered property reads also check numeric storage domains
-through the maintained inventory rather than counting every property row.
-Dictionary lookups resolve requested names and label groups through existing
-indexes; whole-catalog loading remains an explicit preload operation.
-
-Velr is already usable for real workflows and representative use cases, but rough edges remain and the API is not yet stable.
-
-Fulltext search and vector search are available today through Cypher DDL and
-`CALL` syntax. API details may still evolve while Velr remains alpha.
+New databases use schema version 11. Databases at schema versions 3 through 9
+require an [explicit migration](#schema-migration) before graph queries can run.
 
 ---
 
@@ -113,6 +86,128 @@ fn main() -> velr::Result<()> {
 
 ---
 
+## Choosing an API
+
+| Application task | API |
+|---|---|
+| Open a database | `Velr::open`, `Velr::open_readonly` |
+| Create a database with an inline relationship property | `Velr::create`, `CreateOptions`, `inline_edge_properties` |
+| Execute a write and discard results | `run`, `run_with_params`, `run_with_options` |
+| Read exactly one result table | `exec_one`, `exec_one_with_params`, `exec_one_with_options` |
+| Read multiple result tables | `exec`, `exec_with_params`, `exec_with_options`, then `next_table` |
+| Read rows | `TableResult::for_each_row`, `collect`, or `rows` and `RowIter::next` |
+| Bind parameters or limit emitted rows | `params!`, `QueryParams`, `QueryValue`, `QueryOptions` |
+| Group work in a transaction | `begin_tx`, then the query methods on `VelrTx`, followed by `commit` or `rollback` |
+| Inspect query behavior | `explain`, `explain_with_params`, `explain_analyze`, `ExplainTrace` |
+| Check and migrate an existing database | `schema_version`, `current_schema_version`, `needs_migration`, `migrate` |
+| Import or export Arrow data | `bind_arrow`, `bind_arrow_chunks`, `bind_arrow_ipc`, `TableResult::to_arrow_ipc_file` |
+| Provide embeddings for vector search | `register_vector_embedder`, `VectorEmbeddingInput`, `VectorEmbeddingBatchResult` |
+| Compact a database or inspect temporary storage | `vacuum`, `temp_storage_bytes` |
+
+`exec_one` returns an error when a query produces zero or multiple result tables.
+Use `run` when no result is needed and `exec` when processing multiple statements.
+The transaction handle provides matching execution and Arrow binding methods.
+
+## Results, lifetimes, and threads
+
+`CellRef` represents `Null`, `Bool`, `Integer`, `Float`, borrowed `Text` bytes,
+or borrowed `Json` bytes for structured values such as lists, maps, and graph
+entities. Text and JSON are valid only inside the row callback; copy or parse
+them there to retain values. `collect` retains every mapped value in memory;
+use `for_each_row` for results that should be processed incrementally.
+
+```rust,no_run
+use velr::{CellRef, Velr};
+
+fn main() -> velr::Result<()> {
+    let db = Velr::open(None)?;
+    let mut table = db.exec_one("RETURN 'Alice' AS name")?;
+    let names: Vec<String> = table.collect(|row| match row[0] {
+        CellRef::Text(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        _ => Ok(String::new()),
+    })?;
+    println!("{names:?}");
+    Ok(())
+}
+```
+
+Process each result table before requesting the next one. Finish tables and row
+cursors while their connection and any transaction are active. Streams, tables,
+cursors, transactions, savepoints, and explain traces release their resources
+when dropped. Dropping an active transaction rolls back its writes.
+
+`Velr` is `Send` but not `Sync`: an idle connection can be moved to another
+thread, and separate threads can use separate connections. Result handles and
+transaction handles are neither `Send` nor `Sync`; keep them on their creating
+thread. An `Arc<Velr>` does not permit concurrent use of one connection.
+
+Most operations return `velr::Result<T>`. `Error` contains a numeric `code` and a
+human-readable `message`. The numeric code describes the API failure, such as
+an invalid argument or execution failure. Cypher diagnostics in `message`
+identify the error category and its compile-time or runtime phase, with an
+explanation of the problem and guidance for correcting it. Source-aware
+diagnostics show the query excerpt, location, and affected expression. Where
+several expressions could explain an error, labels mark possible locations.
+
+| Cypher error category | Meaning |
+|---|---|
+| `SyntaxError` | Invalid syntax or a statically invalid query. |
+| `TypeError` | A value has an incompatible type. |
+| `ArgumentError` | An argument is outside the operation's supported domain. |
+| `ParameterMissing` | A query parameter was not supplied. |
+| `ArithmeticError` | Arithmetic is undefined or overflows. |
+| `EntityNotFound` | A query accesses a deleted graph entity. |
+| `ConstraintVerificationFailed` | A write violates a graph constraint. |
+| `SemanticError` | A query violates a graph semantic rule. |
+
+Parameter construction returns `QueryParamError`, which converts to `Error`
+through `?`. A query that references an unbound parameter returns `Error` with
+a `ParameterMissing` diagnostic. Query execution can fail when starting a query,
+advancing result tables, or fetching rows, so
+propagate errors at each stage. Returning an error from a row callback stops
+iteration and returns that error to the caller.
+
+A runtime error can be reported before a result table is returned. The phase
+describes the Cypher error independently of which driver call reports it.
+
+---
+
+## Creating a database with an inline relationship property
+
+Use `Velr::create` to choose zero or one case-sensitive relationship property
+name for a new database. The default selects no property. The choice applies
+across all relationship types and persists when you reopen the database. Pass
+`None` to create an in-memory database. Creation fails if the file already
+exists. Use `Velr::open` or `Velr::open_readonly` to reopen an existing file.
+
+Eligible values include integers, floating-point numbers, and strings up to 128
+UTF-8 bytes. Values that exceed the inline size limit remain available through
+the same property name. Use ordinary Cypher to create, update, and read the
+property.
+
+```rust,no_run
+use velr::{CreateOptions, Velr};
+
+fn main() -> velr::Result<()> {
+    let options = CreateOptions::new().with_inline_edge_properties(["timestamp"]);
+    let db = Velr::create(Some("events.db"), options)?;
+    db.run("CREATE (:Event)-[:FOLLOWED_BY {timestamp: 1}]->(:Event)")?;
+    db.run("MATCH ()-[r:FOLLOWED_BY]->() SET r.timestamp = 2")?;
+    drop(db);
+
+    let db = Velr::open_readonly("events.db")?;
+    println!("{:?}", db.inline_edge_properties()?);
+    let mut table = db.exec_one("MATCH ()-[r:FOLLOWED_BY]->() RETURN r.timestamp")?;
+    table.for_each_row(|row| {
+        println!("{:?}", row[0]);
+        Ok(())
+    })?;
+    Ok(())
+}
+```
+
+---
+
 ## Opening an existing database read-only
 
 Use `Velr::open_readonly(path)` for viewers, agents, and other read paths that
@@ -134,21 +229,16 @@ fn main() -> velr::Result<()> {
 }
 ```
 
-`open_readonly` requires an existing file-backed database at a supported Velr
-schema version. It does not create files, run schema DDL, or migrate older
-databases. Older supported databases, such as schema version 3, 4, 5, 6, 7, or
-8 databases opened by a schema version 9 runtime, remain available for reads.
-Writes and features that require the current schema fail with a normal query
-error until the database is explicitly migrated.
+`open_readonly` requires an existing Velr database at a supported version and
+does not modify the file. After migrating an older database on a writable
+connection, reopen any read-only connections before querying it.
 
 ---
 
 ## Schema migration
 
-Velr does not migrate supported older databases automatically on open. Use the
-driver migration API, or run `MIGRATE DATABASE`, from maintenance code when you
-intend to update the on-disk schema. See the release-status note above for the
-schema version 9 read/write compatibility behavior.
+Open the database on a writable connection and call `migrate()` or run
+`MIGRATE DATABASE` outside an active transaction.
 
 ```rust,no_run
 use velr::{MigrationStatus, Velr};
@@ -173,8 +263,7 @@ fn main() -> velr::Result<()> {
 }
 ```
 
-The equivalent Cypher command is useful for scripts and tools that already work
-through query execution:
+Run the equivalent Cypher command from scripts and query-based tools:
 
 ```rust,no_run
 let db = Velr::open(Some("mygraph.db"))?;
@@ -210,11 +299,6 @@ reports the shape present in stored data: node labels, relationship types,
 properties, observed value types, and counts. It is an observed shape surface,
 not a declared GQL graph type.
 
-`SHOW CURRENT GRAPH SHAPE` is available on schema version 5 or newer databases.
-Older supported databases can still be opened for reads, but must be migrated
-explicitly before this command is valid. Schema version 5 introduced this
-inventory through the write planner instead of persistent graph-shape triggers.
-
 The default projection returns `element_kind`, `element_name`, `property_name`,
 `observed_type`, `owner_count`, `present_count`, and `missing_count`.
 `YIELD *` exposes the full row shape, including `surface`, `source_label`,
@@ -244,8 +328,7 @@ full current row shape.
 
 ## Fulltext Search
 
-Fulltext search is available through normal Cypher execution. Define indexes
-with `CREATE FULLTEXT INDEX` and query them with
+Create fulltext indexes with `CREATE FULLTEXT INDEX` and query them with
 `CALL db.index.fulltext.queryNodes(...)`.
 
 ```rust,no_run
@@ -280,9 +363,8 @@ Field scoping applies to the next term or phrase only. For example,
 `title:graph search` searches `graph` in `title` and `search` in the default
 fulltext field.
 
-`score` is a non-normalized relevance score. Higher scores are better within a
-single query result set; scores are not guaranteed to be in `0..1` or
-comparable across different queries.
+`score` is an unnormalized, query-specific relevance score. Higher scores rank
+results higher. Compare scores within the same query's result set.
 
 Fulltext indexes are kept up to date by writes. For file-backed databases,
 Velr repairs missing or corrupt fulltext index data automatically when the
@@ -372,9 +454,6 @@ HNSW tuning options:
 | `` `vector.hnsw.ef_construction` `` | `1..3200` candidates | Build-time candidate pool per inserted vector. For example, `320` means the builder considers a working set of 320 candidate neighbors while placing each vector. Higher values can improve index quality and recall, usually with slower index creation. |
 | `` `vector.hnsw.ef_search` `` | `1..3200` candidates | Query-time candidate pool. For example, `128` means each search keeps a working set of 128 candidate vectors while traversing the HNSW graph. Higher values can improve recall, usually with slower searches. Velr's default is `64`. |
 
-Velr manages the vector scalar format and storage/cache engines internally. Use
-the options above for application configuration.
-
 ```rust,no_run
 use velr::{PropertyValue, VectorEmbeddingPurpose, Velr};
 
@@ -431,23 +510,92 @@ that order. Query text is passed as one unnamed string field. Vector `score` is
 metric-dependent and non-normalized; higher scores are better within a single
 query result set.
 
-For file-backed databases, Velr can repair missing or corrupt vector index data
-from stored vector properties or from registered embedders, depending on how
-the index was created.
+For file-backed databases, Velr repairs missing or corrupt vector index data
+using stored vector properties or registered embedders, according to the index
+configuration.
 
 ---
 
 ## Query language support
 
-Velr supports the openCypher query language and passes all positive openCypher
-TCK tests. Exact error semantics, including error messages, categories, and
-timing, are not guaranteed to match other openCypher implementations.
+Velr is openCypher compliant, including query validation and error categories.
+It also supports Cypher extensions for subqueries, fulltext search, and vector
+search.
+
+Use `MATCH`, `OPTIONAL MATCH`, `WHERE`, `WITH`, `UNWIND`, aggregation,
+ordering, pagination, `CREATE`, `MERGE`, `SET`, `REMOVE`, and deletion. Variable
+length paths, `shortestPath`, `allShortestPaths`, list and pattern comprehensions,
+`reduce`, `UNION`, and `UNION ALL` are also supported.
+
+List comprehensions transform or filter a list; `reduce` folds its elements into
+an accumulator, including lists stored as properties:
+
+```cypher
+RETURN [x IN range(1, 5) WHERE x % 2 = 1 | x * x] AS oddSquares,
+       reduce(total = 0, x IN [1, 2, 3] | total + x) AS sum
+```
+
+`reduce` processes elements in list order. An empty list returns the initial
+accumulator; a `null` source returns `null`.
+
+`range(start, end[, step])` accepts integer and finite floating-point arguments.
+Floating-point arguments are truncated toward zero; the resulting step must be
+nonzero. Strings, booleans, and `null` arguments raise an argument error.
+List element access (`list[index]`) requires an integer index, and map element
+access (`map[key]`) requires a string key. A `null` index or key returns `null`.
+`trim(value)` accepts a string or `null`; other argument types raise a type error.
+Convert other values explicitly with `toString()` before trimming them.
+
+`sqrt()`, `floor()`, and `round()` accept numeric values or `null`; incompatible
+argument types raise a runtime `TypeError`. `round(value, precision)` accepts
+integer and finite floating-point precision values, truncating FLOAT precision
+toward zero. The resulting precision must be non-negative. Negative precision,
+non-finite precision, and a NaN value passed to `round()` raise `ArgumentError`.
+`sqrt()` and `floor()` propagate NaN values. Integer overflow and integer
+division or modulo by zero raise `ArithmeticError`.
+
+`percentileDisc()` and `percentileCont()` require finite numeric inputs and a
+percentile between `0.0` and `1.0`, inclusive, constant within each aggregation
+group. Null inputs are skipped. Incompatible types raise `TypeError`; invalid
+percentile values raise `ArgumentError`. Diagnostics identify the relevant
+function argument and provide source guidance.
+
+In a `CREATE` or `MERGE` relationship pattern, reference a node already in scope
+as `(n)`; apply labels and properties with `SET`. Repeating the same relationship
+variable in one `MATCH` makes that pattern produce no matches. Use separate
+`MATCH` clauses to reuse the same relationship.
+
+Use a pattern comprehension to return related values as a list:
+
+```cypher
+MATCH (p:Person)
+RETURN p.name, [(p)-[:KNOWS]->(friend) | friend.name] AS friends
+```
+
+Use `EXISTS { ... }` and `COUNT { ... }` with read-only subqueries:
+
+```cypher
+RETURN EXISTS { MATCH (n) } AS anyNodes, COUNT { MATCH (n) } AS nodeCount
+```
+
+`CALL { ... }` supports subqueries that return rows and unit subqueries that
+perform writes without returning rows. Import outer variables with `WITH`.
+For a returning subquery, also include a final outer `RETURN`:
+
+```cypher
+UNWIND [1, 2] AS x
+CALL { WITH x RETURN x * 2 AS doubled }
+RETURN x, doubled
+```
+
+Use `collect(expression)` aggregation or a pattern comprehension to collect
+values into a list. `COLLECT { ... }` subquery syntax is not supported.
 
 ---
 
 ## Streaming multiple result tables
 
-A single `exec()` can yield multiple result tables (e.g. multiple statements):
+Use `exec()` to read result tables from multiple statements:
 
 ```rust
 let db = Velr::open(None)?;
@@ -496,7 +644,7 @@ fn main() -> velr::Result<()> {
 `max_result_rows = 0` preserves the returned column metadata and opens row
 cursors at EOF. The cap is enforced by Velr during result emission, not by
 appending or injecting Cypher `LIMIT`, and applies independently to each result
-table produced by `exec_with_options`. Existing Cypher `LIMIT` clauses still
+table produced by `exec_with_options`. Existing Cypher `LIMIT` clauses
 apply, so a query with `LIMIT 3` and `max_result_rows = 5` emits at most three
 rows, while `LIMIT 10` with `max_result_rows = 5` emits at most five rows. It is
 not a timeout or cancellation
@@ -543,6 +691,11 @@ floats, strings, lists, and maps. Lists and maps can be supplied as
 `QueryValue::List` / `QueryValue::Map`, Rust `Vec`s, `BTreeMap<String, _>`,
 `HashMap<String, _>`, or `serde_json::Value`.
 
+`Option::None` and `()` represent Cypher `null`. Integer values must fit in a
+signed 64-bit integer, and floating-point values must be finite. Invalid nested
+values are rejected too. A parameter name must be nonempty and omit `$`;
+inserting an existing name replaces its value.
+
 Use string-literal keys in `params!` for parameter names that are not Rust
 identifiers, such as `$1`: `velr::params! { name: "Alice", "1" => 42_i64 }?`.
 
@@ -574,7 +727,7 @@ tx.run("CREATE (:Temp {k:'outer'})")?;
 }
 
 tx.commit()?;
-````
+```
 
 ### Named savepoints
 
@@ -596,14 +749,17 @@ tx.release_savepoint("before_write1")?;
 tx.commit()?;
 ```
 
-`release_savepoint(name)` currently releases the most recent active named savepoint.
+`release_savepoint(name)` requires the name of the most recent active named
+savepoint. Names must be unique among active savepoints. Releasing a savepoint
+keeps its changes pending in the outer transaction; commit the transaction to
+persist them. Drop or finalize scoped savepoints before finalizing the transaction.
 
 Dropping an active transaction without `commit()` will roll it back automatically.
 
 ---
 ## Explain plans
 
-Velr can produce an explain trace for a query, which is useful when you want to inspect how a openCypher query is planned and translated internally.
+Use an explain trace to diagnose a query's behavior.
 
 Use `Velr::explain` to build a trace without executing the query:
 
@@ -622,7 +778,15 @@ fn main() -> velr::Result<()> {
 }
 ```
 
-The returned `ExplainTrace` can be inspected programmatically or rendered as a compact string for logging, debugging, tests, or documentation.
+Inspect the returned `ExplainTrace` programmatically or render it as a compact
+string for logging and debugging.
+
+Use `explain_with_params(query, params)` for queries with bound parameters.
+`explain_analyze` executes the query, including writes; use it inside a transaction
+that you roll back when those changes should be discarded. The trace exposes
+zero-based plan, step, and statement accessors, plus `snapshot()` for owned data
+and `write_compact()` for writing a readable trace. Generated plan details can
+change between releases.
 
 ---
 
@@ -634,11 +798,18 @@ Arrow IPC support is enabled by default. With the default feature set you can:
 * Bind Arrow IPC file / Feather v2 bytes as a logical table (`bind_arrow_ipc`)
 * Export a result table as an Arrow IPC file (`to_arrow_ipc_file()`)
 
-```rust,no_run
-#[cfg(feature = "arrow-ipc")]
-fn arrow_example() -> velr::Result<()> {
-    use arrow2::array::{Array, Utf8Array};
+Add `arrow2 = "0.18"` to your application's dependencies when constructing
+arrays with `arrow2`. `bind_arrow` takes one equal-length array per column name;
+`bind_arrow_chunks` accepts one nonempty chunk list per column with matching
+total row counts. Both consume the arrays, so the application need not retain
+their buffers. `bind_arrow_ipc` accepts an Arrow IPC **file** (Feather v2),
+not an IPC stream, and only borrows the input bytes during the call.
 
+```rust,no_run
+use arrow2::array::{Array, Utf8Array};
+use velr::Velr;
+
+fn main() -> velr::Result<()> {
     let db = Velr::open(None)?;
 
     let cols = vec!["name".to_string()];
@@ -657,80 +828,28 @@ fn arrow_example() -> velr::Result<()> {
 }
 ```
 
+The returned IPC bytes are owned and can be saved or read independently of the
+table. Export reads the result and can use memory proportional to its size.
+
 ---
 
-## OpenCypher functions
+## Query functions and expressions
 
-The following openCypher functions and constructors are available:
+| Category | Available functions and forms |
+|---|---|
+| Graph and path | `id`, `type`, `labels`, `keys`, `properties`, `length`, `nodes`, `relationships`, `shortestPath`, `allShortestPaths` |
+| Lists | `size`, `head`, `last`, `tail`, `reverse`, `range`, list comprehensions, pattern comprehensions, `reduce(acc = initial, x IN list \| expression)` |
+| Predicates and nulls | `all`, `any`, `none`, `single`, `IN`, `IS NULL`, `IS NOT NULL`, `coalesce`, `EXISTS { ... }` |
+| Strings and conversions | `toInteger`, `toFloat`, `toBoolean`, `toString`, `toLower` / `lower`, `trim`, `substring`, `split` |
+| Numbers | `abs`, `ceil`, `floor`, `round(value)` / `round(value, precision)`, `rand`, `sign`, `sqrt` |
+| Aggregates | `count`, `sum`, `avg`, `min`, `max`, `collect`, `percentileDisc`, `percentileCont` |
+| Temporal constructors | `date`, `time`, `localtime`, `datetime`, `localdatetime`, `duration`, `datetime.fromepoch`, `datetime.fromepochmillis` |
+| Temporal clocks | `.realtime()`, `.transaction()`, and `.statement()` on `date`, `time`, `localtime`, `datetime`, and `localdatetime` |
+| Temporal operations | `duration.between`, `duration.inMonths`, `duration.inDays`, `duration.inSeconds`; `.truncate(unit, value, fields)` on `date`, `time`, `localtime`, `datetime`, and `localdatetime` |
+| Vector similarity | `vector.similarity.cosine(left, right)` |
 
-**Graph and path**
-
-* `id()`
-* `type()`
-* `labels()`
-* `keys()`
-* `properties()`
-* `length()`
-* `nodes()`
-* `relationships()`
-
-**Lists and predicates**
-
-* `size()`
-* `head()`
-* `last()`
-* `tail()`
-* `reverse()`
-* `range()`
-* `all()`
-* `any()`
-* `none()`
-* `single()`
-
-**Strings and conversion**
-
-* `coalesce()`
-* `toInteger()`
-* `toString()`
-* `toLower()`
-* `trim()`
-* `substring()`
-* `split()`
-
-**Numeric**
-
-* `abs()`
-* `ceil()`
-* `rand()`
-* `sign()`
-* `sqrt()`
-
-**Temporal**
-
-* `date()`
-* `time()`
-* `localtime()`
-* `datetime()`
-* `localdatetime()`
-* `duration()`
-* `datetime.fromepoch()`
-* `datetime.fromepochmillis()`
-* `date.realtime()`, `date.transaction()`, `date.statement()`
-* `time.realtime()`, `time.transaction()`, `time.statement()`
-* `localtime.realtime()`, `localtime.transaction()`, `localtime.statement()`
-* `datetime.realtime()`, `datetime.transaction()`, `datetime.statement()`
-* `localdatetime.realtime()`, `localdatetime.transaction()`, `localdatetime.statement()`
-
-**Aggregates**
-
-* `count()`
-* `sum()`
-* `avg()`
-* `min()`
-* `max()`
-* `collect()`
-* `percentileDisc()`
-* `percentileCont()`
+For temporal truncation, pass the third map argument even when no fields need
+overriding, for example `date.truncate('month', date('2026-11-05'), {})`.
 
 ---
 
@@ -744,7 +863,7 @@ This crate links against a bundled native runtime. Cargo selects one platform-sp
 velr = "0.2"
 ```
 
-Currently bundled targets:
+Supported platforms:
 
 * macOS aarch64 (Apple Silicon)
 * macOS x86_64 (Intel)

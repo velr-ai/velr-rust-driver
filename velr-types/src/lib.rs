@@ -1,3 +1,30 @@
+//! Owned and borrowed property values shared by Velr's Rust APIs.
+//!
+//! [`PropertyValue`] represents scalars, lists, vectors, temporal values, spatial
+//! values, and bytes. [`PropertyValueRef`] borrows an existing value without
+//! cloning its contents. The `velr` driver reexports these types for applications
+//! such as vector embedding callbacks. Query parameters in that driver use its
+//! separate `QueryValue` type.
+//!
+//! Typed lists retain null elements and iterate in their original order:
+//!
+//! ```
+//! use velr_types::{ListValue, PropertyValueRef};
+//!
+//! let values = ListValue::Int64(vec![Some(2), None, Some(5)]);
+//! let total: i64 = values.iter().filter_map(|value| match value {
+//!     PropertyValueRef::Integer(number) => Some(number),
+//!     _ => None,
+//! }).sum();
+//! assert_eq!(total, 7);
+//! ```
+//!
+//! Use checked temporal constructors or parse ISO text with `str::parse`.
+//! Spatial values provide GeoJSON, WKT, and EWKT conversions. Numeric vectors
+//! pair a coordinate type with matching storage; validate values constructed
+//! directly before passing them to APIs that encode them. Fallible constructors
+//! and conversions return [`EncodeError`] or [`DecodeError`].
+
 pub mod codec;
 pub mod cypher_order;
 pub mod error;

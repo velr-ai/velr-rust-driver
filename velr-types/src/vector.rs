@@ -1,17 +1,29 @@
+//! Typed numeric vectors and their borrowing iterators.
+
+#![warn(missing_docs)]
+
 use crate::error::{DecodeError, EncodeError};
 use crate::tag;
 
+/// The numeric type of each vector coordinate.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum VectorType {
+    /// Signed 8-bit coordinates.
     Integer8,
+    /// Signed 16-bit coordinates.
     Integer16,
+    /// Signed 32-bit coordinates.
     Integer32,
+    /// Signed 64-bit coordinates.
     Integer64,
+    /// 32-bit floating-point coordinates.
     Float32,
+    /// 64-bit floating-point coordinates.
     Float64,
 }
 
 impl VectorType {
+    /// Returns the type identifier used by the vector blob encoding.
     pub fn code(self) -> u8 {
         match self {
             Self::Integer8 => 0x01,
@@ -23,6 +35,7 @@ impl VectorType {
         }
     }
 
+    /// Decodes a vector coordinate type identifier, returning an error for an unknown identifier.
     pub fn from_code(code: u8) -> Result<Self, DecodeError> {
         match code {
             0x01 => Ok(Self::Integer8),
@@ -38,33 +51,52 @@ impl VectorType {
     }
 }
 
+/// Owned vector coordinates. The variant must match [`VectorValue::coord_type`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum VectorStorage {
+    /// Owned signed 8-bit integer coordinates.
     I8(Vec<i8>),
+    /// Owned signed 16-bit integer coordinates.
     I16(Vec<i16>),
+    /// Owned signed 32-bit integer coordinates.
     I32(Vec<i32>),
+    /// Owned signed 64-bit integer coordinates.
     I64(Vec<i64>),
+    /// Owned 32-bit floating-point coordinates.
     F32(Vec<f32>),
+    /// Owned 64-bit floating-point coordinates.
     F64(Vec<f64>),
 }
 
+/// One vector coordinate, retaining its numeric type.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum VectorElem {
+    /// A signed 8-bit integer coordinate.
     I8(i8),
+    /// A signed 16-bit integer coordinate.
     I16(i16),
+    /// A signed 32-bit integer coordinate.
     I32(i32),
+    /// A signed 64-bit integer coordinate.
     I64(i64),
+    /// A 32-bit floating-point coordinate.
     F32(f32),
+    /// A 64-bit floating-point coordinate.
     F64(f64),
 }
 
+/// An owned numeric vector. Coordinate type and storage must agree; call [`Self::validate`] after
+/// constructing one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorValue {
+    /// The declared numeric coordinate type.
     pub coord_type: VectorType,
+    /// The owned coordinate sequence.
     pub values: VectorStorage,
 }
 
 impl VectorValue {
+    /// Returns the number of vector coordinates.
     pub fn len(&self) -> usize {
         match &self.values {
             VectorStorage::I8(v) => v.len(),
@@ -76,10 +108,12 @@ impl VectorValue {
         }
     }
 
+    /// Returns whether there are no elements.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Iterates elements in their original order without copying the collection.
     pub fn iter(&self) -> VectorIter<'_> {
         match &self.values {
             VectorStorage::I8(v) => VectorIter::I8(v.iter()),
@@ -91,6 +125,8 @@ impl VectorValue {
         }
     }
 
+    /// Checks that the coordinate type matches the storage variant. Encoding additionally checks
+    /// length and finite floating-point coordinates.
     pub fn validate(&self) -> Result<(), EncodeError> {
         let ok = matches!(
             (&self.coord_type, &self.values),
@@ -110,6 +146,8 @@ impl VectorValue {
         }
     }
 
+    /// Encodes this vector as a Velr value blob. Returns an error for mismatched storage, more than
+    /// 65,535 coordinates, or non-finite floating-point coordinates.
     pub fn encode_blob(&self) -> Result<Vec<u8>, EncodeError> {
         self.validate()?;
         if self.len() > u16::MAX as usize {
@@ -164,6 +202,8 @@ impl VectorValue {
         Ok(out)
     }
 
+    /// Decodes a Velr value blob. Returns an error for malformed input or a value of a different
+    /// type.
     pub fn decode_blob(blob: &[u8]) -> Result<Self, DecodeError> {
         if blob.is_empty() {
             return Err(DecodeError::EmptyInput);
@@ -272,12 +312,19 @@ impl VectorValue {
     }
 }
 
+/// An iterator over vector coordinates in their original order.
 pub enum VectorIter<'a> {
+    /// An iterator over signed 8-bit integer coordinates.
     I8(std::slice::Iter<'a, i8>),
+    /// An iterator over signed 16-bit integer coordinates.
     I16(std::slice::Iter<'a, i16>),
+    /// An iterator over signed 32-bit integer coordinates.
     I32(std::slice::Iter<'a, i32>),
+    /// An iterator over signed 64-bit integer coordinates.
     I64(std::slice::Iter<'a, i64>),
+    /// An iterator over 32-bit floating-point coordinates.
     F32(std::slice::Iter<'a, f32>),
+    /// An iterator over 64-bit floating-point coordinates.
     F64(std::slice::Iter<'a, f64>),
 }
 

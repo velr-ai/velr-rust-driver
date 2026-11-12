@@ -1,3 +1,7 @@
+//! Spatial value constructors and GeoJSON, WKT, and EWKT conversion helpers.
+
+#![warn(missing_docs)]
+
 use crate::error::{DecodeError, EncodeError};
 use crate::tag;
 use serde_json::{Map, Number, Value};
@@ -17,13 +21,30 @@ const EWKB_GEOMETRY_COLLECTION: u32 = 7;
 
 const DEFAULT_GEOJSON_SRID: u32 = 4326;
 
+/// A two- or three-dimensional coordinate. Coordinate meaning is determined by the containing
+/// value's SRID.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Position {
-    Xy { x: f64, y: f64 },
-    Xyz { x: f64, y: f64, z: f64 },
+    /// A two-dimensional coordinate.
+    Xy {
+        /// The first coordinate.
+        x: f64,
+        /// The second coordinate.
+        y: f64,
+    },
+    /// A three-dimensional coordinate.
+    Xyz {
+        /// The first coordinate.
+        x: f64,
+        /// The second coordinate.
+        y: f64,
+        /// The third coordinate.
+        z: f64,
+    },
 }
 
 impl Position {
+    /// Returns 2 for `Xy` or 3 for `Xyz`.
     pub fn dimension(&self) -> usize {
         match self {
             Self::Xy { .. } => 2,
@@ -31,18 +52,21 @@ impl Position {
         }
     }
 
+    /// Returns the first coordinate.
     pub fn x(&self) -> f64 {
         match self {
             Self::Xy { x, .. } | Self::Xyz { x, .. } => *x,
         }
     }
 
+    /// Returns the second coordinate.
     pub fn y(&self) -> f64 {
         match self {
             Self::Xy { y, .. } | Self::Xyz { y, .. } => *y,
         }
     }
 
+    /// Returns the third coordinate, or `None` for a two-dimensional position.
     pub fn z(&self) -> Option<f64> {
         match self {
             Self::Xy { .. } => None,
@@ -95,35 +119,45 @@ impl Position {
     }
 }
 
+/// A point with a spatial reference identifier (SRID).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointValue {
+    /// The spatial reference identifier for these coordinates.
     pub srid: u32,
+    /// The point coordinates.
     pub position: Position,
 }
 
+/// An ordered sequence of positions with a consistent coordinate dimension.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineStringValue {
     positions: Vec<Position>,
 }
 
 impl LineStringValue {
+    /// Constructs a line string. Empty input is allowed; mixed coordinate dimensions return an
+    /// error.
     pub fn new(positions: Vec<Position>) -> Result<Self, EncodeError> {
         ensure_consistent_dimensions(&positions)?;
         Ok(Self { positions })
     }
 
+    /// Returns the number of elements, including nulls where allowed.
     pub fn len(&self) -> usize {
         self.positions.len()
     }
 
+    /// Returns whether there are no elements.
     pub fn is_empty(&self) -> bool {
         self.positions.is_empty()
     }
 
+    /// Iterates elements in their original order without copying the collection.
     pub fn iter(&self) -> std::slice::Iter<'_, Position> {
         self.positions.iter()
     }
 
+    /// Borrows the positions in their original order.
     pub fn positions(&self) -> &[Position] {
         &self.positions
     }
@@ -133,12 +167,16 @@ impl LineStringValue {
     }
 }
 
+/// A closed ring. A nonempty ring contains at least four positions, with equal first and last
+/// positions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearRingValue {
     positions: Vec<Position>,
 }
 
 impl LinearRingValue {
+    /// Constructs a ring. Empty input is allowed; nonempty input must contain at least four
+    /// positions, close on itself, and use one coordinate dimension.
     pub fn new(positions: Vec<Position>) -> Result<Self, EncodeError> {
         ensure_consistent_dimensions(&positions)?;
         if !positions.is_empty() {
@@ -154,18 +192,22 @@ impl LinearRingValue {
         Ok(Self { positions })
     }
 
+    /// Returns the number of elements, including nulls where allowed.
     pub fn len(&self) -> usize {
         self.positions.len()
     }
 
+    /// Returns whether there are no elements.
     pub fn is_empty(&self) -> bool {
         self.positions.is_empty()
     }
 
+    /// Iterates elements in their original order without copying the collection.
     pub fn iter(&self) -> std::slice::Iter<'_, Position> {
         self.positions.iter()
     }
 
+    /// Borrows the positions in their original order.
     pub fn positions(&self) -> &[Position] {
         &self.positions
     }
@@ -175,28 +217,36 @@ impl LinearRingValue {
     }
 }
 
+/// A polygon represented by ordered rings; the first ring is the exterior and later rings are
+/// holes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolygonValue {
     rings: Vec<LinearRingValue>,
 }
 
 impl PolygonValue {
+    /// Constructs a polygon from rings in exterior-then-holes order. Empty input represents an
+    /// empty polygon; no topology validation is performed.
     pub fn new(rings: Vec<LinearRingValue>) -> Result<Self, EncodeError> {
         Ok(Self { rings })
     }
 
+    /// Returns the number of rings, including the exterior ring and any holes.
     pub fn len(&self) -> usize {
         self.rings.len()
     }
 
+    /// Returns whether there are no rings.
     pub fn is_empty(&self) -> bool {
         self.rings.is_empty()
     }
 
+    /// Iterates rings in order: exterior first, followed by holes.
     pub fn rings(&self) -> std::slice::Iter<'_, LinearRingValue> {
         self.rings.iter()
     }
 
+    /// Borrows the rings in order: exterior first, followed by holes.
     pub fn ring_slice(&self) -> &[LinearRingValue] {
         &self.rings
     }
@@ -206,30 +256,46 @@ impl PolygonValue {
     }
 }
 
+/// The shape and coordinates of a spatial value, without an SRID.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GeometryShape {
+    /// A point.
     Point(Position),
+    /// A line string.
     LineString(LineStringValue),
+    /// A polygon.
     Polygon(PolygonValue),
+    /// A collection of points.
     MultiPoint(Vec<Position>),
+    /// A collection of line strings.
     MultiLineString(Vec<LineStringValue>),
+    /// A collection of polygons.
     MultiPolygon(Vec<PolygonValue>),
+    /// A collection of possibly different geometry shapes.
     GeometryCollection(Vec<GeometryShape>),
 }
 
+/// A geometry shape paired with its spatial reference identifier (SRID).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeometryValue {
+    /// The spatial reference identifier for these coordinates.
     pub srid: u32,
+    /// The geometry shape and coordinates.
     pub shape: GeometryShape,
 }
 
+/// A geography shape paired with its spatial reference identifier (SRID).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeographyValue {
+    /// The spatial reference identifier for these coordinates.
     pub srid: u32,
+    /// The geometry shape and coordinates.
     pub shape: GeometryShape,
 }
 
 impl PointValue {
+    /// Returns a GeoJSON geometry object without an SRID member. Returns an error if a coordinate
+    /// cannot be represented in JSON.
     pub fn to_geojson_value(&self) -> Result<Value, EncodeError> {
         let mut obj = Map::new();
         obj.insert("type".into(), Value::String("Point".into()));
@@ -237,11 +303,15 @@ impl PointValue {
         Ok(Value::Object(obj))
     }
 
+    /// Returns GeoJSON text without an SRID member. Returns an error if the value cannot be
+    /// represented in JSON.
     pub fn to_geojson_string(&self) -> Result<String, EncodeError> {
         serde_json::to_string(&self.to_geojson_value()?)
             .map_err(|_| EncodeError::InvalidSpatial("failed to encode GeoJSON point"))
     }
 
+    /// Parses a GeoJSON geometry object with SRID 4326. Returns an error for invalid coordinates or
+    /// an incompatible geometry type.
     pub fn from_geojson_value(value: &Value) -> Result<Self, DecodeError> {
         let shape = GeometryShape::from_geojson_value(value)?;
         match shape {
@@ -255,20 +325,26 @@ impl PointValue {
         }
     }
 
+    /// Parses GeoJSON text with SRID 4326. Returns an error for invalid JSON, coordinates, or
+    /// geometry type.
     pub fn from_geojson_str(s: &str) -> Result<Self, DecodeError> {
         let value: Value =
             serde_json::from_str(s).map_err(|e| DecodeError::InvalidJson(e.to_string()))?;
         Self::from_geojson_value(&value)
     }
 
+    /// Returns WKT text without an SRID prefix. Returns an error for invalid coordinate values.
     pub fn to_wkt_string(&self) -> Result<String, EncodeError> {
         geometry_shape_to_wkt(&GeometryShape::Point(self.position))
     }
 
+    /// Returns EWKT text including the SRID prefix. Returns an error for invalid coordinate values.
     pub fn to_ewkt_string(&self) -> Result<String, EncodeError> {
         Ok(format!("SRID={};{}", self.srid, self.to_wkt_string()?))
     }
 
+    /// Parses WKT or EWKT text. Uses SRID 4326 when no SRID is supplied; returns an error for
+    /// invalid text or geometry type.
     pub fn from_wkt_str(s: &str) -> Result<Self, DecodeError> {
         let (srid, shape) = parse_wkt_or_ewkt(s)?;
         match shape {
@@ -284,15 +360,21 @@ impl PointValue {
 }
 
 impl GeometryValue {
+    /// Returns a GeoJSON geometry object without an SRID member. Returns an error if a coordinate
+    /// cannot be represented in JSON.
     pub fn to_geojson_value(&self) -> Result<Value, EncodeError> {
         self.shape.to_geojson_value()
     }
 
+    /// Returns GeoJSON text without an SRID member. Returns an error if the value cannot be
+    /// represented in JSON.
     pub fn to_geojson_string(&self) -> Result<String, EncodeError> {
         serde_json::to_string(&self.to_geojson_value()?)
             .map_err(|_| EncodeError::InvalidSpatial("failed to encode GeoJSON geometry"))
     }
 
+    /// Parses a GeoJSON geometry object with SRID 4326. Returns an error for invalid coordinates or
+    /// an incompatible geometry type.
     pub fn from_geojson_value(value: &Value) -> Result<Self, DecodeError> {
         Ok(Self {
             srid: DEFAULT_GEOJSON_SRID,
@@ -300,20 +382,26 @@ impl GeometryValue {
         })
     }
 
+    /// Parses GeoJSON text with SRID 4326. Returns an error for invalid JSON, coordinates, or
+    /// geometry type.
     pub fn from_geojson_str(s: &str) -> Result<Self, DecodeError> {
         let value: Value =
             serde_json::from_str(s).map_err(|e| DecodeError::InvalidJson(e.to_string()))?;
         Self::from_geojson_value(&value)
     }
 
+    /// Returns WKT text without an SRID prefix. Returns an error for invalid coordinate values.
     pub fn to_wkt_string(&self) -> Result<String, EncodeError> {
         geometry_shape_to_wkt(&self.shape)
     }
 
+    /// Returns EWKT text including the SRID prefix. Returns an error for invalid coordinate values.
     pub fn to_ewkt_string(&self) -> Result<String, EncodeError> {
         Ok(format!("SRID={};{}", self.srid, self.to_wkt_string()?))
     }
 
+    /// Parses WKT or EWKT text. Uses SRID 4326 when no SRID is supplied; returns an error for
+    /// invalid text or geometry type.
     pub fn from_wkt_str(s: &str) -> Result<Self, DecodeError> {
         let (srid, shape) = parse_wkt_or_ewkt(s)?;
         Ok(Self {
@@ -324,15 +412,21 @@ impl GeometryValue {
 }
 
 impl GeographyValue {
+    /// Returns a GeoJSON geometry object without an SRID member. Returns an error if a coordinate
+    /// cannot be represented in JSON.
     pub fn to_geojson_value(&self) -> Result<Value, EncodeError> {
         self.shape.to_geojson_value()
     }
 
+    /// Returns GeoJSON text without an SRID member. Returns an error if the value cannot be
+    /// represented in JSON.
     pub fn to_geojson_string(&self) -> Result<String, EncodeError> {
         serde_json::to_string(&self.to_geojson_value()?)
             .map_err(|_| EncodeError::InvalidSpatial("failed to encode GeoJSON geography"))
     }
 
+    /// Parses a GeoJSON geometry object with SRID 4326. Returns an error for invalid coordinates or
+    /// an incompatible geometry type.
     pub fn from_geojson_value(value: &Value) -> Result<Self, DecodeError> {
         Ok(Self {
             srid: DEFAULT_GEOJSON_SRID,
@@ -340,20 +434,26 @@ impl GeographyValue {
         })
     }
 
+    /// Parses GeoJSON text with SRID 4326. Returns an error for invalid JSON, coordinates, or
+    /// geometry type.
     pub fn from_geojson_str(s: &str) -> Result<Self, DecodeError> {
         let value: Value =
             serde_json::from_str(s).map_err(|e| DecodeError::InvalidJson(e.to_string()))?;
         Self::from_geojson_value(&value)
     }
 
+    /// Returns WKT text without an SRID prefix. Returns an error for invalid coordinate values.
     pub fn to_wkt_string(&self) -> Result<String, EncodeError> {
         geometry_shape_to_wkt(&self.shape)
     }
 
+    /// Returns EWKT text including the SRID prefix. Returns an error for invalid coordinate values.
     pub fn to_ewkt_string(&self) -> Result<String, EncodeError> {
         Ok(format!("SRID={};{}", self.srid, self.to_wkt_string()?))
     }
 
+    /// Parses WKT or EWKT text. Uses SRID 4326 when no SRID is supplied; returns an error for
+    /// invalid text or geometry type.
     pub fn from_wkt_str(s: &str) -> Result<Self, DecodeError> {
         let (srid, shape) = parse_wkt_or_ewkt(s)?;
         Ok(Self {
@@ -364,6 +464,8 @@ impl GeographyValue {
 }
 
 impl PointValue {
+    /// Encodes this value as a Velr value blob. Returns an error if the value cannot be
+    /// represented.
     pub fn encode_blob(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = vec![tag::POINT];
         encode_geometry_record(
@@ -376,6 +478,8 @@ impl PointValue {
         Ok(out)
     }
 
+    /// Decodes a Velr value blob. Returns an error for malformed input or a value of a different
+    /// type.
     pub fn decode_blob(blob: &[u8]) -> Result<Self, DecodeError> {
         let (srid, shape) = decode_top_level_shape(blob, tag::POINT)?;
         match shape {
@@ -388,6 +492,8 @@ impl PointValue {
 }
 
 impl GeometryValue {
+    /// Encodes this value as a Velr value blob. Returns an error if the value cannot be
+    /// represented.
     pub fn encode_blob(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = vec![tag::GEOMETRY];
         encode_geometry_record(
@@ -400,6 +506,8 @@ impl GeometryValue {
         Ok(out)
     }
 
+    /// Decodes a Velr value blob. Returns an error for malformed input or a value of a different
+    /// type.
     pub fn decode_blob(blob: &[u8]) -> Result<Self, DecodeError> {
         let (srid, shape) = decode_top_level_shape(blob, tag::GEOMETRY)?;
         Ok(Self { srid, shape })
@@ -407,6 +515,8 @@ impl GeometryValue {
 }
 
 impl GeographyValue {
+    /// Encodes this value as a Velr value blob. Returns an error if the value cannot be
+    /// represented.
     pub fn encode_blob(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = vec![tag::GEOGRAPHY];
         encode_geometry_record(
@@ -419,6 +529,8 @@ impl GeographyValue {
         Ok(out)
     }
 
+    /// Decodes a Velr value blob. Returns an error for malformed input or a value of a different
+    /// type.
     pub fn decode_blob(blob: &[u8]) -> Result<Self, DecodeError> {
         let (srid, shape) = decode_top_level_shape(blob, tag::GEOGRAPHY)?;
         Ok(Self { srid, shape })
@@ -426,6 +538,8 @@ impl GeographyValue {
 }
 
 impl GeometryShape {
+    /// Returns a GeoJSON geometry object without an SRID member. Returns an error if a coordinate
+    /// cannot be represented in JSON.
     pub fn to_geojson_value(&self) -> Result<Value, EncodeError> {
         let mut obj = Map::new();
         match self {
@@ -533,6 +647,7 @@ impl GeometryShape {
         Ok(Value::Object(obj))
     }
 
+    /// Parses a GeoJSON geometry object, returning an error for invalid geometry or coordinates.
     pub fn from_geojson_value(value: &Value) -> Result<Self, DecodeError> {
         let obj = value.as_object().ok_or_else(|| {
             DecodeError::InvalidSpatial("GeoJSON geometry must be an object".into())

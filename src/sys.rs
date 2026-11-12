@@ -199,10 +199,15 @@ pub type velr_vector_embedder_free_callback = unsafe extern "C" fn(
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum velr_code {
+    /// The operation succeeded.
     VELR_OK = 0,
+    /// An argument is null or invalid.
     VELR_EARG = -1,
+    /// Text supplied by the caller is not valid UTF-8.
     VELR_EUTF = -2,
+    /// The operation requires a different caller state, such as a larger buffer.
     VELR_ESTATE = -3,
+    /// A query, database, or driver operation failed; the error message gives details.
     VELR_EERR = -4,
 }
 #[allow(non_camel_case_types)]

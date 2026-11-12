@@ -1,6 +1,6 @@
 [package]
 name = "velr-runtime-linux-x86_64"
-version = "0.2.57"
+version = "0.2.59"
 edition = "2021"
 
 description = "Velr native runtime for Linux x86_64"
@@ -9,7 +9,10 @@ homepage = "https://velr.ai"
 repository = "https://github.com/velr-ai/velr-rust-driver"
 documentation = "https://docs.rs/velr"
 
-include = ["src/**", "prebuilt/**", "Cargo.toml", "LICENSE.runtime"]
+include = ["src/**", "prebuilt/**", "build.rs", "Cargo.toml", "LICENSE.runtime"]
+
+[build-dependencies]
+zstd = { version = "0.13", default-features = false }
 
 [lib]
 name = "velr_runtime_linux_x86_64"

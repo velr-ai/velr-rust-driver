@@ -330,22 +330,31 @@ fn sql_quote(text: &str) -> String {
 }
 
 fn push_json_string(out: &mut String, text: &str) {
+    out.reserve(text.len() + 2);
     out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c <= '\u{1F}' => {
-                let _ = write!(out, "\\u{:04X}", c as u32);
-            }
-            c => out.push(c),
+    let mut start = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        let escape = match byte {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            b'\x08' => Some("\\b"),
+            b'\x0C' => Some("\\f"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            b'\x00'..=b'\x1F' => None,
+            _ => continue,
+        };
+        // Only ASCII bytes need escaping, so both slice bounds are UTF-8 boundaries.
+        out.push_str(&text[start..index]);
+        if let Some(escape) = escape {
+            out.push_str(escape);
+        } else {
+            let _ = write!(out, "\\u{byte:04X}");
         }
+        start = index + 1;
     }
+    out.push_str(&text[start..]);
     out.push('"');
 }
 
@@ -399,6 +408,14 @@ mod tests {
             storage_value_to_display_text(StorageValueRef::Text("Ada")).unwrap(),
             "Ada"
         );
+    }
+
+    #[test]
+    fn json_string_preserves_utf8_and_canonical_escapes() {
+        let text = "λ\"\\\0\x01\x08\t\n\x0B\x0C\r\x1F🙂";
+        let json = storage_value_to_json_text(StorageValueRef::Text(text)).unwrap();
+        assert_eq!(json, r#""λ\"\\\u0000\u0001\b\t\n\u000B\f\r\u001F🙂""#);
+        assert_eq!(serde_json::from_str::<String>(&json).unwrap(), text);
     }
 
     fn finite_float_boundaries() -> [f64; 10] {

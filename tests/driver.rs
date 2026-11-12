@@ -8,7 +8,7 @@ use std::{
 
 use serde_json::Value;
 use velr::{
-    CellRef, PropertyValue, PropertyValueRef, QueryOptions, QueryParams, QueryValue,
+    CellRef, CreateOptions, PropertyValue, PropertyValueRef, QueryOptions, QueryParams, QueryValue,
     VectorEmbeddingInput, VectorEmbeddingPurpose, VectorEntityKind, Velr,
 };
 
@@ -80,6 +80,49 @@ impl Drop for TempDbPath {
         )));
         let _ = fs::remove_dir_all(PathBuf::from(format!("{}.velr-fts", self.path.display())));
     }
+}
+
+#[test]
+fn create_inline_edge_properties_and_reopen() -> velr::Result<()> {
+    let file = TempDbPath::new("inline-edge-properties");
+    let path = file.path.to_str().expect("UTF-8 test database path");
+    let options = CreateOptions::new().with_inline_edge_properties(["timestamp"]);
+    let db = match Velr::create(Some(path), options) {
+        Ok(db) => db,
+        Err(error) if error.message.contains("does not expose velr_create") => {
+            assert!(!file.path.exists());
+            let legacy = Velr::open(None)?;
+            let error = legacy.inline_edge_properties().unwrap_err();
+            assert!(error
+                .message
+                .contains("does not expose velr_inline_edge_properties_json"));
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    assert_eq!(db.inline_edge_properties()?, ["timestamp"]);
+    db.run("CREATE (:A)-[:R {timestamp: 42}]->(:B)")?;
+    drop(db);
+
+    assert!(Velr::create(Some(path), CreateOptions::new()).is_err());
+    let reopened = Velr::open_readonly(path)?;
+    assert_eq!(reopened.inline_edge_properties()?, ["timestamp"]);
+    let mut values = Vec::new();
+    let mut table = reopened.exec_one("MATCH ()-[r:R]->() RETURN r.timestamp")?;
+    table.for_each_row(|row| {
+        values.push(own_cell(&row[0]));
+        Ok(())
+    })?;
+    assert_eq!(values, [Owned::Int(42)]);
+    assert!(Velr::create(None, CreateOptions::new())?
+        .inline_edge_properties()?
+        .is_empty());
+    let invalid = CreateOptions::new().with_inline_edge_properties(["time\0stamp"]);
+    let error = Velr::create(None, invalid)
+        .err()
+        .expect("reject NUL in name");
+    assert!(error.message.contains("contains NUL"));
+    Ok(())
 }
 
 fn vector_text(input: &VectorEmbeddingInput) -> String {

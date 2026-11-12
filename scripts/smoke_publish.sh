@@ -8,12 +8,22 @@ MAX_CRATE_BYTES="${MAX_CRATE_BYTES:-10485760}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target-smoke}"
 export VELR_CACHE_DIR="${VELR_CACHE_DIR:-$CARGO_TARGET_DIR/cache}"
 
+stage="$(mktemp -d)"
+trap 'rm -rf -- "$stage"' EXIT
+cp -R runtime/linux-x86_64 runtime/macos-x86_64 runtime/windows-x86_64 "$stage/"
+linux_x86_64_runtime="$stage/linux-x86_64"
+macos_x86_64_runtime="$stage/macos-x86_64"
+windows_x86_64_runtime="$stage/windows-x86_64"
+bash scripts/pack_runtime.sh "$linux_x86_64_runtime/prebuilt" libvelrc.so
+bash scripts/pack_runtime.sh "$macos_x86_64_runtime/prebuilt" libvelrc.dylib
+bash scripts/pack_runtime.sh "$windows_x86_64_runtime/prebuilt" velrc.dll
+
 manifests=(
-  "runtime/linux-x86_64/Cargo.toml"
+  "$linux_x86_64_runtime/Cargo.toml"
   "runtime/linux-aarch64/Cargo.toml"
   "runtime/macos-aarch64/Cargo.toml"
-  "runtime/macos-x86_64/Cargo.toml"
-  "runtime/windows-x86_64/Cargo.toml"
+  "$macos_x86_64_runtime/Cargo.toml"
+  "$windows_x86_64_runtime/Cargo.toml"
 )
 
 crate_name() {

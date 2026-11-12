@@ -1,18 +1,30 @@
+//! Property lists and borrowing iterators that preserve element order and nulls.
+
+#![warn(missing_docs)]
+
 use crate::error::{DecodeError, EncodeError};
 use crate::property::{PropertyValue, PropertyValueRef};
 use crate::tag;
 use serde_json::Value;
 
+/// An owned list of property values. Typed lists use `None` for null elements; generic lists may
+/// mix types.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ListValue {
+    /// Elements with independently chosen property types, including nulls.
     Generic(Vec<PropertyValue>),
+    /// Nullable string elements.
     String(Vec<Option<String>>),
+    /// Nullable Boolean elements.
     Bool(Vec<Option<bool>>),
+    /// Nullable signed 64-bit integer elements.
     Int64(Vec<Option<i64>>),
+    /// Nullable 64-bit floating-point elements.
     Float64(Vec<Option<f64>>),
 }
 
 impl ListValue {
+    /// Returns the number of elements, including nulls where allowed.
     pub fn len(&self) -> usize {
         match self {
             Self::Generic(v) => v.len(),
@@ -23,10 +35,12 @@ impl ListValue {
         }
     }
 
+    /// Returns whether there are no elements.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Iterates elements in their original order without copying the collection.
     pub fn iter(&self) -> ListIter<'_> {
         match self {
             Self::Generic(v) => ListIter::Generic(v.iter()),
@@ -37,6 +51,8 @@ impl ListValue {
         }
     }
 
+    /// Encodes this value as a Velr value blob. Returns an error if the value cannot be
+    /// represented.
     pub fn encode_blob(&self) -> Result<Vec<u8>, EncodeError> {
         match self {
             Self::Generic(values) => {
@@ -63,6 +79,8 @@ impl ListValue {
         }
     }
 
+    /// Decodes a Velr value blob. Returns an error for malformed input or a value of a different
+    /// type.
     pub fn decode_blob(blob: &[u8]) -> Result<Self, DecodeError> {
         if blob.is_empty() {
             return Err(DecodeError::EmptyInput);
@@ -81,11 +99,17 @@ impl ListValue {
     }
 }
 
+/// An iterator over borrowed list elements in their original order, including nulls.
 pub enum ListIter<'a> {
+    /// Iterates a generic list.
     Generic(std::slice::Iter<'a, PropertyValue>),
+    /// Iterates a nullable string list.
     String(std::slice::Iter<'a, Option<String>>),
+    /// Iterates a nullable Boolean list.
     Bool(std::slice::Iter<'a, Option<bool>>),
+    /// Iterates a nullable integer list.
     Int64(std::slice::Iter<'a, Option<i64>>),
+    /// Iterates a nullable floating-point list.
     Float64(std::slice::Iter<'a, Option<f64>>),
 }
 

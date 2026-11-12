@@ -1,34 +1,45 @@
-//! Rust bindings for the Velr runtime.
+//! An openCypher-compliant embedded property-graph database.
 //!
-//! This crate exposes a high-level API over the Velr runtime ABI (loaded via the `runtime` module),
-//! wrapping raw FFI pointers in RAII types with predictable lifetimes.
+//! Velr follows openCypher query validation and error categories and supports additional
+//! Cypher features for subqueries, fulltext search, and vector search.
+//!
+//! Open an in-memory or file-backed database with [`Velr`], bind application data with
+//! [`params!`], and read results through [`TableResult`]. The native runtime is bundled for
+//! supported platforms; see the [package README](https://github.com/velr-ai/velr-rust-driver)
+//! for installation, platform support, and search examples.
+//!
+//! ```
+//! # fn main() -> velr::Result<()> {
+//! let db = velr::Velr::open(None)?;
+//! db.run_with_params("CREATE (:Person {name: $name})", velr::params! { name: "Alice" }?)?;
+//! let mut table = db.exec_one("MATCH (p:Person) RETURN p.name AS name")?;
+//! let names = table.collect(|row| match row[0] {
+//!     velr::CellRef::Text(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+//!     _ => Ok(String::new()),
+//! })?;
+//! assert_eq!(names, ["Alice"]);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Use [`Velr::run`] for writes whose results you do not need, [`Velr::exec_one`] when
+//! exactly one result table is expected, and [`Velr::exec`] for multiple statements or tables.
+//! [`VelrTx`] provides transactions and savepoints. With the default `arrow-ipc` feature,
+//! `Velr::bind_arrow` imports columnar data and `TableResult::to_arrow_ipc_file` exports it.
 //!
 //! # Threading model
 //!
-//! Velr uses a *connection-affine* model:
+//! [`Velr`] is **`Send` + `!Sync`**. Move an idle connection to another thread,
+//! or open a separate connection per thread for parallel work. Concurrent shared
+//! use of one connection is unsupported, including when it is wrapped in `Arc`.
 //!
-//! 1) [`Velr`] (the connection) is **`Send` + `!Sync`**.
-//!    - ✅ You may **move** a connection to another thread.
-//!      Example: spawn a worker thread and move the connection into it.
-//!    - ❌ Wrapping a connection in `Arc` does not make it safe to share across threads;
-//!      `Velr` is `!Sync`, so concurrent shared use is not supported.
-//!
-//! 2) In-flight / handle-based objects are **`!Send` + `!Sync`** (thread-affine):
-//!    [`ExecTables`], [`TableResult`], [`RowIter`], [`VelrTx`], [`ExecTablesTx`],
-//!    [`VelrSavepoint`], [`ExplainTrace`].
-//!    - ❌ You may not move these to another thread.
-//!    - ❌ You may not share these across threads.
-//!
-//! Practical implications:
-//! - ✅ Many connections across many threads is fine (open one connection per thread).
-//! - ✅ You can move a connection between threads (e.g., create in main, move into worker).
-//! - ❌ You cannot run concurrent operations on the same connection across threads.
-//!
-//! If you need parallelism, open multiple connections and/or use a pool.
+//! Result and transaction handles are **`!Send` + `!Sync`**:
+//! [`ExecTables`], [`TableResult`], [`RowIter`], [`VelrTx`], [`ExecTablesTx`],
+//! [`VelrSavepoint`], and [`ExplainTrace`]. Keep these handles on their creating thread.
 //!
 //! # Results and lifetimes
 //!
-//! Queries can produce **zero or more result tables**:
+//! Queries produce **zero or more result tables**:
 //! - [`Velr::exec`] / [`VelrTx::exec`] stream tables via [`ExecTables`] / [`ExecTablesTx`].
 //! - [`Velr::exec_one`] / [`VelrTx::exec_one`] return a single [`TableResult`].
 //!
@@ -40,10 +51,9 @@
 //!
 //! # Bounded result previews
 //!
-//! Hosts that need projected column names plus a small sample can use [`QueryOptions`] with
+//! For projected column names and a small sample, use [`QueryOptions`] with
 //! [`Velr::exec_with_options`], [`Velr::exec_one_with_options`], or [`Velr::run_with_options`].
-//! The row cap is enforced by Velr while emitting result rows; the driver does not rewrite the
-//! Cypher text.
+//! The row cap limits the number of rows returned from each result table.
 //!
 //! ```
 //! # use velr::{QueryOptions, Velr};
@@ -61,7 +71,7 @@
 //! # }
 //! ```
 //!
-//! Existing Cypher `LIMIT` clauses still apply. For example, `LIMIT 3` with
+//! Existing Cypher `LIMIT` clauses apply. For example, `LIMIT 3` with
 //! `QueryOptions::max_result_rows(5)` emits at most three rows, while `LIMIT 10` with the same
 //! option emits at most five rows. Use `QueryOptions::max_result_rows(0)` when you want result
 //! table metadata, including column names, without materializing any rows.
@@ -96,14 +106,22 @@
 //! # Errors
 //!
 //! Most operations return [`Result<T>`]. On failure, you get an [`Error`] containing a numeric
-//! code (originating from the runtime ABI) and an optional message.
+//! API status code and a human-readable message. Cypher diagnostics identify the error
+//! category, such as `SyntaxError`, `TypeError`, `ArgumentError`, or `ParameterMissing`,
+//! and its compile-time or runtime phase, followed by an explanation. Diagnostic wording can
+//! include query locations and guidance for correcting the query.
+//!
+//! Parameter construction can return
+//! [`QueryParamError`], which converts to [`Error`] when using `?` in a [`Result`].
+//! Execution can fail when starting a query, advancing tables, or fetching rows; propagate errors
+//! at every stage. Callback errors from row iteration are returned to the caller unchanged.
+//! A runtime error can be reported before a result table is returned: the phase describes the
+//! Cypher error, rather than which driver call reports it.
 //!
 //! # Schema migration and introspection
 //!
-//! This runtime's current on-disk schema is version 9. Supported older databases can be opened
-//! without automatic migration. Reads remain available on those databases, but writes and
-//! features that require the current schema return a query error until the user explicitly
-//! migrates. `SHOW CURRENT GRAPH SHAPE` is available once a database has reached schema version 5.
+//! The bundled runtime creates databases at schema version 11. Databases at schema versions
+//! 3 through 9 require an explicit migration before graph queries can run.
 //!
 //! Use [`Velr::schema_version`], [`Velr::current_schema_version`], and
 //! [`Velr::needs_migration`] to inspect the connection state. Use [`Velr::migrate`] or execute
@@ -115,13 +133,13 @@
 //! properties, observed value types, and counts. Use `YIELD` to compose it with `WHERE` and
 //! `RETURN`, or `YIELD *` to inspect the full row shape.
 //!
-//! Fulltext search is also available through normal Cypher execution. Use `CREATE FULLTEXT INDEX`
-//! to define an index and `CALL db.index.fulltext.queryNodes(...)` to search it. For file-backed
+//! Create a fulltext index with `CREATE FULLTEXT INDEX` and search it with
+//! `CALL db.index.fulltext.queryNodes(...)`. For file-backed
 //! databases, Velr repairs missing or corrupt fulltext index data automatically when the database
 //! is opened. The query grammar supports terms, phrases, field scoping, boolean grouping,
 //! required/excluded terms, phrase slop, phrase-prefix, boosts, and `*` match-all. `score` is a
-//! non-normalized relevance score. Higher scores are better within a single query result set;
-//! scores are not guaranteed to be in `0..1` or comparable across different queries.
+//! unnormalized, query-specific relevance score. Higher scores rank results higher;
+//! compare scores within the same query's result set.
 //!
 //! # Vector search
 //!
@@ -132,11 +150,11 @@
 //!   `CALL db.index.vector.queryNodes(...)`.
 //! - Embedder-backed vectors: `CREATE VECTOR INDEX paperEmbedding FOR (n:Paper) ON EACH
 //!   [n.title, n.abstract] OPTIONS { indexConfig: { embedder: 'text', dimensions: 384 } }`
-//!   uses a callback registered with [`Velr::register_vector_embedder`]. Queries may pass text
-//!   payloads, which Velr sends to the same registered embedder.
+//!   uses a callback registered with [`Velr::register_vector_embedder`]. Pass text query
+//!   payloads to the same registered embedder.
 //!
-//! For file-backed databases, Velr can repair missing or corrupt vector index data from stored
-//! vector properties or from registered embedders, depending on how the index was created.
+//! For file-backed databases, Velr repairs missing or corrupt vector index data using stored
+//! vector properties or registered embedders, according to the index configuration.
 //!
 //! `OPTIONS { indexConfig: ... }` configures Velr vector indexes. Prefer the Neo4j-style names
 //! where they exist; shorter aliases are accepted for existing queries and examples.
@@ -153,9 +171,9 @@
 //! `` `vector.hnsw.ef_construction` `` (`1..3200` build candidates per inserted vector), and
 //! `` `vector.hnsw.ef_search` `` (`1..3200` query candidates) for graph traversal. Higher values
 //! can improve recall, usually with more memory, larger index files, slower builds, or slower
-//! queries. Velr's default query-time candidate pool is `64`. Velr manages the vector scalar
-//! format and storage/cache engines internally.
+//! queries. Velr's default query-time candidate pool is `64`.
 #![allow(unsafe_code)]
+#![warn(missing_docs)]
 
 mod api;
 mod runtime;
@@ -179,6 +197,7 @@ use serde_json::Value as JsonValue;
 use sys as ffi;
 use velr_types::{decode_property_value, StorageValueRef};
 
+/// Typed temporal, spatial, vector, and list values used by embedding callbacks and applications.
 pub use velr_types::{
     DateValue, DurationValue, GeographyValue, GeometryShape, GeometryValue, LineStringValue,
     LinearRingValue, ListIter, ListValue, LocalDateTimeValue, LocalTimeValue, PointValue,
@@ -191,13 +210,28 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Error returned by the Velr API.
 ///
-/// - `code` is an integer error code returned by the runtime ABI. This is subject for change later.
-/// - `message` is an optional, human-readable message (may be empty).
+/// [`Self::code`] describes the API failure, such as an invalid argument or execution
+/// failure. [`Self::message`] contains its human-readable description, or an empty string
+/// when no description is supplied. Cypher diagnostics identify the error category
+/// and compile-time or runtime phase, with an explanation of the problem.
 ///
-/// The runtime may or may not provide an error message for a given code.
+/// Query errors can be returned when starting execution, advancing result tables, or
+/// fetching rows. The Cypher phase is independent of which operation returns the error.
+///
+/// Cypher categories include `SyntaxError` for invalid query syntax or static validation,
+/// `TypeError` for incompatible value types, `ArgumentError` for arguments outside an
+/// operation's domain, `ParameterMissing` for an unbound parameter, `ArithmeticError` for
+/// undefined arithmetic or overflow, `EntityNotFound` for access to a deleted graph entity,
+/// `ConstraintVerificationFailed` for a graph constraint violation, and `SemanticError`
+/// for a graph semantic rule violation.
 #[derive(Debug)]
 pub struct Error {
+    /// Numeric API status code; distinct from the Cypher error category in the message.
     pub code: i32,
+    /// Human-readable diagnostic, including the category and phase for Cypher errors.
+    ///
+    /// Other API failures can have an empty message. Diagnostic wording can change;
+    /// preserve the full message when displaying or logging a failure.
     pub message: String,
 }
 
@@ -261,6 +295,13 @@ pub struct QueryParams {
 }
 
 /// Error returned while constructing or binding query parameters.
+///
+/// Parameter names must be non-empty and omit the leading `$`; values must fit their
+/// Cypher types, including signed 64-bit integers and finite floating-point numbers.
+/// Display this error to obtain its diagnostic, or convert it into [`Error`] with `?`.
+///
+/// A parameter referenced in a query but absent from [`QueryParams`] is reported during
+/// query execution as [`Error`] with a `ParameterMissing` diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryParamError {
     message: String,
@@ -296,6 +337,11 @@ impl From<QueryParamError> for Error {
 /// `&str`, `Vec<T>`, `BTreeMap<String, T>`, `HashMap<String, T>`, and `serde_json::Value`.
 pub trait TryIntoQueryValue {
     /// Convert this Rust value into a Cypher parameter value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryParamError`] for integers outside the signed 64-bit range,
+    /// non-finite floats, or invalid values nested inside lists and maps.
     fn try_into_query_value(self) -> std::result::Result<QueryValue, QueryParamError>;
 }
 
@@ -307,7 +353,11 @@ impl QueryParams {
 
     /// Return a new parameter map with one additional named value.
     ///
-    /// The name must be non-empty and should not include the leading `$` used in Cypher text.
+    /// Replaces an existing value with the same name. The name must be non-empty
+    /// and must not include the leading `$` used in Cypher text.
+    ///
+    /// # Errors
+    ///
     /// Returns [`QueryParamError`] if the name or value cannot be represented as a Cypher
     /// parameter value.
     pub fn with<V>(
@@ -324,7 +374,11 @@ impl QueryParams {
 
     /// Insert or replace one named value.
     ///
-    /// The name must be non-empty and should not include the leading `$` used in Cypher text.
+    /// The name must be non-empty and must not include the leading `$` used in Cypher text.
+    /// A validation error leaves the existing map unchanged.
+    ///
+    /// # Errors
+    ///
     /// Returns [`QueryParamError`] if the name or value cannot be represented as a Cypher
     /// parameter value.
     pub fn insert<V>(
@@ -694,10 +748,10 @@ fn require_runtime_symbol<T: Copy>(symbol: Option<T>, name: &str) -> Result<T> {
 ///
 /// Use this type with [`Velr::exec_with_options`], [`Velr::exec_one_with_options`],
 /// [`Velr::run_with_options`], and the matching [`VelrTx`] methods when a host wants to preview
-/// a query result without rewriting the Cypher text.
+/// a query result.
 ///
-/// The options affect result emission only. They do not make a query read-only and they are not a
-/// timeout or cancellation mechanism.
+/// Parameters supply query data, and row caps affect result emission. A cap does
+/// not make a query read-only and is not a timeout or cancellation mechanism.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct QueryOptions {
@@ -745,6 +799,8 @@ impl QueryOptions {
     }
 
     /// Set the full parameter map for this query.
+    ///
+    /// Replaces all parameters previously added to these options. The row cap is unchanged.
     pub fn with_params(mut self, params: QueryParams) -> Self {
         self.params = params;
         self
@@ -752,7 +808,13 @@ impl QueryOptions {
 
     /// Add one named parameter to this query.
     ///
-    /// The name should not include the leading `$` used in Cypher text.
+    /// Replaces an existing parameter with the same name. The name must be nonempty
+    /// and must not include the leading `$` used in Cypher text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryParamError`] when the name or value fails [`QueryParams::insert`]
+    /// validation.
     pub fn with_param<V>(
         mut self,
         name: impl Into<String>,
@@ -1633,7 +1695,7 @@ pub struct MigrationReport {
     pub to_version: i32,
     /// Whether migration work was applied.
     pub status: MigrationStatus,
-    /// Runtime migration step identifiers applied in order.
+    /// Migration step identifiers applied in order, for diagnostics.
     pub steps: Vec<String>,
 }
 
@@ -1653,7 +1715,9 @@ pub enum VectorEmbeddingPurpose {
 /// Graph entity kind for indexed vector embedding inputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VectorEntityKind {
+    /// A node whose indexed properties are being embedded.
     Node,
+    /// A relationship whose indexed properties are being embedded.
     Relationship,
 }
 
@@ -1683,14 +1747,25 @@ pub struct VectorEmbeddingField {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct VectorEmbeddingInput {
+    /// Name of the vector index requesting the embedding.
     pub index_name: String,
+    /// Required number of finite components in the returned vector.
     pub dimensions: usize,
+    /// Whether this input describes indexed data or a search query.
     pub purpose: VectorEmbeddingPurpose,
+    /// Indexed entity kind; absent for query payloads.
     pub entity_kind: Option<VectorEntityKind>,
+    /// Velr entity identity for indexed data; absent for query payloads.
     pub entity_id: Option<i64>,
+    /// Values to embed, in the order described by [`VectorEmbeddingInput`].
     pub fields: Vec<VectorEmbeddingField>,
 }
 
+/// Result returned by an embedding callback.
+///
+/// On success, return one vector for each input in the same order. Each vector must
+/// have the input's requested dimensions and contain only finite values. Return
+/// `Err(message)` to fail the database operation with an application error message.
 pub type VectorEmbeddingBatchResult = std::result::Result<Vec<Vec<f32>>, String>;
 
 /// Get a reference to the loaded runtime API.
@@ -2027,52 +2102,74 @@ where
 /// Owned plan metadata returned from an [`ExplainTrace`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainPlanMeta {
+    /// Identifier for this plan within its trace; treat it as an opaque string.
     pub plan_id: String,
+    /// Cypher text associated with the plan.
     pub cypher: String,
+    /// Number of steps available through [`ExplainTrace::step_meta`].
     pub step_count: usize,
 }
 
 /// Owned step metadata returned from an [`ExplainTrace`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainStepMeta {
+    /// Step number reported by the trace.
     pub step_no: usize,
+    /// Opaque grouping identifier for related operations.
     pub group_id: String,
+    /// Operation identifier as displayed by the explain trace.
     pub op_index: String,
+    /// Execution phase label for display and diagnostics.
     pub phase: String,
+    /// Human-readable step title.
     pub title: String,
+    /// Source description associated with the step.
     pub source: String,
+    /// Additional explanation when one is available.
     pub note: Option<String>,
+    /// Number of statements available through [`ExplainTrace::statement_meta`].
     pub statement_count: usize,
 }
 
 /// Owned statement metadata returned from an [`ExplainTrace`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainStatementMeta {
+    /// Identifier for this statement within the trace.
     pub stmt_id: String,
+    /// Statement kind reported by the runtime, intended for diagnostics.
     pub kind: String,
+    /// Generated SQL text, when present, for inspecting query behavior.
     pub sql: String,
+    /// Additional explanation when one is available.
     pub note: Option<String>,
+    /// Number of query-plan detail lines available for this statement.
     pub sqlite_plan_count: usize,
 }
 
 /// One explain statement plus its SQLite query-plan detail lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainStatement {
+    /// Owned statement metadata.
     pub meta: ExplainStatementMeta,
+    /// Query-plan detail lines in their reported order.
     pub sqlite_plan: Vec<String>,
 }
 
 /// One explain step plus all statements in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainStep {
+    /// Owned step metadata.
     pub meta: ExplainStepMeta,
+    /// Statements belonging to the step, in execution order.
     pub statements: Vec<ExplainStatement>,
 }
 
 /// One explain plan plus all steps in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainPlan {
+    /// Owned top-level plan metadata.
     pub meta: ExplainPlanMeta,
+    /// Steps belonging to the plan, in their reported order.
     pub steps: Vec<ExplainStep>,
 }
 
@@ -2082,6 +2179,8 @@ pub struct ExplainPlan {
 /// Dropping it closes the underlying runtime trace handle.
 ///
 /// All strings exposed by this type are copied into owned Rust `String`s before being returned.
+/// Accessor indexes are zero-based. Use display labels and generated SQL for
+/// diagnostics; application query logic should use query results.
 pub struct ExplainTrace {
     trace: NonNull<ffi::velr_explain_trace>,
     _nosend: PhantomData<Rc<()>>, // !Send + !Sync
@@ -2325,7 +2424,7 @@ impl ExplainTrace {
     /// Materialize the entire trace into owned Rust structs.
     ///
     /// This walks all plans, steps, statements, and SQLite plan details and returns
-    /// a fully owned snapshot detached from the borrowed runtime string views.
+    /// a fully owned snapshot that remains usable after this trace is dropped.
     ///
     /// # Errors
     ///
@@ -2394,7 +2493,7 @@ impl ExplainTrace {
     /// Returns an [`Error`] if:
     /// - the runtime API cannot be loaded
     /// - the runtime fails to render the compact form
-    /// - the runtime returns an invalid null/non-null pointer + length combination
+    /// - the rendered trace cannot be read
     pub fn to_compact_bytes(&self) -> Result<Vec<u8>> {
         let a = velr_api()?;
         let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -2460,11 +2559,18 @@ impl Drop for ExplainTrace {
 /// - JSON is returned as raw bytes
 #[derive(Debug, Copy, Clone)]
 pub enum CellRef<'a> {
+    /// The Cypher `null` value.
     Null,
+    /// A boolean value.
     Bool(bool),
+    /// A signed 64-bit integer value.
     Integer(i64),
+    /// A floating-point value.
     Float(f64),
+    /// Borrowed string bytes. Copy them inside the row callback to retain the value.
     Text(&'a [u8]),
+    /// Borrowed JSON for a structured value, such as a list, map, node, or path.
+    /// Parse or copy the bytes inside the row callback to retain the value.
     Json(&'a [u8]),
 }
 
@@ -2475,6 +2581,10 @@ impl<'a> CellRef<'a> {
     /// - `Some(Ok(&str))` if the cell is text and valid UTF-8
     /// - `Some(Err(_))` if the cell is text but invalid UTF-8
     /// - `None` if the cell is not text
+    ///
+    /// # Errors
+    ///
+    /// The inner result contains [`std::str::Utf8Error`] when text bytes are not UTF-8.
     pub fn as_str_utf8(&self) -> Option<std::result::Result<&'a str, std::str::Utf8Error>> {
         match self {
             CellRef::Text(b) => Some(std::str::from_utf8(b)),
@@ -2488,6 +2598,53 @@ impl<'a> CellRef<'a> {
 // Velr is Send + !Sync (movable, not shareable).
 //
 
+/// Options for creating a database with [`Velr::create`].
+///
+/// The default configures no inline relationship properties. Options apply to the
+/// new database and persist when it is reopened.
+#[derive(Debug, Clone, Default)]
+pub struct CreateOptions {
+    inline_edge_properties: Vec<String>,
+}
+
+impl CreateOptions {
+    /// Create options with no inline relationship properties.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Choose the relationship property name whose eligible values to store inline.
+    ///
+    /// This replaces any previous list. Supply zero or one case-sensitive,
+    /// nonempty name. Names may not contain NUL bytes. [`Velr::create`] validates
+    /// the list before creating the database.
+    ///
+    /// The choice applies across all relationship types. Eligible values include
+    /// integers, floating-point numbers, and strings up to 128 UTF-8 bytes. Values
+    /// that exceed the inline size limit remain accessible through the same
+    /// property name. Use ordinary Cypher `CREATE`, `SET`, and property reads
+    /// regardless of value size.
+    pub fn with_inline_edge_properties<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inline_edge_properties = names.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// A connection to an in-memory or file-backed Velr database.
+///
+/// Dropping the connection closes it. Finish result streams, transactions, and
+/// row processing before closing or moving the connection. A connection is
+/// [`Send`] but not [`Sync`]: move it between threads when idle, or open separate
+/// connections for work on different threads. Returned handles remain on the
+/// thread where they were created.
+///
+/// Create with [`Velr::create`], or open with [`Velr::open`] or [`Velr::open_readonly`].
+/// Supported older databases require an explicit migration. See
+/// [`Velr::needs_migration`] and [`Velr::migrate`].
 pub struct Velr {
     db: NonNull<ffi::velr_db>,
     _not_sync: PhantomData<Cell<()>>, // Send + !Sync
@@ -2496,6 +2653,67 @@ pub struct Velr {
 unsafe impl Send for Velr {}
 
 impl Velr {
+    /// Create a new database and return a writable connection.
+    ///
+    /// Use `None` or `Some(":memory:")` for an in-memory database. Any other path
+    /// must name a file that does not exist. The inline relationship property
+    /// selection is fixed at creation and persists when the database is reopened.
+    /// Use [`Self::open`] or [`Self::open_readonly`] to reopen an existing file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the path exists, the path or options are invalid,
+    /// creation fails, or the loaded runtime lacks the creation API.
+    pub fn create(path: Option<&str>, options: CreateOptions) -> Result<Self> {
+        let a = velr_api()?;
+        let create = require_runtime_symbol(a.velr_create, "velr_create")?;
+
+        let path = path
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "path contains NUL"))?;
+        let names = options
+            .inline_edge_properties
+            .into_iter()
+            .map(CString::new)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| {
+                Error::new(
+                    ffi::velr_code::VELR_EUTF as i32,
+                    "inline relationship property name contains NUL",
+                )
+            })?;
+        let name_ptrs: Vec<_> = names.iter().map(|name| name.as_ptr()).collect();
+        let names_pointer = if name_ptrs.is_empty() {
+            std::ptr::null()
+        } else {
+            name_ptrs.as_ptr()
+        };
+        let mut out_db = std::ptr::null_mut();
+        let mut err = std::ptr::null_mut();
+        let rc = unsafe {
+            create(
+                path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                names_pointer,
+                name_ptrs.len(),
+                &mut out_db,
+                &mut err,
+            )
+        };
+        rc_to_result(rc, err)?;
+
+        let db = NonNull::new(out_db).ok_or_else(|| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "velr_create returned null db",
+            )
+        })?;
+        Ok(Self {
+            db,
+            _not_sync: PhantomData,
+        })
+    }
+
     /// Open a Velr connection.
     ///
     /// ## Path semantics
@@ -2547,14 +2765,14 @@ impl Velr {
     /// Velr schema version. Use this for viewers, agents, and other read paths
     /// that should not perform schema DDL.
     ///
-    /// Supported older databases remain readable. Mutating queries and features
-    /// that require the current schema version are unavailable until the
-    /// database is opened read-write and explicitly migrated. `SHOW CURRENT
-    /// GRAPH SHAPE` is available once a database has reached schema version 5.
-    /// Use [`Velr::migrate`] or `MIGRATE DATABASE` to apply pending migrations.
+    /// With the bundled runtime, migrate older databases on a writable connection
+    /// and reopen the read-only connection before querying. Use [`Velr::migrate`]
+    /// or `MIGRATE DATABASE` to apply pending migrations.
     ///
-    /// If the loaded native runtime is older and does not expose the underlying
-    /// C ABI symbol, this returns an error.
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the path contains a NUL byte, the file is missing,
+    /// unreadable, or incompatible, or the loaded runtime lacks read-only opening.
     pub fn open_readonly(path: &str) -> Result<Self> {
         let a = velr_api()?;
         let open_readonly = a.velr_open_existing_readonly.ok_or_else(|| {
@@ -2585,7 +2803,53 @@ impl Velr {
         })
     }
 
-    /// Return the schema version cached by this connection.
+    /// Return the database's inline relationship property names in configured order.
+    ///
+    /// The selection is available after reopening the database, including on a
+    /// read-only connection. Returns an empty list if no name is configured. The
+    /// returned strings belong to the caller and can outlive the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the runtime cannot report the configuration or lacks
+    /// the getter.
+    pub fn inline_edge_properties(&self) -> Result<Vec<String>> {
+        let a = velr_api()?;
+        let get_names = require_runtime_symbol(
+            a.velr_inline_edge_properties_json,
+            "velr_inline_edge_properties_json",
+        )?;
+        let mut json = std::ptr::null_mut();
+        let mut err = std::ptr::null_mut();
+        let rc = unsafe { get_names(self.db.as_ptr(), &mut json, &mut err) };
+        rc_to_result(rc, err)?;
+        if json.is_null() {
+            return Err(Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                "velr_inline_edge_properties_json returned null JSON",
+            ));
+        }
+        let names = unsafe {
+            let names = serde_json::from_slice(CStr::from_ptr(json).to_bytes());
+            (a.velr_string_free)(json);
+            names
+        };
+        names.map_err(|error| {
+            Error::new(
+                ffi::velr_code::VELR_EERR as i32,
+                format!("invalid inline relationship property list: {error}"),
+            )
+        })
+    }
+
+    /// Return the database schema version reported by this connection.
+    ///
+    /// Compare with [`Velr::current_schema_version`] or use [`Velr::needs_migration`]
+    /// before requesting an explicit migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the runtime cannot report the schema version.
     pub fn schema_version(&self) -> Result<i32> {
         let a = velr_api()?;
         let schema_version = require_runtime_symbol(a.velr_schema_version, "velr_schema_version")?;
@@ -2598,6 +2862,14 @@ impl Velr {
     }
 
     /// Return live bytes currently owned by SQLite's TEMP database.
+    ///
+    /// Use this diagnostic to observe temporary storage used by this connection.
+    /// It does not measure the database file size or total process memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the loaded runtime lacks this diagnostic or cannot
+    /// read the temporary-storage usage.
     pub fn temp_storage_bytes(&self) -> Result<u64> {
         let a = velr_api()?;
         let temp_storage_bytes =
@@ -2610,6 +2882,10 @@ impl Velr {
     }
 
     /// Return the current schema version supported by this runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the runtime cannot report its schema version.
     pub fn current_schema_version(&self) -> Result<i32> {
         let a = velr_api()?;
         let current_schema_version =
@@ -2624,8 +2900,12 @@ impl Velr {
 
     /// Return true when this connection is on an older supported schema version.
     ///
-    /// Older supported databases can be read, but mutating queries are rejected
-    /// until the database is explicitly migrated to the current schema version.
+    /// With the bundled runtime, migrate the database before running graph queries
+    /// when this method returns `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the runtime cannot inspect migration status.
     pub fn needs_migration(&self) -> Result<bool> {
         let a = velr_api()?;
         let needs_migration =
@@ -2644,7 +2924,13 @@ impl Velr {
     /// or run `MIGRATE DATABASE`, when maintenance code intentionally wants to
     /// apply the pending schema migration.
     ///
-    /// Migration must be performed on a read-write connection.
+    /// Migration must be performed on a read-write connection outside an active
+    /// transaction. An already-current database returns [`MigrationStatus::AlreadyCurrent`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the connection is read-only, migration is unavailable
+    /// or cannot run in the current state, or a migration operation fails.
     pub fn migrate(&self) -> Result<MigrationReport> {
         let a = velr_api()?;
         let migrate = require_runtime_symbol(a.velr_migrate, "velr_migrate")?;
@@ -2703,6 +2989,11 @@ impl Velr {
     /// This is an explicit maintenance operation for file-backed databases
     /// after large deletes or prune operations. It must run on a writable
     /// current-schema connection outside any open transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if those requirements are not met, the runtime lacks
+    /// this operation, or compaction fails, for example because of an I/O error.
     pub fn vacuum(&self) -> Result<()> {
         let a = velr_api()?;
         let vacuum = require_runtime_symbol(a.velr_vacuum, "velr_vacuum")?;
@@ -2733,6 +3024,15 @@ impl Velr {
     /// callbacks must be `Send`; callbacks are still invoked serially by the
     /// connection that owns the operation.
     ///
+    /// The callback is owned by the connection. Use the same preprocessing and model
+    /// for indexing and querying. Returning `Err(message)` fails the invoking operation;
+    /// callback panics are also reported as errors instead of unwinding through Velr.
+    ///
+    /// # Errors
+    ///
+    /// Registration returns an [`Error`] for an empty or whitespace-only name or
+    /// a runtime registration failure. Later operations can fail if the callback
+    /// returns an error, a wrong number of vectors, incorrect dimensions, or non-finite values.
     pub fn register_vector_embedder<F>(&self, name: &str, embedder: F) -> Result<()>
     where
         F: Fn(&[VectorEmbeddingInput]) -> VectorEmbeddingBatchResult + Send + 'static,
@@ -2805,8 +3105,8 @@ impl Velr {
 
     /// Execute `openCypher` with out-of-band result emission options.
     ///
-    /// Use this when a host wants result metadata and a bounded row preview without rewriting the
-    /// Cypher text. [`QueryOptions::max_result_rows`] caps rows emitted from each result table.
+    /// Use this for result metadata and a bounded row preview.
+    /// [`QueryOptions::max_result_rows`] caps rows emitted from each result table.
     /// Existing Cypher `LIMIT` clauses still apply, so the effective emitted row count is bounded
     /// by both the query and the option.
     ///
@@ -2927,7 +3227,11 @@ impl Velr {
 
     /// Execute a query and discard all results.
     ///
-    /// This uses the runtime's direct run ABI and does not materialize result tables.
+    /// Use this for writes or other statements whose rows you do not need.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for a NUL byte in `cypher`, a query error, or a runtime failure.
     pub fn run(&self, cypher: &str) -> Result<()> {
         let a = velr_api()?;
         let cy = CString::new(cypher)
@@ -2962,6 +3266,11 @@ impl Velr {
     ///
     /// This is a convenience wrapper around [`Velr::exec_with_options`] for the common case where
     /// only parameters are needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Velr::exec_with_options`], including invalid
+    /// or missing parameters. Execution errors may also occur while reading results.
     pub fn exec_with_params<'db>(
         &'db self,
         cypher: &str,
@@ -2974,6 +3283,11 @@ impl Velr {
     ///
     /// This is a convenience wrapper around [`Velr::exec_one_with_options`] for the common case
     /// where only parameters are needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Velr::exec_one_with_options`], including invalid
+    /// or missing parameters and zero or multiple result tables.
     pub fn exec_one_with_params(&self, cypher: &str, params: QueryParams) -> Result<TableResult> {
         self.exec_one_with_options(cypher, QueryOptions::new().with_params(params))
     }
@@ -2982,6 +3296,11 @@ impl Velr {
     ///
     /// This is a convenience wrapper around [`Velr::run_with_options`] for the common case where
     /// only parameters are needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Velr::run_with_options`], including invalid
+    /// or missing parameters.
     pub fn run_with_params(&self, cypher: &str, params: QueryParams) -> Result<()> {
         self.run_with_options(cypher, QueryOptions::new().with_params(params))
     }
@@ -3008,8 +3327,14 @@ impl Velr {
         ExplainTrace::from_raw(out_trace)
     }
 
-    /// Build an EXPLAIN trace using the exact parameterized planning path used
-    /// by [`Velr::exec_with_params`].
+    /// Explain a query with bound parameters without executing it.
+    ///
+    /// Use the same `params` as [`Velr::exec_with_params`] to inspect that query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for invalid query text or parameters, a planning error,
+    /// or a loaded runtime that does not support parameterized explain.
     pub fn explain_with_params(&self, cypher: &str, params: QueryParams) -> Result<ExplainTrace> {
         let a = velr_api()?;
         let explain_with_params =
@@ -3035,6 +3360,10 @@ impl Velr {
 
     /// Build an EXPLAIN ANALYZE trace for `openCypher`.
     ///
+    /// This executes the query, including its writes. Use [`Velr::explain`] when
+    /// execution is not intended, or [`VelrTx::explain_analyze`] inside a transaction
+    /// that you can roll back.
+    ///
     /// # Errors
     ///
     /// Returns an [`Error`] if:
@@ -3058,12 +3387,15 @@ impl Velr {
 
     /// Begin a transaction.
     ///
-    /// The transaction handle is closed automatically on drop. To explicitly finalize a
-    /// transaction, use [`VelrTx::commit`] or [`VelrTx::rollback`].
-    /// Begin a transaction.
+    /// The returned transaction borrows the connection and rolls back on drop.
+    /// Use [`VelrTx::commit`] to persist changes or [`VelrTx::rollback`] to undo them.
+    /// Execute transaction work through that handle. For nested units of work,
+    /// create savepoints rather than starting another transaction on the connection.
     ///
-    /// The transaction handle is closed automatically on drop. To explicitly finalize a
-    /// transaction, use [`VelrTx::commit`] or [`VelrTx::rollback`].
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if a transaction is already active or the runtime cannot
+    /// begin one, for example because the database is busy.
     pub fn begin_tx(&self) -> Result<VelrTx<'_>> {
         let a = velr_api()?;
 
@@ -3088,12 +3420,19 @@ impl Velr {
         })
     }
 
-    /// Bind Arrow arrays (Arrow C Data Interface) to a logical name.
+    /// Bind Arrow columns to a name used by `UNWIND BIND('name') AS row`.
     ///
     /// Available only when built with the `arrow-ipc` feature.
     ///
-    /// This transfers ownership of the provided Arrow arrays into Velr for the lifetime of the bind.
-    /// (At the ABI level, the ArrowArray structs are consumed during the call.)
+    /// Pass one array for each entry in `col_names`, in the same order. All arrays
+    /// must have the same row count. This method takes ownership of `arrays`, so
+    /// the caller does not need to keep their buffers alive after it returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if there are no columns, array and name counts differ,
+    /// `logical` contains a NUL byte, array lengths or types are unsupported, or
+    /// the runtime rejects the binding.
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow(
         &self,
@@ -3110,6 +3449,12 @@ impl Velr {
     ///
     /// The IPC byte slice is borrowed only for the duration of the call. Velr decodes the IPC file
     /// and owns the resulting Arrow arrays before this returns.
+    /// Consume the bound rows with `UNWIND BIND('name') AS row`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if `logical` contains a NUL byte, `ipc_file` is empty
+    /// or is not a supported Arrow IPC file, or the runtime rejects the binding.
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow_ipc(&self, logical: &str, ipc_file: &[u8]) -> Result<()> {
         arrow_bind::bind_arrow_ipc_db(self.db.as_ptr(), logical, ipc_file)
@@ -3119,11 +3464,16 @@ impl Velr {
     ///
     /// Available only when built with the `arrow-ipc` feature.
     ///
-    /// This transfers ownership of the provided Arrow arrays into Velr for the lifetime of the bind.
-    /// (At the ABI level, the ArrowArray structs are consumed during the call.)
+    /// Supply one nonempty chunk vector for each entry in `col_names`. All columns
+    /// must have the same total row count, but their chunk boundaries may differ.
+    /// The arrays are consumed; their buffers need not be retained by the caller.
+    /// Use `UNWIND BIND('name') AS row` to read the bound columns.
     ///
-    /// All columns must have the same total row count (sum of chunk lengths); otherwise the bind
-    /// returns an error.
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if names and column counts differ, a column has no
+    /// chunks, row counts or types are incompatible, `logical` contains a NUL byte,
+    /// or the runtime rejects the binding.
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow_chunks(
         &self,
@@ -3151,7 +3501,9 @@ impl Drop for Velr {
 /// This is an *in-flight* type and is **`!Send` + `!Sync`** (thread-affine).
 ///
 /// Use [`ExecTables::next_table`] to pull result tables sequentially. Dropping this value will
-/// close the underlying execution stream
+/// close the execution stream. It borrows the connection for its lifetime.
+/// Fully process each table before requesting the next one. Query errors can be
+/// reported while advancing tables or fetching rows, after the initial call succeeds.
 pub struct ExecTables<'db> {
     stream: Option<NonNull<ffi::velr_stream>>,
     _db: PhantomData<&'db Velr>,
@@ -3215,6 +3567,9 @@ impl Drop for ExecTables<'_> {
 /// - column metadata (names and count)
 /// - row iteration via [`TableResult::rows`], [`TableResult::for_each_row`], or [`TableResult::collect`]
 ///
+/// Dropping the table closes its result handle. Complete row processing while the
+/// connection and any transaction that produced the table are still active.
+/// Copy borrowed string/JSON cells when retaining values outside the row callback.
 pub struct TableResult {
     table: NonNull<ffi::velr_table>,
     col_names: Vec<String>,
@@ -3342,6 +3697,11 @@ impl TableResult {
     ///
     /// The callback receives a slice of [`CellRef`] representing the row’s cells.
     /// The borrow is scoped to the callback invocation (and remains valid until the next row is fetched).
+    /// Return an error from the callback to stop iteration immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns cursor-opening or row-fetch errors, or the callback's own error.
     pub fn for_each_row<F>(&mut self, mut on_row: F) -> Result<()>
     where
         F: for<'row> FnMut(&[CellRef<'row>]) -> Result<()>,
@@ -3354,6 +3714,13 @@ impl TableResult {
     /// Map each row to a value and collect into a vector.
     ///
     /// This is a convenience wrapper around [`TableResult::for_each_row`].
+    /// Values returned by `map` must own any text or JSON copied from the row;
+    /// borrowed cells cannot escape the callback. All mapped values are retained
+    /// in memory, so use [`TableResult::for_each_row`] for large results.
+    ///
+    /// # Errors
+    ///
+    /// Returns cursor-opening or row-fetch errors, or the first error from `map`.
     pub fn collect<T, F>(&mut self, mut map: F) -> Result<Vec<T>>
     where
         F: for<'row> FnMut(&[CellRef<'row>]) -> Result<T>,
@@ -3371,6 +3738,13 @@ impl TableResult {
     /// Available only when built with the `arrow-ipc` feature.
     ///
     /// Returns the IPC file bytes produced by the runtime.
+    /// The returned buffer is owned and can be written to a file or passed to an
+    /// Arrow reader without retaining this table. Export may read the entire result
+    /// and allocate memory proportional to its size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if row reading, Arrow conversion, or IPC encoding fails.
     #[cfg(feature = "arrow-ipc")]
     pub fn to_arrow_ipc_file(&mut self) -> Result<Vec<u8>> {
         let a = velr_api()?;
@@ -3422,10 +3796,13 @@ impl<'t> RowIter<'t> {
     ///
     /// For `CellRef::Text` and `CellRef::Json`, the returned byte slices remain valid until the next
     /// call to [`RowIter::next`] on the same iterator (or until the iterator is dropped).
+    /// Safe Rust confines those borrows to the callback. Copy the bytes to keep
+    /// them; return `Err` from the callback to stop processing.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if the runtime reports an error while advancing.
+    /// Returns an [`Error`] if the runtime reports an error while advancing, or
+    /// returns the callback's error unchanged.
     pub fn next<F>(&mut self, on_row: F) -> Result<bool>
     where
         F: for<'row> FnOnce(&[CellRef<'row>]) -> Result<()>,
@@ -3544,6 +3921,9 @@ struct NamedSavepoint {
 /// ## Drop behavior
 ///
 /// If a transaction is dropped without an explicit commit/rollback, the runtime rolls it back.
+/// The handle borrows its [`Velr`] connection and is neither `Send` nor `Sync`.
+/// Finish result streams, tables, and scoped savepoints before committing or rolling back.
+/// Use this handle's query methods for work belonging to the transaction.
 pub struct VelrTx<'db> {
     tx: Option<NonNull<ffi::velr_tx>>,
     named_savepoints: RefCell<Vec<NamedSavepoint>>,
@@ -3567,6 +3947,13 @@ impl<'db> VelrTx<'db> {
     /// Execute `openCypher` within this transaction and return a stream of result tables.
     ///
     /// See [`Velr::exec`] for general streaming semantics.
+    /// The returned stream borrows this transaction until it is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the transaction is inactive, query text contains a
+    /// NUL byte, or parsing, planning, or execution fails. Later errors can occur
+    /// while advancing tables or reading rows.
     pub fn exec<'tx>(&'tx self, cypher: &str) -> Result<ExecTablesTx<'tx>> {
         let a = velr_api()?;
 
@@ -3598,8 +3985,7 @@ impl<'db> VelrTx<'db> {
     /// Execute `openCypher` within this transaction with out-of-band result emission options.
     ///
     /// Transactional semantics match [`VelrTx::exec`]. [`QueryOptions::max_result_rows`] caps
-    /// emitted rows per result table without rewriting the Cypher text. Existing Cypher `LIMIT`
-    /// clauses still apply.
+    /// emitted rows per result table. Existing Cypher `LIMIT` clauses still apply.
     ///
     /// # Errors
     ///
@@ -3649,8 +4035,13 @@ impl<'db> VelrTx<'db> {
 
     /// Execute a query expected to produce exactly one table within this transaction.
     ///
-    /// This method is implemented by streaming (`exec`) and validating that exactly one table is
-    /// produced. If you expect multiple tables, use [`VelrTx::exec`].
+    /// Returns an error for zero or multiple result tables. If you expect multiple
+    /// tables, use [`VelrTx::exec`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`VelrTx::exec`], and an [`Error`] if the query
+    /// does not produce exactly one table.
     pub fn exec_one(&self, cypher: &str) -> Result<TableResult> {
         let mut st = self.exec(cypher)?;
         let first = match st.next_table()? {
@@ -3682,7 +4073,7 @@ impl<'db> VelrTx<'db> {
     /// Returns an [`Error`] if:
     /// - the transaction is no longer active
     /// - `openCypher` contains an interior NUL (`\0`)
-    /// - the loaded runtime does not expose the transaction query-options ABI
+    /// - the loaded runtime does not support these query options
     /// - the runtime reports an execution, planning, or parsing error
     /// - the execution yields zero or multiple result tables
     pub fn exec_one_with_options(
@@ -3711,7 +4102,12 @@ impl<'db> VelrTx<'db> {
 
     /// Execute a query within this transaction and discard all results.
     ///
-    /// This uses the runtime's direct transaction run ABI and does not materialize result tables.
+    /// The query's writes remain pending until [`VelrTx::commit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the transaction is inactive, query text contains a
+    /// NUL byte, or parsing, planning, or execution fails.
     pub fn run(&self, cypher: &str) -> Result<()> {
         let a = velr_api()?;
         let tx = self.ptr()?;
@@ -3746,6 +4142,11 @@ impl<'db> VelrTx<'db> {
     ///
     /// This is a convenience wrapper around [`VelrTx::exec_with_options`] for the common case
     /// where only parameters are needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`VelrTx::exec_with_options`], including invalid
+    /// or missing parameters. Later errors can occur while reading results.
     pub fn exec_with_params<'tx>(
         &'tx self,
         cypher: &str,
@@ -3758,6 +4159,11 @@ impl<'db> VelrTx<'db> {
     ///
     /// This is a convenience wrapper around [`VelrTx::exec_one_with_options`] for the common case
     /// where only parameters are needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`VelrTx::exec_one_with_options`], including invalid
+    /// or missing parameters and zero or multiple result tables.
     pub fn exec_one_with_params(&self, cypher: &str, params: QueryParams) -> Result<TableResult> {
         self.exec_one_with_options(cypher, QueryOptions::new().with_params(params))
     }
@@ -3766,6 +4172,11 @@ impl<'db> VelrTx<'db> {
     ///
     /// This is a convenience wrapper around [`VelrTx::run_with_options`] for the common case where
     /// only parameters are needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`VelrTx::run_with_options`], including invalid
+    /// or missing parameters.
     pub fn run_with_params(&self, cypher: &str, params: QueryParams) -> Result<()> {
         self.run_with_options(cypher, QueryOptions::new().with_params(params))
     }
@@ -3793,6 +4204,10 @@ impl<'db> VelrTx<'db> {
     }
 
     /// Build an EXPLAIN ANALYZE trace for `openCypher`.
+    ///
+    /// Executes the query inside this transaction, including writes. Roll back
+    /// the transaction to discard those changes, or use [`VelrTx::explain`] to
+    /// inspect a plan without executing the query.
     ///
     /// # Errors
     ///
@@ -3824,7 +4239,10 @@ impl<'db> VelrTx<'db> {
     /// Consumes the transaction handle. After this call, the transaction is finalized and cannot be
     /// used again.
     ///
-    /// Note: the underlying C ABI consumes the transaction handle even if an error is returned.
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if savepoint release or commit fails. The transaction
+    /// is consumed even on error; it cannot be retried through this handle.
     pub fn commit(mut self) -> Result<()> {
         let a = velr_api()?;
 
@@ -3852,7 +4270,10 @@ impl<'db> VelrTx<'db> {
     /// Consumes the transaction handle. After this call, the transaction is finalized and cannot be
     /// used again.
     ///
-    /// Note: the underlying C ABI consumes the transaction handle even if an error is returned.
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if rollback fails. The transaction is consumed even on
+    /// error; it cannot be retried through this handle.
     pub fn rollback(mut self) -> Result<()> {
         let a = velr_api()?;
 
@@ -3902,6 +4323,13 @@ impl<'db> VelrTx<'db> {
     /// - call [`VelrSavepoint::release`] to keep the work since the savepoint
     /// - call [`VelrSavepoint::rollback`] to undo back to the savepoint
     /// - dropping the handle rolls back to the savepoint and releases it
+    ///
+    /// The guard borrows the transaction. Nest guards in lexical scopes and finish
+    /// the innermost savepoint first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the transaction is inactive or a savepoint cannot be created.
     pub fn savepoint<'tx>(&'tx self) -> Result<VelrSavepoint<'tx>> {
         let a = velr_api()?;
 
@@ -3927,11 +4355,17 @@ impl<'db> VelrTx<'db> {
     ///
     /// Unlike [`VelrTx::savepoint`], this does not return a guard. The named savepoint remains
     /// active in the transaction until:
-    /// - [`VelrTx::rollback_to`] rolls back to it
+    /// - rollback to an older savepoint discards it
     /// - [`VelrTx::release_savepoint`] explicitly releases it
     /// - the transaction is committed, rolled back, or dropped
     ///
     /// Active names must be unique within the transaction.
+    /// [`VelrTx::rollback_to`] keeps its target active for reuse. Name matching is exact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for a duplicate active name, a NUL byte in `name`,
+    /// an inactive transaction, or a runtime savepoint error.
     pub fn savepoint_named(&self, name: &str) -> Result<()> {
         if self.find_named_index(name).is_some() {
             return Err(Error::new(
@@ -3952,13 +4386,14 @@ impl<'db> VelrTx<'db> {
 
     /// Roll back to a previously-created named savepoint.
     ///
-    /// Driver semantics:
+    /// Behavior:
     /// - all newer named savepoints are discarded
     /// - the target named savepoint remains active after rollback
     ///
-    /// This is implemented using the stored savepoint handle, because the runtime's
-    /// `velr_tx_rollback_to(...)` is not guaranteed to interoperate with savepoints
-    /// created through `velr_tx_savepoint_named(...)`.
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if `name` does not identify an active named savepoint,
+    /// or rollback or restoring the target savepoint fails.
     pub fn rollback_to(&self, name: &str) -> Result<()> {
         let idx = self.find_named_index(name).ok_or_else(|| {
             Error::new(
@@ -4006,8 +4441,13 @@ impl<'db> VelrTx<'db> {
 
     /// Release the most recently-created active named savepoint.
     ///
-    /// Releasing a non-topmost named savepoint is intentionally rejected here to keep the driver
-    /// semantics simple and well-defined.
+    /// The supplied `name` must match the newest active named savepoint. Releasing
+    /// keeps its changes within the outer transaction; it does not commit them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if no named savepoint is active, `name` is not the
+    /// newest active name, or release fails.
     pub fn release_savepoint(&self, name: &str) -> Result<()> {
         let a = velr_api()?;
 
@@ -4035,13 +4475,18 @@ impl<'db> VelrTx<'db> {
         rc_to_result(rc, err)
     }
 
-    /// Bind Arrow arrays (Arrow C Data Interface) to a logical name.
+    /// Bind Arrow columns to a name within this transaction.
     ///
     /// Available only when built with the `arrow-ipc` feature.
     ///
-    /// This consumes the exported ArrowArray values at the ABI boundary.
-    /// Callers must not reuse or release those exported ArrowArray values after the call.
-    /// (At the ABI level, the ArrowArray structs are consumed during the call.)
+    /// Like [`Velr::bind_arrow`], this consumes the arrays; no caller-owned buffers
+    /// need to remain alive. Read rows through `UNWIND BIND('name') AS row`.
+    /// Supply one array per column name, with equal row counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for an inactive transaction, invalid name or array
+    /// layout, unsupported Arrow data, or a runtime binding failure.
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow(
         &self,
@@ -4059,6 +4504,11 @@ impl<'db> VelrTx<'db> {
     ///
     /// The IPC byte slice is borrowed only for the duration of the call. Velr decodes the IPC file
     /// and owns the resulting Arrow arrays before this returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for an inactive transaction, a NUL byte in `logical`,
+    /// empty or invalid IPC file bytes, or a runtime binding failure.
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow_ipc(&self, logical: &str, ipc_file: &[u8]) -> Result<()> {
         let tx = self.ptr()?;
@@ -4069,11 +4519,13 @@ impl<'db> VelrTx<'db> {
     ///
     /// Available only when built with the `arrow-ipc` feature.
     ///
-    /// This transfers ownership of the provided Arrow arrays into Velr for the lifetime of the bind.
-    /// (At the ABI level, the ArrowArray structs are consumed during the call.)
+    /// Like [`Velr::bind_arrow_chunks`], this consumes the arrays. Supply one nonempty
+    /// chunk vector per column name, with equal total row counts across columns.
     ///
-    /// All columns must have the same total row count (sum of chunk lengths); otherwise the bind
-    /// returns an error.
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for an inactive transaction, a NUL byte in `logical`,
+    /// invalid or unsupported column layouts, or a runtime binding failure.
     #[cfg(feature = "arrow-ipc")]
     pub fn bind_arrow_chunks(
         &self,
@@ -4107,6 +4559,9 @@ impl Drop for VelrTx<'_> {
 /// Streaming result of an execution within a transaction.
 ///
 /// This is an *in-flight* type and is **`!Send` + `!Sync`** (thread-affine).
+/// It borrows the transaction. Fully process each result table before requesting
+/// the next one, and drop the stream before finalizing the transaction. Dropping
+/// the stream closes it; it does not commit the transaction.
 pub struct ExecTablesTx<'tx> {
     stream: Option<NonNull<ffi::velr_stream_tx>>,
     _tx: PhantomData<&'tx VelrTx<'tx>>,
@@ -4117,6 +4572,10 @@ impl ExecTablesTx<'_> {
     /// Fetch the next result table from the transaction execution stream.
     ///
     /// Returns `Ok(None)` when exhausted (and closes the underlying stream).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if execution fails while advancing to the next table.
     pub fn next_table(&mut self) -> Result<Option<TableResult>> {
         let a = velr_api()?;
 
@@ -4180,7 +4639,12 @@ impl VelrSavepoint<'_> {
     /// Consumes the savepoint handle. After this call, the savepoint is finalized and cannot be used
     /// again.
     ///
-    /// Note: the underlying C ABI consumes the savepoint handle even if an error is returned.
+    /// Releasing keeps changes pending in the transaction; commit the transaction
+    /// to persist them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if release fails. The guard is consumed even on error.
     pub fn release(mut self) -> Result<()> {
         let a = velr_api()?;
 
@@ -4201,7 +4665,11 @@ impl VelrSavepoint<'_> {
     /// Consumes the savepoint handle. After this call, the savepoint is finalized and cannot be used
     /// again.
     ///
-    /// Note: the underlying C ABI consumes the savepoint handle even if an error is returned.
+    /// The outer transaction remains active after a successful rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if rollback fails. The guard is consumed even on error.
     pub fn rollback(mut self) -> Result<()> {
         let a = velr_api()?;
 

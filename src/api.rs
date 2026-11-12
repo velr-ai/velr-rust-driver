@@ -17,6 +17,22 @@ pub struct Api {
         *mut *mut velr_db,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_create: Option<
+        unsafe extern "C" fn(
+            *const c_char,
+            *const *const c_char,
+            usize,
+            *mut *mut velr_db,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
+    pub velr_inline_edge_properties_json: Option<
+        unsafe extern "C" fn(
+            *mut velr_db,
+            *mut *mut c_char,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
     pub velr_open_existing_readonly: Option<
         unsafe extern "C" fn(
             *const c_char,
@@ -539,6 +555,14 @@ impl Api {
                 concat!(stringify!(velr_string_free), "\0").as_bytes(),
             )?,
             velr_open: get(lib, concat!(stringify!(velr_open), "\0").as_bytes())?,
+            velr_create: get_optional(
+                lib,
+                concat!(stringify!(velr_create), "\0").as_bytes(),
+            ),
+            velr_inline_edge_properties_json: get_optional(
+                lib,
+                concat!(stringify!(velr_inline_edge_properties_json), "\0").as_bytes(),
+            ),
             velr_open_existing_readonly: get_optional(
                 lib,
                 concat!(stringify!(velr_open_existing_readonly), "\0").as_bytes(),

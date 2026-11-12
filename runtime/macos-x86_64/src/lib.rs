@@ -1,10 +1,7 @@
 //! Bundled Velr native runtime for macos-x86_64.
 
 pub const FILENAME: &str = "libvelrc.dylib";
-pub const BYTES: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/prebuilt/libvelrc.dylib"
-));
+pub const BYTES: &[u8] = include_bytes!(env!("VELR_MACOS_X86_64_RUNTIME_PATH"));
 
 pub fn bytes_and_name() -> (&'static [u8], &'static str) {
     (BYTES, FILENAME)
