@@ -326,6 +326,9 @@ fn json_quote(text: &str) -> String {
 }
 
 fn sql_quote(text: &str) -> String {
+    if text.as_bytes().contains(&0) {
+        return format!("CAST({} AS TEXT)", blob_sql_literal(text.as_bytes()));
+    }
     format!("'{}'", text.replace('\'', "''"))
 }
 

@@ -353,6 +353,23 @@ pub struct Api {
         *mut usize,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_table_python_rows_malloc: unsafe extern "C" fn(
+        *mut velr_table,
+        c_int,
+        *const usize,
+        usize,
+        *mut *mut u8,
+        *mut usize,
+        *mut *mut c_char,
+    ) -> velr_code,
+    pub velr_table_python_rows_with_paths_malloc: unsafe extern "C" fn(
+        *mut velr_table,
+        *const usize,
+        usize,
+        *mut *mut u8,
+        *mut usize,
+        *mut *mut c_char,
+    ) -> velr_code,
     pub velr_rows_next: unsafe extern "C" fn(
         *mut velr_rows,
         *mut velr_cell,
@@ -788,6 +805,15 @@ impl Api {
             velr_table_json_rows_with_options_malloc: get(
                 lib,
                 concat!(stringify!(velr_table_json_rows_with_options_malloc), "\0")
+                    .as_bytes(),
+            )?,
+            velr_table_python_rows_malloc: get(
+                lib,
+                concat!(stringify!(velr_table_python_rows_malloc), "\0").as_bytes(),
+            )?,
+            velr_table_python_rows_with_paths_malloc: get(
+                lib,
+                concat!(stringify!(velr_table_python_rows_with_paths_malloc), "\0")
                     .as_bytes(),
             )?,
             velr_rows_next: get(

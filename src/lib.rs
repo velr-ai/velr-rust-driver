@@ -1,7 +1,7 @@
-//! An openCypher-compliant embedded property-graph database.
+//! An embedded property-graph database with openCypher query support.
 //!
-//! Velr follows openCypher query validation and error categories and supports additional
-//! Cypher features for subqueries, fulltext search, and vector search.
+//! Velr supports openCypher query validation and error categories, along with Cypher
+//! extensions for subqueries, fulltext search, and vector search.
 //!
 //! Open an in-memory or file-backed database with [`Velr`], bind application data with
 //! [`params!`], and read results through [`TableResult`]. The native runtime is bundled for
@@ -26,6 +26,17 @@
 //! exactly one result table is expected, and [`Velr::exec`] for multiple statements or tables.
 //! [`VelrTx`] provides transactions and savepoints. With the default `arrow-ipc` feature,
 //! `Velr::bind_arrow` imports columnar data and `TableResult::to_arrow_ipc_file` exports it.
+//!
+//! # Cypher regular expressions
+//!
+//! Use the openCypher operator `=~` to match an entire string against a regular
+//! expression. Matching is case-sensitive by default. For example,
+//! `RETURN 'alice' =~ '(?i)A.*' AS matched` returns `true`.
+//!
+//! The pattern string uses the Rust regex dialect. Lookaround and backreferences
+//! are unsupported. A null or non-string operand yields `null`. An invalid
+//! pattern raises a query error when both operands are strings.
+//! See [supported pattern syntax](https://docs.rs/regex/latest/regex/#syntax).
 //!
 //! # Threading model
 //!
@@ -134,9 +145,14 @@
 //! `RETURN`, or `YIELD *` to inspect the full row shape.
 //!
 //! Create a fulltext index with `CREATE FULLTEXT INDEX` and search it with
-//! `CALL db.index.fulltext.queryNodes(...)`. For file-backed
-//! databases, Velr repairs missing or corrupt fulltext index data automatically when the database
-//! is opened. The query grammar supports terms, phrases, field scoping, boolean grouping,
+//! `CALL db.index.fulltext.queryNodes(...)`. Fulltext queries return up to 1,000 matches
+//! by default. Pass a third argument such as `{limit: 5000}` to change the cap.
+//! Fulltext queries see changes made earlier in the current transaction. A writable open
+//! applies pending index updates and repairs missing or corrupt index data. If the shared index
+//! cannot serve the query's snapshot, Velr builds a temporary index for that search by scanning
+//! the indexed graph.
+//!
+//! The query grammar supports terms, phrases, field scoping, boolean grouping,
 //! required/excluded terms, phrase slop, phrase-prefix, boosts, and `*` match-all. `score` is a
 //! unnormalized, query-specific relevance score. Higher scores rank results higher;
 //! compare scores within the same query's result set.
@@ -220,8 +236,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Cypher categories include `SyntaxError` for invalid query syntax or static validation,
 /// `TypeError` for incompatible value types, `ArgumentError` for arguments outside an
-/// operation's domain, `ParameterMissing` for an unbound parameter, `ArithmeticError` for
-/// undefined arithmetic or overflow, `EntityNotFound` for access to a deleted graph entity,
+/// operation's domain, `ParameterMissing` for an unbound parameter, `ProcedureNotFound` for
+/// an unavailable procedure, `ArithmeticError` for undefined arithmetic or overflow,
+/// `EntityNotFound` for access to a deleted graph entity,
 /// `ConstraintVerificationFailed` for a graph constraint violation, and `SemanticError`
 /// for a graph semantic rule violation.
 #[derive(Debug)]

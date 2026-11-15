@@ -1,6 +1,6 @@
 # Velr
 
-Velr is an openCypher-compliant embedded property-graph database from Velr.ai.
+Velr is an embedded property-graph database with openCypher query support.
 
 This crate provides the **Rust binding** for Velr and bundles the native runtime
 for supported platforms.
@@ -155,6 +155,8 @@ several expressions could explain an error, labels mark possible locations.
 | `TypeError` | A value has an incompatible type. |
 | `ArgumentError` | An argument is outside the operation's supported domain. |
 | `ParameterMissing` | A query parameter was not supplied. |
+| `ProcedureNotFound` | A `CALL` names a procedure unavailable on this connection. |
+| `ProcedureError` | In the openCypher profile, a `CALL` names an unavailable procedure. |
 | `ArithmeticError` | Arithmetic is undefined or overflows. |
 | `EntityNotFound` | A query accesses a deleted graph entity. |
 | `ConstraintVerificationFailed` | A write violates a graph constraint. |
@@ -366,9 +368,16 @@ fulltext field.
 `score` is an unnormalized, query-specific relevance score. Higher scores rank
 results higher. Compare scores within the same query's result set.
 
-Fulltext indexes are kept up to date by writes. For file-backed databases,
-Velr repairs missing or corrupt fulltext index data automatically when the
-database is opened.
+Fulltext queries return up to 1,000 matches by default. Pass a third
+argument such as `{limit: 5000}` to change the cap.
+
+Fulltext queries see changes made earlier in the current transaction.
+Opening a file-backed database for writing applies pending index updates
+and repairs missing or corrupt index data. If the shared index cannot serve
+the query's snapshot, Velr builds a temporary index for that search. This
+can happen when updates are pending, a concurrent writer has published a
+newer index, or a read-only connection opens an index that needs repair.
+The temporary build scans the indexed graph.
 
 ---
 
@@ -518,14 +527,21 @@ configuration.
 
 ## Query language support
 
-Velr is openCypher compliant, including query validation and error categories.
-It also supports Cypher extensions for subqueries, fulltext search, and vector
-search.
+Velr supports the openCypher clauses and expressions described here, along with
+Cypher extensions for subqueries, fulltext search, and vector search.
 
 Use `MATCH`, `OPTIONAL MATCH`, `WHERE`, `WITH`, `UNWIND`, aggregation,
 ordering, pagination, `CREATE`, `MERGE`, `SET`, `REMOVE`, and deletion. Variable
 length paths, `shortestPath`, `allShortestPaths`, list and pattern comprehensions,
 `reduce`, `UNION`, and `UNION ALL` are also supported.
+
+`UNWIND` emits one row per list element, including null elements. A non-null
+scalar or map yields one row, so `UNWIND 5 AS x RETURN x` returns `5`. A null
+source or empty list yields zero rows.
+
+Use a Boolean condition in `WHERE`. Evaluating an integer property as the
+condition raises a runtime `TypeError`. To filter on a number, write a comparison
+such as `WHERE p.age > 0`.
 
 List comprehensions transform or filter a list; `reduce` folds its elements into
 an accumulator, including lists stored as properties:
@@ -837,19 +853,62 @@ table. Export reads the result and can use memory proportional to its size.
 
 | Category | Available functions and forms |
 |---|---|
-| Graph and path | `id`, `type`, `labels`, `keys`, `properties`, `length`, `nodes`, `relationships`, `shortestPath`, `allShortestPaths` |
+| Graph and path | `id`, `type`, `labels`, `keys`, `properties`, `startNode`, `endNode`, `length`, `nodes`, `relationships`, `shortestPath`, `allShortestPaths` |
+| Maps | Map projections such as `p {.name, .age}` and `p {.*, active: true}` |
 | Lists | `size`, `head`, `last`, `tail`, `reverse`, `range`, list comprehensions, pattern comprehensions, `reduce(acc = initial, x IN list \| expression)` |
-| Predicates and nulls | `all`, `any`, `none`, `single`, `IN`, `IS NULL`, `IS NOT NULL`, `coalesce`, `EXISTS { ... }` |
-| Strings and conversions | `toInteger`, `toFloat`, `toBoolean`, `toString`, `toLower` / `lower`, `trim`, `substring`, `split` |
-| Numbers | `abs`, `ceil`, `floor`, `round(value)` / `round(value, precision)`, `rand`, `sign`, `sqrt` |
-| Aggregates | `count`, `sum`, `avg`, `min`, `max`, `collect`, `percentileDisc`, `percentileCont` |
+| Predicates and nulls | `all`, `any`, `none`, `single`, `exists(n.property)`, `IN`, `IS NULL`, `IS NOT NULL`, `coalesce`, `EXISTS { ... }` |
+| Strings and conversions | `toInteger`, `toFloat`, `toBoolean`, `toString`, `toLower` / `lower`, `toUpper`, `replace`, `left`, `right`, `trim`, `lTrim`, `rTrim`, `substring(text, start [, length])`, `split`, `=~` |
+| Numbers | `abs`, `ceil`, `floor`, `round(value)` / `round(value, precision)`, `rand`, `sign`, `sqrt`, `e`, `exp`, `log`, `log10` |
+| Trigonometry | `acos`, `asin`, `atan`, `atan2`, `cos`, `cot`, `degrees`, `haversin`, `pi`, `radians`, `sin`, `tan` |
+| Aggregates | `count`, `sum`, `avg`, `min`, `max`, `collect`, `percentileDisc`, `percentileCont`, `stDev`, `stDevP` |
 | Temporal constructors | `date`, `time`, `localtime`, `datetime`, `localdatetime`, `duration`, `datetime.fromepoch`, `datetime.fromepochmillis` |
-| Temporal clocks | `.realtime()`, `.transaction()`, and `.statement()` on `date`, `time`, `localtime`, `datetime`, and `localdatetime` |
+| Temporal clocks | `timestamp()`, plus `.realtime()`, `.transaction()`, and `.statement()` on `date`, `time`, `localtime`, `datetime`, and `localdatetime` |
 | Temporal operations | `duration.between`, `duration.inMonths`, `duration.inDays`, `duration.inSeconds`; `.truncate(unit, value, fields)` on `date`, `time`, `localtime`, `datetime`, and `localdatetime` |
 | Vector similarity | `vector.similarity.cosine(left, right)` |
 
+Map projections accept node, relationship, and map variables. Use `.key` to
+select a field, `.*` to include all fields, `key: expression` to add or override
+a field, or a bare variable to include it under its name. A null source produces
+null.
+
+Name a path inside a pattern comprehension to use it in the projection,
+as in `[p = (n)-[:LINK]->() | length(p)]`. A variable-length interval such
+as `*2..1` produces no matches. In `MATCH`, `<-[:LINK]->` matches the
+relationship in either direction.
+
+Deeply nested expressions or long chains of operators can raise
+`SyntaxError` with detail `QueryTooComplex`. Split nested computations into
+`WITH` clauses or use `IN` for a long chain of equality comparisons.
+
+Use `CREATE p = (:A)-[:LINK]->(:B) RETURN length(p)` to create a path and
+return its length. `startNode(r)` and `endNode(r)` return the relationship's
+stored endpoints. Both return `null` when the relationship is `null`.
+
+When the host uses the strict `OpenCypher` query profile, a list assigned to a
+graph property must contain non-null values of one property type. Integers and
+floats can be combined in a list of floats.
+
+`left(text, length)` and `right(text, length)` count Unicode code points and
+require a nonnegative integer length when the text is present.
+
+Use the openCypher operator `=~` to match an entire string against a regular
+expression. Matching is case-sensitive by default. For example,
+`RETURN 'alice' =~ '(?i)A.*' AS matched` returns `true`.
+
+The pattern string uses the Rust regex dialect. Lookaround and backreferences
+are unsupported. A null or non-string operand yields `null`. An invalid
+pattern raises a query error when both operands are strings.
+See [supported pattern syntax](https://docs.rs/regex/latest/regex/#syntax).
+
+`timestamp()` returns Unix epoch milliseconds and has the same value throughout
+a statement.
+
 For temporal truncation, pass the third map argument even when no fields need
 overriding, for example `date.truncate('month', date('2026-11-05'), {})`.
+
+For two durations with matching months, days, seconds, and nanoseconds, `<=`
+and `>=` return `true`. For unequal durations, both return `null`. Strict
+comparisons (`<` and `>`) between durations always return `null`.
 
 ---
 
