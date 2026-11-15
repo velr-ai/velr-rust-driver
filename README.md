@@ -373,11 +373,14 @@ argument such as `{limit: 5000}` to change the cap.
 
 Fulltext queries see changes made earlier in the current transaction.
 Opening a file-backed database for writing applies pending index updates
-and repairs missing or corrupt index data. If the shared index cannot serve
-the query's snapshot, Velr builds a temporary index for that search. This
-can happen when updates are pending, a concurrent writer has published a
-newer index, or a read-only connection opens an index that needs repair.
-The temporary build scans the indexed graph.
+and repairs missing or corrupt index data. Term, phrase, phrase-prefix,
+and Boolean searches can see small sets of indexed changes without
+scanning the graph. A search can still scan the indexed graph after
+large writes, when its snapshot predates the shared index, or with tied
+scores. Broad prefix expansions and some combinations of Boolean scores
+can also require a scan.
+Repeated searches can reuse the same view of the indexed documents
+while the transaction makes no further changes.
 
 ---
 
@@ -865,6 +868,8 @@ table. Export reads the result and can use memory proportional to its size.
 | Temporal clocks | `timestamp()`, plus `.realtime()`, `.transaction()`, and `.statement()` on `date`, `time`, `localtime`, `datetime`, and `localdatetime` |
 | Temporal operations | `duration.between`, `duration.inMonths`, `duration.inDays`, `duration.inSeconds`; `.truncate(unit, value, fields)` on `date`, `time`, `localtime`, `datetime`, and `localdatetime` |
 | Vector similarity | `vector.similarity.cosine(left, right)` |
+
+`toLower(text)`, `lower(text)`, and `toUpper(text)` convert Unicode case.
 
 Map projections accept node, relationship, and map variables. Use `.key` to
 select a field, `.*` to include all fields, `key: expression` to add or override
