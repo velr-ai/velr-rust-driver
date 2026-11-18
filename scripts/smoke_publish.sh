@@ -10,17 +10,19 @@ export VELR_CACHE_DIR="${VELR_CACHE_DIR:-$CARGO_TARGET_DIR/cache}"
 
 stage="$(mktemp -d)"
 trap 'rm -rf -- "$stage"' EXIT
-cp -R runtime/linux-x86_64 runtime/macos-x86_64 runtime/windows-x86_64 "$stage/"
+cp -R runtime/linux-x86_64 runtime/linux-aarch64 runtime/macos-x86_64 runtime/windows-x86_64 "$stage/"
 linux_x86_64_runtime="$stage/linux-x86_64"
+linux_aarch64_runtime="$stage/linux-aarch64"
 macos_x86_64_runtime="$stage/macos-x86_64"
 windows_x86_64_runtime="$stage/windows-x86_64"
 bash scripts/pack_runtime.sh "$linux_x86_64_runtime/prebuilt" libvelrc.so
+bash scripts/pack_runtime.sh "$linux_aarch64_runtime/prebuilt" libvelrc.so
 bash scripts/pack_runtime.sh "$macos_x86_64_runtime/prebuilt" libvelrc.dylib
 bash scripts/pack_runtime.sh "$windows_x86_64_runtime/prebuilt" velrc.dll
 
 manifests=(
   "$linux_x86_64_runtime/Cargo.toml"
-  "runtime/linux-aarch64/Cargo.toml"
+  "$linux_aarch64_runtime/Cargo.toml"
   "runtime/macos-aarch64/Cargo.toml"
   "$macos_x86_64_runtime/Cargo.toml"
   "$windows_x86_64_runtime/Cargo.toml"
@@ -62,7 +64,7 @@ for manifest in "${manifests[@]}"; do
   version="$(crate_version "$manifest")"
   crate_file="$CARGO_TARGET_DIR/package/$name-$version.crate"
 
-  cargo package --manifest-path "$manifest" --allow-dirty --no-verify
+  cargo package --manifest-path "$manifest" --allow-dirty
 
   if [[ ! -f "$crate_file" ]]; then
     echo "ERROR: expected package file missing: $crate_file" >&2

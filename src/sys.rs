@@ -209,6 +209,10 @@ pub enum velr_code {
     VELR_ESTATE = -3,
     /// A query, database, or driver operation failed; the error message gives details.
     VELR_EERR = -4,
+    /// The query stopped after a cancellation request.
+    VELR_ECANCELLED = -5,
+    /// The query exceeded its deadline.
+    VELR_EDEADLINE = -6,
 }
 #[allow(non_camel_case_types)]
 #[repr(C)]
@@ -266,6 +270,10 @@ pub struct velr_db {
 }
 #[repr(C)]
 pub struct velr_query_params {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub struct velr_query_control {
     _private: [u8; 0],
 }
 #[repr(C)]

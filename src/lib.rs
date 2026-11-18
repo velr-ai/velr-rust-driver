@@ -1,11 +1,16 @@
 //! An embedded property-graph database with openCypher query support.
 //!
-//! Velr supports openCypher query validation and error categories, along with Cypher
-//! extensions for subqueries, fulltext search, and vector search.
+//! Start with the [`getting_started`] guide, then use [`guide`] for detailed
+//! integrations and [`query_language`] for supported query syntax and functions.
+//!
+//! Velr follows openCypher query validation and error categories and supports additional
+//! Cypher features for subqueries, fulltext search, and vector search. With a Velr 0.2.62+
+//! runtime, query fulltext/vector indexes through `MATCH ... SEARCH ... SCORE AS ...`;
+//! existing search `CALL` procedures remain supported. See [`guide`] and [`query_language`].
 //!
 //! Open an in-memory or file-backed database with [`Velr`], bind application data with
 //! [`params!`], and read results through [`TableResult`]. The native runtime is bundled for
-//! supported platforms; see the [package README](https://github.com/velr-ai/velr-rust-driver)
+//! supported platforms; see the [getting-started guide](crate::getting_started)
 //! for installation, platform support, and search examples.
 //!
 //! ```
@@ -26,17 +31,6 @@
 //! exactly one result table is expected, and [`Velr::exec`] for multiple statements or tables.
 //! [`VelrTx`] provides transactions and savepoints. With the default `arrow-ipc` feature,
 //! `Velr::bind_arrow` imports columnar data and `TableResult::to_arrow_ipc_file` exports it.
-//!
-//! # Cypher regular expressions
-//!
-//! Use the openCypher operator `=~` to match an entire string against a regular
-//! expression. Matching is case-sensitive by default. For example,
-//! `RETURN 'alice' =~ '(?i)A.*' AS matched` returns `true`.
-//!
-//! The pattern string uses the Rust regex dialect. Lookaround and backreferences
-//! are unsupported. A null or non-string operand yields `null`. An invalid
-//! pattern raises a query error when both operands are strings.
-//! See [supported pattern syntax](https://docs.rs/regex/latest/regex/#syntax).
 //!
 //! # Threading model
 //!
@@ -87,6 +81,15 @@
 //! option emits at most five rows. Use `QueryOptions::max_result_rows(0)` when you want result
 //! table metadata, including column names, without materializing any rows.
 //!
+//! # Query cancellation and timeouts
+//!
+//! Set a time budget with [`QueryOptions::with_timeout`] and attach a
+//! [`CancellationToken`] with [`QueryOptions::with_cancellation`]. The controls
+//! apply to query execution and subsequent table and row fetches. Share a clone
+//! of the token with the thread that handles stop requests. Use [`Error::kind`]
+//! on execution and fetch errors to distinguish [`ErrorKind::Cancelled`] and
+//! [`ErrorKind::DeadlineExceeded`].
+//!
 //! # Query parameter binding
 //!
 //! Use [`params!`] or [`QueryParams`] for params-only calls, or combine params with bounded
@@ -131,8 +134,10 @@
 //!
 //! # Schema migration and introspection
 //!
-//! The bundled runtime creates databases at schema version 11. Databases at schema versions
-//! 3 through 9 require an explicit migration before graph queries can run.
+//! Use [`Velr::current_schema_version`] to get the schema version supported by this runtime.
+//! Supported older formats can be opened for version inspection and explicit migration,
+//! but graph queries, including reads, require the current format. Reopen read-only
+//! connections after migrating through a writable connection.
 //!
 //! Use [`Velr::schema_version`], [`Velr::current_schema_version`], and
 //! [`Velr::needs_migration`] to inspect the connection state. Use [`Velr::migrate`] or execute
@@ -144,15 +149,10 @@
 //! properties, observed value types, and counts. Use `YIELD` to compose it with `WHERE` and
 //! `RETURN`, or `YIELD *` to inspect the full row shape.
 //!
-//! Create a fulltext index with `CREATE FULLTEXT INDEX` and search it with
-//! `CALL db.index.fulltext.queryNodes(...)`. Fulltext queries return up to 1,000 matches
-//! by default. Pass a third argument such as `{limit: 5000}` to change the cap.
-//! Fulltext queries see changes made earlier in the current transaction. A writable open
-//! applies pending index updates and repairs missing or corrupt index data. If the shared index
-//! cannot serve the query's snapshot, Velr builds a temporary index for that search by scanning
-//! the indexed graph.
-//!
-//! The query grammar supports terms, phrases, field scoping, boolean grouping,
+//! Create a fulltext index with `CREATE FULLTEXT INDEX` and query it with `SEARCH`
+//! in `MATCH` on a 0.2.62+ runtime. `CALL db.index.fulltext.queryNodes(...)` remains supported.
+//! Writable connections repair missing or corrupt fulltext index data; read-only opening
+//! never repairs the database file. The grammar supports terms, phrases, field scoping, boolean grouping,
 //! required/excluded terms, phrase slop, phrase-prefix, boosts, and `*` match-all. `score` is a
 //! unnormalized, query-specific relevance score. Higher scores rank results higher;
 //! compare scores within the same query's result set.
@@ -162,15 +162,17 @@
 //! Velr supports two vector index shapes through Cypher:
 //!
 //! - Stored vectors: `CREATE VECTOR INDEX chunkEmbedding FOR (n:Chunk) ON (n.embedding) ...`
-//!   indexes an existing vector/list property. Queries pass a numeric vector/list to
-//!   `CALL db.index.vector.queryNodes(...)`.
+//!   indexes an existing vector/list property. On a 0.2.62+ runtime, query it through
+//!   `MATCH (n) SEARCH n IN (VECTOR INDEX chunkEmbedding FOR $vector LIMIT $limit)`,
+//!   optionally followed by `SCORE AS score`. Vector `CALL` procedures remain supported.
 //! - Embedder-backed vectors: `CREATE VECTOR INDEX paperEmbedding FOR (n:Paper) ON EACH
 //!   [n.title, n.abstract] OPTIONS { indexConfig: { embedder: 'text', dimensions: 384 } }`
 //!   uses a callback registered with [`Velr::register_vector_embedder`]. Pass text query
 //!   payloads to the same registered embedder.
 //!
-//! For file-backed databases, Velr repairs missing or corrupt vector index data using stored
-//! vector properties or registered embedders, according to the index configuration.
+//! Writable connections repair missing or corrupt vector index data according to the index
+//! configuration. Register required embedders before writing/querying embedder-backed indexes.
+//! Read-only opening never repairs the database file.
 //!
 //! `OPTIONS { indexConfig: ... }` configures Velr vector indexes. Prefer the Neo4j-style names
 //! where they exist; shorter aliases are accepted for existing queries and examples.
@@ -188,13 +190,24 @@
 //! `` `vector.hnsw.ef_search` `` (`1..3200` query candidates) for graph traversal. Higher values
 //! can improve recall, usually with more memory, larger index files, slower builds, or slower
 //! queries. Velr's default query-time candidate pool is `64`.
+
 #![allow(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Installation, runnable first queries, and core application workflows.
+/// Detailed driver usage, integration examples, and resource contracts.
+pub mod guide;
+
+/// Installation, runnable first queries, and core application workflows.
+pub mod getting_started;
+
+#[doc = include_str!("../QUERY_LANGUAGE.md")]
+pub mod query_language {}
+
 mod api;
+mod cancellation;
 mod runtime;
 mod sys;
-
 
 use std::{
     cell::{Cell, RefCell},
@@ -207,8 +220,12 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     ptr::NonNull,
     rc::Rc,
+    sync::Arc,
+    time::Duration,
 };
 
+pub use cancellation::CancellationToken;
+use cancellation::{require_control_api, NativeQueryControl};
 use serde_json::Value as JsonValue;
 use sys as ffi;
 use velr_types::{decode_property_value, StorageValueRef};
@@ -236,9 +253,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Cypher categories include `SyntaxError` for invalid query syntax or static validation,
 /// `TypeError` for incompatible value types, `ArgumentError` for arguments outside an
-/// operation's domain, `ParameterMissing` for an unbound parameter, `ProcedureNotFound` for
-/// an unavailable procedure, `ArithmeticError` for undefined arithmetic or overflow,
-/// `EntityNotFound` for access to a deleted graph entity,
+/// operation's domain, `ParameterMissing` for an unbound parameter, `ArithmeticError` for
+/// undefined arithmetic or overflow, `EntityNotFound` for access to a deleted graph entity,
 /// `ConstraintVerificationFailed` for a graph constraint violation, and `SemanticError`
 /// for a graph semantic rule violation.
 #[derive(Debug)]
@@ -252,7 +268,28 @@ pub struct Error {
     pub message: String,
 }
 
+/// Machine-readable classification of a Velr operation error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// The caller canceled execution or result fetching.
+    Cancelled,
+    /// The query's deadline expired before execution or result fetching finished.
+    DeadlineExceeded,
+    /// Another database, driver, or runtime failure.
+    Other,
+}
+
 impl Error {
+    /// Classify a query execution or result-fetch error for programmatic handling.
+    pub fn kind(&self) -> ErrorKind {
+        match self.code {
+            code if code == ffi::velr_code::VELR_ECANCELLED as i32 => ErrorKind::Cancelled,
+            code if code == ffi::velr_code::VELR_EDEADLINE as i32 => ErrorKind::DeadlineExceeded,
+            _ => ErrorKind::Other,
+        }
+    }
+
     fn new(code: i32, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -761,17 +798,19 @@ fn require_runtime_symbol<T: Copy>(symbol: Option<T>, name: &str) -> Result<T> {
     symbol.ok_or_else(|| missing_runtime_symbol(name))
 }
 
-/// Out-of-band execution options for query result emission.
+/// Execution options for parameters, result limits, timeouts, and cancellation.
 ///
 /// Use this type with [`Velr::exec_with_options`], [`Velr::exec_one_with_options`],
-/// [`Velr::run_with_options`], and the matching [`VelrTx`] methods when a host wants to preview
-/// a query result.
+/// [`Velr::run_with_options`], and the matching [`VelrTx`] methods. The timeout
+/// and cancellation token apply to the query and subsequent table and row fetching.
 ///
-/// Parameters supply query data, and row caps affect result emission. A cap does
-/// not make a query read-only and is not a timeout or cancellation mechanism.
+/// Parameters supply query data. Row caps limit result emission. Write queries
+/// still apply their side effects under a row cap.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct QueryOptions {
+    timeout: Option<Duration>,
+    cancellation: Option<CancellationToken>,
     /// Maximum number of rows to emit from each result table.
     ///
     /// - `None` preserves the default behavior and emits all rows produced by the query.
@@ -792,9 +831,29 @@ pub struct QueryOptions {
 impl QueryOptions {
     /// Create default query options.
     ///
-    /// The default has no row cap and behaves like the non-`_with_options` execution methods.
+    /// The default emits all rows with no time limit, cancellation token, or parameters.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the total time budget for this query.
+    ///
+    /// The budget begins at execution and also applies to deferred table and row
+    /// fetching. A zero duration expires immediately. An expired query returns
+    /// [`ErrorKind::DeadlineExceeded`] from the execution or fetch operation.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Make this query and its result handles respond to a cancellation token.
+    ///
+    /// A clone of `cancellation` can be canceled on another thread. If a query
+    /// observes the signal, execution or fetching returns [`ErrorKind::Cancelled`].
+    /// An already canceled token stops the query before it runs.
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
     }
 
     /// Create query options that cap emitted rows per result table.
@@ -803,7 +862,7 @@ impl QueryOptions {
     pub fn max_result_rows(max_result_rows: usize) -> Self {
         Self {
             max_result_rows: Some(max_result_rows),
-            params: QueryParams::new(),
+            ..Self::default()
         }
     }
 
@@ -2618,7 +2677,9 @@ impl<'a> CellRef<'a> {
 /// Options for creating a database with [`Velr::create`].
 ///
 /// The default configures no inline relationship properties. Options apply to the
-/// new database and persist when it is reopened.
+/// new database and persist when it is reopened. The selection cannot be changed
+/// by reopening the file. Ordinary Cypher property reads and writes support all
+/// property values regardless of this option.
 #[derive(Debug, Clone, Default)]
 pub struct CreateOptions {
     inline_edge_properties: Vec<String>,
@@ -2630,17 +2691,20 @@ impl CreateOptions {
         Self::default()
     }
 
-    /// Choose the relationship property name whose eligible values to store inline.
+    /// Select a relationship property to configure when creating the database.
     ///
     /// This replaces any previous list. Supply zero or one case-sensitive,
     /// nonempty name. Names may not contain NUL bytes. [`Velr::create`] validates
     /// the list before creating the database.
     ///
-    /// The choice applies across all relationship types. Eligible values include
-    /// integers, floating-point numbers, and strings up to 128 UTF-8 bytes. Values
-    /// that exceed the inline size limit remain accessible through the same
-    /// property name. Use ordinary Cypher `CREATE`, `SET`, and property reads
-    /// regardless of value size.
+    /// The choice applies across all relationship types and is fixed at database
+    /// creation. Use ordinary Cypher `CREATE`, `SET`, and property reads for every
+    /// value stored under that name. This option does not restrict which property
+    /// values application queries may read or write.
+    ///
+    /// This builder stores the selection; an invalid selection returns an error
+    /// when passed to [`Velr::create`]. Pass an empty iterator to clear a previous
+    /// selection before creating the database.
     pub fn with_inline_edge_properties<I, S>(mut self, names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -2659,9 +2723,9 @@ impl CreateOptions {
 /// connections for work on different threads. Returned handles remain on the
 /// thread where they were created.
 ///
-/// Create with [`Velr::create`], or open with [`Velr::open`] or [`Velr::open_readonly`].
-/// Supported older databases require an explicit migration. See
-/// [`Velr::needs_migration`] and [`Velr::migrate`].
+/// Open with [`Velr::open`] or [`Velr::open_readonly`], or initialize a new database
+/// with [`Velr::create`] and [`CreateOptions`]. Supported older databases
+/// are not automatically migrated; see [`Velr::needs_migration`] and [`Velr::migrate`].
 pub struct Velr {
     db: NonNull<ffi::velr_db>,
     _not_sync: PhantomData<Cell<()>>, // Send + !Sync
@@ -2676,11 +2740,27 @@ impl Velr {
     /// must name a file that does not exist. The inline relationship property
     /// selection is fixed at creation and persists when the database is reopened.
     /// Use [`Self::open`] or [`Self::open_readonly`] to reopen an existing file.
+    /// Parent directories for a file-backed database must already exist. Dropping
+    /// the returned connection closes it; copied results remain independently owned.
+    ///
+    /// The `options` argument defaults to no selected relationship properties when
+    /// constructed with [`CreateOptions::default`]. Requires a runtime with database
+    /// creation support (Velr 0.2.62 or later).
+    ///
+    /// ```
+    /// use velr::{CreateOptions, Velr};
+    /// let db = Velr::create(None, CreateOptions::new()
+    ///     .with_inline_edge_properties(["timestamp"]))?;
+    /// assert_eq!(db.inline_edge_properties()?, ["timestamp"]);
+    /// # Ok::<(), velr::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if the path exists, the path or options are invalid,
-    /// creation fails, or the loaded runtime lacks the creation API.
+    /// Returns an [`Error`] if the path exists, cannot be created, or contains a
+    /// NUL byte; if the selection contains more than one property, an empty name,
+    /// or a NUL-containing name; or if the runtime is unavailable, incompatible,
+    /// or lacks the creation API. Existing files are never overwritten.
     pub fn create(path: Option<&str>, options: CreateOptions) -> Result<Self> {
         let a = velr_api()?;
         let create = require_runtime_symbol(a.velr_create, "velr_create")?;
@@ -2782,9 +2862,9 @@ impl Velr {
     /// Velr schema version. Use this for viewers, agents, and other read paths
     /// that should not perform schema DDL.
     ///
-    /// With the bundled runtime, migrate older databases on a writable connection
-    /// and reopen the read-only connection before querying. Use [`Velr::migrate`]
-    /// or `MIGRATE DATABASE` to apply pending migrations.
+    /// Supported older formats require an explicit migration through a writable
+    /// connection before graph queries, including reads. Reopen read-only connections
+    /// after migrating. Use [`Velr::migrate`] or `MIGRATE DATABASE` for the upgrade.
     ///
     /// # Errors
     ///
@@ -2917,8 +2997,8 @@ impl Velr {
 
     /// Return true when this connection is on an older supported schema version.
     ///
-    /// With the bundled runtime, migrate the database before running graph queries
-    /// when this method returns `true`.
+    /// Graph queries, including reads, are rejected on supported older formats until
+    /// the database is explicitly migrated to the current schema version.
     ///
     /// # Errors
     ///
@@ -3115,12 +3195,13 @@ impl Velr {
 
         Ok(ExecTables {
             stream: Some(nn),
+            control: None,
             _db: PhantomData,
             _nosend: PhantomData,
         })
     }
 
-    /// Execute `openCypher` with out-of-band result emission options.
+    /// Execute `openCypher` with [`QueryOptions`] and stream the resulting tables.
     ///
     /// Use this for result metadata and a bounded row preview.
     /// [`QueryOptions::max_result_rows`] caps rows emitted from each result table.
@@ -3129,18 +3210,21 @@ impl Velr {
     ///
     /// `QueryOptions::max_result_rows(0)` preserves table metadata, including column names, but
     /// row cursors immediately return EOF.
+    /// The timeout and cancellation token apply to opening and reading the result stream.
     ///
     /// # Errors
     ///
     /// Returns an [`Error`] if:
     /// - `openCypher` contains an interior NUL (`\0`)
     /// - the runtime reports an execution, planning, or parsing error
+    /// - the query is canceled or expires while starting execution
     pub fn exec_with_options<'db>(
         &'db self,
         cypher: &str,
         options: QueryOptions,
     ) -> Result<ExecTables<'db>> {
         let a = velr_api()?;
+        let control = NativeQueryControl::prepare(a, &options)?;
 
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
@@ -3150,13 +3234,24 @@ impl Velr {
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc = unsafe {
-            (a.velr_exec_start_with_options)(
-                self.db.as_ptr(),
-                cy.as_ptr(),
-                &raw_options,
-                &mut out_stream,
-                &mut err,
-            )
+            if let Some(control) = &control {
+                (require_control_api(a.velr_exec_start_with_control)?)(
+                    self.db.as_ptr(),
+                    cy.as_ptr(),
+                    &raw_options,
+                    control.as_ptr(),
+                    &mut out_stream,
+                    &mut err,
+                )
+            } else {
+                (a.velr_exec_start_with_options)(
+                    self.db.as_ptr(),
+                    cy.as_ptr(),
+                    &raw_options,
+                    &mut out_stream,
+                    &mut err,
+                )
+            }
         };
         rc_to_result(rc, err)?;
 
@@ -3169,6 +3264,7 @@ impl Velr {
 
         Ok(ExecTables {
             stream: Some(nn),
+            control,
             _db: PhantomData,
             _nosend: PhantomData,
         })
@@ -3199,7 +3295,7 @@ impl Velr {
         let rc =
             unsafe { (a.velr_exec_one)(self.db.as_ptr(), cy.as_ptr(), &mut out_table, &mut err) };
         rc_to_result(rc, err)?;
-        TableResult::from_raw(out_table)
+        TableResult::from_raw(out_table, None)
     }
 
     /// Execute `openCypher` with options and return exactly one result table.
@@ -3208,6 +3304,7 @@ impl Velr {
     /// provided openCypher text produces exactly one result table. Row emission is controlled by
     /// [`QueryOptions`]; use [`QueryOptions::max_result_rows`] with `0` to inspect column metadata
     /// without emitting rows.
+    /// The timeout and cancellation token apply to execution and subsequent row reads.
     ///
     /// # Errors
     ///
@@ -3215,12 +3312,14 @@ impl Velr {
     /// - `openCypher` contains an interior NUL (`\0`)
     /// - the runtime reports an execution, planning, or parsing error
     /// - the execution yields zero or multiple result tables
+    /// - the query is canceled or expires
     pub fn exec_one_with_options(
         &self,
         cypher: &str,
         options: QueryOptions,
     ) -> Result<TableResult> {
         let a = velr_api()?;
+        let control = NativeQueryControl::prepare(a, &options)?;
 
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
@@ -3230,16 +3329,27 @@ impl Velr {
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc = unsafe {
-            (a.velr_exec_one_with_options)(
-                self.db.as_ptr(),
-                cy.as_ptr(),
-                &raw_options,
-                &mut out_table,
-                &mut err,
-            )
+            if let Some(control) = &control {
+                (require_control_api(a.velr_exec_one_with_control)?)(
+                    self.db.as_ptr(),
+                    cy.as_ptr(),
+                    &raw_options,
+                    control.as_ptr(),
+                    &mut out_table,
+                    &mut err,
+                )
+            } else {
+                (a.velr_exec_one_with_options)(
+                    self.db.as_ptr(),
+                    cy.as_ptr(),
+                    &raw_options,
+                    &mut out_table,
+                    &mut err,
+                )
+            }
         };
         rc_to_result(rc, err)?;
-        TableResult::from_raw(out_table)
+        TableResult::from_raw(out_table, control)
     }
 
     /// Execute a query and discard all results.
@@ -3260,21 +3370,32 @@ impl Velr {
 
     /// Execute a query with options and discard emitted results.
     ///
-    /// Query options still affect emitted rows, but they do not skip side effects from write
-    /// queries. For example, a read-write query with `max_result_rows = 1` may emit one row while
-    /// still applying all writes required by the query.
+    /// Result row limits still allow write queries to apply their side effects.
+    /// Use [`QueryOptions::with_timeout`] and [`QueryOptions::with_cancellation`]
+    /// to stop execution.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if the runtime reports an execution error.
+    /// Returns an [`Error`] if execution fails, is canceled, or exceeds its deadline.
     pub fn run_with_options(&self, cypher: &str, options: QueryOptions) -> Result<()> {
         let a = velr_api()?;
+        let control = NativeQueryControl::prepare(a, &options)?;
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
         let (raw_options, _raw_params) = raw_query_options(cypher, &options)?;
         let mut err: *mut c_char = std::ptr::null_mut();
         let rc = unsafe {
-            (a.velr_run_with_options)(self.db.as_ptr(), cy.as_ptr(), &raw_options, &mut err)
+            if let Some(control) = &control {
+                (require_control_api(a.velr_run_with_control)?)(
+                    self.db.as_ptr(),
+                    cy.as_ptr(),
+                    &raw_options,
+                    control.as_ptr(),
+                    &mut err,
+                )
+            } else {
+                (a.velr_run_with_options)(self.db.as_ptr(), cy.as_ptr(), &raw_options, &mut err)
+            }
         };
         rc_to_result(rc, err)
     }
@@ -3523,6 +3644,7 @@ impl Drop for Velr {
 /// reported while advancing tables or fetching rows, after the initial call succeeds.
 pub struct ExecTables<'db> {
     stream: Option<NonNull<ffi::velr_stream>>,
+    control: Option<Arc<NativeQueryControl>>,
     _db: PhantomData<&'db Velr>,
     _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
@@ -3556,10 +3678,11 @@ impl<'db> ExecTables<'db> {
         if has == 0 {
             unsafe { (a.velr_exec_close)(stream.as_ptr()) };
             self.stream = None;
+            self.control = None;
             return Ok(None);
         }
 
-        TableResult::from_raw(out_table).map(Some)
+        TableResult::from_raw(out_table, self.control.clone()).map(Some)
     }
 }
 
@@ -3589,6 +3712,7 @@ impl Drop for ExecTables<'_> {
 /// Copy borrowed string/JSON cells when retaining values outside the row callback.
 pub struct TableResult {
     table: NonNull<ffi::velr_table>,
+    _control: Option<Arc<NativeQueryControl>>,
     col_names: Vec<String>,
     col_count: usize,
     _nosend: PhantomData<Rc<()>>, // !Send + !Sync
@@ -3601,7 +3725,10 @@ impl TableResult {
     ///
     /// Returns an [`Error`] if `ptr` is null, if the runtime fails to retrieve column names,
     /// or if column name bytes are not valid UTF-8.
-    fn from_raw(ptr: *mut ffi::velr_table) -> Result<Self> {
+    fn from_raw(
+        ptr: *mut ffi::velr_table,
+        control: Option<Arc<NativeQueryControl>>,
+    ) -> Result<Self> {
         let a = velr_api()?;
 
         let table = NonNull::new(ptr)
@@ -3650,6 +3777,7 @@ impl TableResult {
         match build {
             Ok((col_names, col_count)) => Ok(Self {
                 table,
+                _control: control,
                 col_names,
                 col_count,
                 _nosend: PhantomData,
@@ -3758,6 +3886,13 @@ impl TableResult {
     /// The returned buffer is owned and can be written to a file or passed to an
     /// Arrow reader without retaining this table. Export may read the entire result
     /// and allocate memory proportional to its size.
+    ///
+    /// Column types are inferred from result values. Structured values such as Cypher
+    /// lists, maps, nodes, relationships, and paths become JSON strings in Arrow UTF-8
+    /// columns, not nested Arrow arrays. Numeric columns may be integer or floating-point;
+    /// incompatible value kinds in one column are rendered as strings. Null values stay
+    /// null, and empty/all-null columns are UTF-8 string columns. Inspect the exported schema before assuming an
+    /// application dtype; see the [Arrow guide](crate::guide#arrow-ipc).
     ///
     /// # Errors
     ///
@@ -3994,15 +4129,17 @@ impl<'db> VelrTx<'db> {
 
         Ok(ExecTablesTx {
             stream: Some(nn),
+            control: None,
             _tx: PhantomData,
             _nosend: PhantomData,
         })
     }
 
-    /// Execute `openCypher` within this transaction with out-of-band result emission options.
+    /// Execute `openCypher` within this transaction with [`QueryOptions`].
     ///
     /// Transactional semantics match [`VelrTx::exec`]. [`QueryOptions::max_result_rows`] caps
     /// emitted rows per result table. Existing Cypher `LIMIT` clauses still apply.
+    /// The timeout and cancellation token apply to opening and reading the result stream.
     ///
     /// # Errors
     ///
@@ -4010,12 +4147,14 @@ impl<'db> VelrTx<'db> {
     /// - the transaction is no longer active
     /// - `openCypher` contains an interior NUL (`\0`)
     /// - the runtime reports an execution, planning, or parsing error
+    /// - the query is canceled or expires while starting execution
     pub fn exec_with_options<'tx>(
         &'tx self,
         cypher: &str,
         options: QueryOptions,
     ) -> Result<ExecTablesTx<'tx>> {
         let a = velr_api()?;
+        let control = NativeQueryControl::prepare(a, &options)?;
 
         let tx = self.ptr()?;
         let cy = CString::new(cypher)
@@ -4026,13 +4165,24 @@ impl<'db> VelrTx<'db> {
         let mut err: *mut c_char = std::ptr::null_mut();
 
         let rc = unsafe {
-            (a.velr_tx_exec_start_with_options)(
-                tx.as_ptr(),
-                cy.as_ptr(),
-                &raw_options,
-                &mut out_stream,
-                &mut err,
-            )
+            if let Some(control) = &control {
+                (require_control_api(a.velr_tx_exec_start_with_control)?)(
+                    tx.as_ptr(),
+                    cy.as_ptr(),
+                    &raw_options,
+                    control.as_ptr(),
+                    &mut out_stream,
+                    &mut err,
+                )
+            } else {
+                (a.velr_tx_exec_start_with_options)(
+                    tx.as_ptr(),
+                    cy.as_ptr(),
+                    &raw_options,
+                    &mut out_stream,
+                    &mut err,
+                )
+            }
         };
         rc_to_result(rc, err)?;
 
@@ -4045,6 +4195,7 @@ impl<'db> VelrTx<'db> {
 
         Ok(ExecTablesTx {
             stream: Some(nn),
+            control,
             _tx: PhantomData,
             _nosend: PhantomData,
         })
@@ -4084,6 +4235,7 @@ impl<'db> VelrTx<'db> {
     /// This is the options-aware form of [`VelrTx::exec_one`]. It succeeds only if executing the
     /// provided openCypher text produces exactly one result table. Use
     /// [`QueryOptions::max_result_rows`] with `0` to inspect column metadata without emitting rows.
+    /// The timeout and cancellation token apply to execution and subsequent row reads.
     ///
     /// # Errors
     ///
@@ -4093,6 +4245,7 @@ impl<'db> VelrTx<'db> {
     /// - the loaded runtime does not support these query options
     /// - the runtime reports an execution, planning, or parsing error
     /// - the execution yields zero or multiple result tables
+    /// - the query is canceled or expires
     pub fn exec_one_with_options(
         &self,
         cypher: &str,
@@ -4137,20 +4290,33 @@ impl<'db> VelrTx<'db> {
 
     /// Execute a query with options inside this transaction and discard results.
     ///
-    /// Query options cap only emitted rows; they do not skip query side effects.
+    /// Result row limits still allow write queries to apply their side effects.
+    /// Use [`QueryOptions::with_timeout`] and [`QueryOptions::with_cancellation`]
+    /// to stop execution.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if the runtime reports an execution error.
+    /// Returns an [`Error`] if execution fails, is canceled, or exceeds its deadline.
     pub fn run_with_options(&self, cypher: &str, options: QueryOptions) -> Result<()> {
         let a = velr_api()?;
+        let control = NativeQueryControl::prepare(a, &options)?;
         let tx = self.ptr()?;
         let cy = CString::new(cypher)
             .map_err(|_| Error::new(ffi::velr_code::VELR_EUTF as i32, "openCypher contains NUL"))?;
         let (raw_options, _raw_params) = raw_query_options(cypher, &options)?;
         let mut err: *mut c_char = std::ptr::null_mut();
         let rc = unsafe {
-            (a.velr_tx_run_with_options)(tx.as_ptr(), cy.as_ptr(), &raw_options, &mut err)
+            if let Some(control) = &control {
+                (require_control_api(a.velr_tx_run_with_control)?)(
+                    tx.as_ptr(),
+                    cy.as_ptr(),
+                    &raw_options,
+                    control.as_ptr(),
+                    &mut err,
+                )
+            } else {
+                (a.velr_tx_run_with_options)(tx.as_ptr(), cy.as_ptr(), &raw_options, &mut err)
+            }
         };
         rc_to_result(rc, err)
     }
@@ -4581,6 +4747,7 @@ impl Drop for VelrTx<'_> {
 /// the stream closes it; it does not commit the transaction.
 pub struct ExecTablesTx<'tx> {
     stream: Option<NonNull<ffi::velr_stream_tx>>,
+    control: Option<Arc<NativeQueryControl>>,
     _tx: PhantomData<&'tx VelrTx<'tx>>,
     _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
@@ -4612,10 +4779,11 @@ impl ExecTablesTx<'_> {
         if has == 0 {
             unsafe { (a.velr_exec_tx_close)(stream.as_ptr()) };
             self.stream = None;
+            self.control = None;
             return Ok(None);
         }
 
-        TableResult::from_raw(out_table).map(Some)
+        TableResult::from_raw(out_table, self.control.clone()).map(Some)
     }
 }
 
@@ -4724,6 +4892,14 @@ impl Drop for VelrSavepoint<'_> {
 /// `ArrowArray` values after the call; this matches an ownership-transfer pattern typical of
 /// the Arrow C Data Interface (the runtime is expected to manage release thereafter).
 
+/// Arrow binding support.
+///
+/// This module is only compiled with the `arrow-ipc` feature enabled.
+///
+/// It exports Arrow arrays/schemas using `arrow2`’s Arrow C Data Interface helpers and passes
+/// them to the Velr runtime ABI. The code uses `ManuallyDrop` to avoid dropping the exported
+/// `ArrowArray` values after the call; this matches an ownership-transfer pattern typical of
+/// the Arrow C Data Interface (the runtime is expected to manage release thereafter).
 #[cfg(feature = "arrow-ipc")]
 mod arrow_bind {
     use super::*;

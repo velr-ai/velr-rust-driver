@@ -12,6 +12,16 @@ use crate::sys::*;
 use arrow2::ffi::{ArrowArray, ArrowSchema};
 pub struct Api {
     pub velr_string_free: unsafe extern "C" fn(*mut c_char),
+    pub velr_query_control_new: Option<
+        unsafe extern "C" fn(u64) -> *mut velr_query_control,
+    >,
+    pub velr_query_control_cancel: Option<
+        unsafe extern "C" fn(*const velr_query_control),
+    >,
+    pub velr_query_control_status: Option<
+        unsafe extern "C" fn(*const velr_query_control) -> velr_code,
+    >,
+    pub velr_query_control_free: Option<unsafe extern "C" fn(*mut velr_query_control)>,
     pub velr_open: unsafe extern "C" fn(
         *const c_char,
         *mut *mut velr_db,
@@ -196,6 +206,16 @@ pub struct Api {
         *mut *mut velr_stream,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_exec_start_with_control: Option<
+        unsafe extern "C" fn(
+            *mut velr_db,
+            *const c_char,
+            *const velr_query_options,
+            *const velr_query_control,
+            *mut *mut velr_stream,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
     pub velr_run: unsafe extern "C" fn(
         *mut velr_db,
         *const c_char,
@@ -207,6 +227,15 @@ pub struct Api {
         *const velr_query_options,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_run_with_control: Option<
+        unsafe extern "C" fn(
+            *mut velr_db,
+            *const c_char,
+            *const velr_query_options,
+            *const velr_query_control,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
     pub velr_exec_close: unsafe extern "C" fn(*mut velr_stream),
     pub velr_stream_next_table: unsafe extern "C" fn(
         *mut velr_stream,
@@ -323,6 +352,16 @@ pub struct Api {
         *mut *mut velr_table,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_exec_one_with_control: Option<
+        unsafe extern "C" fn(
+            *mut velr_db,
+            *const c_char,
+            *const velr_query_options,
+            *const velr_query_control,
+            *mut *mut velr_table,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
     pub velr_table_close: unsafe extern "C" fn(*mut velr_table),
     pub velr_table_column_count: unsafe extern "C" fn(*mut velr_table) -> usize,
     pub velr_table_column_name: unsafe extern "C" fn(
@@ -413,6 +452,16 @@ pub struct Api {
         *mut *mut velr_stream_tx,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_tx_exec_start_with_control: Option<
+        unsafe extern "C" fn(
+            *mut velr_tx,
+            *const c_char,
+            *const velr_query_options,
+            *const velr_query_control,
+            *mut *mut velr_stream_tx,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
     pub velr_tx_run: unsafe extern "C" fn(
         *mut velr_tx,
         *const c_char,
@@ -424,6 +473,15 @@ pub struct Api {
         *const velr_query_options,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_tx_run_with_control: Option<
+        unsafe extern "C" fn(
+            *mut velr_tx,
+            *const c_char,
+            *const velr_query_options,
+            *const velr_query_control,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
     pub velr_exec_tx_close: unsafe extern "C" fn(*mut velr_stream_tx),
     pub velr_stream_tx_next_table: unsafe extern "C" fn(
         *mut velr_stream_tx,
@@ -571,6 +629,22 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_string_free), "\0").as_bytes(),
             )?,
+            velr_query_control_new: get_optional(
+                lib,
+                concat!(stringify!(velr_query_control_new), "\0").as_bytes(),
+            ),
+            velr_query_control_cancel: get_optional(
+                lib,
+                concat!(stringify!(velr_query_control_cancel), "\0").as_bytes(),
+            ),
+            velr_query_control_status: get_optional(
+                lib,
+                concat!(stringify!(velr_query_control_status), "\0").as_bytes(),
+            ),
+            velr_query_control_free: get_optional(
+                lib,
+                concat!(stringify!(velr_query_control_free), "\0").as_bytes(),
+            ),
             velr_open: get(lib, concat!(stringify!(velr_open), "\0").as_bytes())?,
             velr_create: get_optional(
                 lib,
@@ -690,11 +764,19 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_exec_start_with_options), "\0").as_bytes(),
             )?,
+            velr_exec_start_with_control: get_optional(
+                lib,
+                concat!(stringify!(velr_exec_start_with_control), "\0").as_bytes(),
+            ),
             velr_run: get(lib, concat!(stringify!(velr_run), "\0").as_bytes())?,
             velr_run_with_options: get(
                 lib,
                 concat!(stringify!(velr_run_with_options), "\0").as_bytes(),
             )?,
+            velr_run_with_control: get_optional(
+                lib,
+                concat!(stringify!(velr_run_with_control), "\0").as_bytes(),
+            ),
             velr_exec_close: get(
                 lib,
                 concat!(stringify!(velr_exec_close), "\0").as_bytes(),
@@ -778,6 +860,10 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_exec_one_with_options), "\0").as_bytes(),
             )?,
+            velr_exec_one_with_control: get_optional(
+                lib,
+                concat!(stringify!(velr_exec_one_with_control), "\0").as_bytes(),
+            ),
             velr_table_close: get(
                 lib,
                 concat!(stringify!(velr_table_close), "\0").as_bytes(),
@@ -848,11 +934,19 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_tx_exec_start_with_options), "\0").as_bytes(),
             )?,
+            velr_tx_exec_start_with_control: get_optional(
+                lib,
+                concat!(stringify!(velr_tx_exec_start_with_control), "\0").as_bytes(),
+            ),
             velr_tx_run: get(lib, concat!(stringify!(velr_tx_run), "\0").as_bytes())?,
             velr_tx_run_with_options: get(
                 lib,
                 concat!(stringify!(velr_tx_run_with_options), "\0").as_bytes(),
             )?,
+            velr_tx_run_with_control: get_optional(
+                lib,
+                concat!(stringify!(velr_tx_run_with_control), "\0").as_bytes(),
+            ),
             velr_exec_tx_close: get(
                 lib,
                 concat!(stringify!(velr_exec_tx_close), "\0").as_bytes(),

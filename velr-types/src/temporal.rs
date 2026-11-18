@@ -839,33 +839,94 @@ impl ZonedDateTimeValue {
         })
     }
 
-    /// Adds a duration to a fixed-offset datetime. Returns an error for named-zone arithmetic or an
-    /// out-of-range result.
+    /// Adds a duration to this datetime. Months and days shift the local calendar in the
+    /// datetime's timezone. The remaining time shifts the resulting instant.
+    /// Returns an error if the timezone is unavailable or the result is out of range.
     pub fn checked_add_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
-        if self.zone_id.is_some() {
-            return Err(EncodeError::InvalidTemporal(
-                "named-zone datetime duration arithmetic is not implemented",
-            ));
-        }
-        Ok(Self {
-            datetime: self.datetime.checked_add_duration(duration)?,
-            offset: self.offset,
-            zone_id: None,
-        })
+        self.checked_add_duration_groups(
+            duration.total_months(),
+            duration.total_days(),
+            duration.total_time_nanos(),
+        )
     }
 
-    /// Subtracts a duration from a fixed-offset datetime. Returns an error for named-zone
-    /// arithmetic or an out-of-range result.
+    /// Subtracts a duration from this datetime using the same calendar and elapsed-time rules
+    /// as [`Self::checked_add_duration`]. Returns an error if the timezone is unavailable, the
+    /// duration cannot be negated, or the result is out of range.
     pub fn checked_sub_duration(&self, duration: &DurationValue) -> Result<Self, EncodeError> {
-        if self.zone_id.is_some() {
-            return Err(EncodeError::InvalidTemporal(
-                "named-zone datetime duration arithmetic is not implemented",
-            ));
+        self.checked_add_duration_groups(
+            checked_i64_from_i128(-i128::from(duration.total_months()))?,
+            checked_i64_from_i128(-i128::from(duration.total_days()))?,
+            duration
+                .total_time_nanos()
+                .checked_neg()
+                .ok_or(EncodeError::InvalidTemporal("duration arithmetic overflow"))?,
+        )
+    }
+
+    fn checked_add_duration_groups(
+        &self,
+        months: i64,
+        days: i64,
+        time_nanos: i128,
+    ) -> Result<Self, EncodeError> {
+        let Some(zone_id) = &self.zone_id else {
+            return Ok(Self {
+                datetime: self
+                    .datetime
+                    .checked_add_duration_groups(months, days, time_nanos)?,
+                offset: self.offset,
+                zone_id: None,
+            });
+        };
+        let timezone = TimeZone::get(zone_id)
+            .map_err(|_| EncodeError::InvalidTemporal("invalid or unavailable zone id"))?;
+        let (day, nanos) = self.utc_epoch_day_and_nanos();
+        let mut zoned = timestamp_from_epoch_day_and_nanos(day, nanos)?.to_zoned(timezone);
+        const OVERFLOW: EncodeError =
+            EncodeError::InvalidTemporal("datetime duration arithmetic overflow");
+
+        // Resolve each calendar shift in order. Jiff retains the preceding offset when it
+        // is valid in an overlap and advances a local time through a gap.
+        if months != 0 {
+            let date = DateValue {
+                inner: zoned.date(),
+            }
+            .checked_add_months(months)?;
+            zoned = zoned
+                .with()
+                .date(date.as_jiff())
+                .build()
+                .map_err(|_| OVERFLOW)?;
         }
+        if days != 0 {
+            let date = DateValue {
+                inner: zoned.date(),
+            }
+            .checked_add_days(days)?;
+            zoned = zoned
+                .with()
+                .date(date.as_jiff())
+                .build()
+                .map_err(|_| OVERFLOW)?;
+        }
+        if time_nanos != 0 {
+            let instant = zoned
+                .timestamp()
+                .as_nanosecond()
+                .checked_add(time_nanos)
+                .ok_or(OVERFLOW)?;
+            zoned = Timestamp::from_nanosecond(instant)
+                .map_err(|_| OVERFLOW)?
+                .to_zoned(zoned.time_zone().clone());
+        }
+
         Ok(Self {
-            datetime: self.datetime.checked_sub_duration(duration)?,
-            offset: self.offset,
-            zone_id: None,
+            datetime: LocalDateTimeValue {
+                inner: zoned.datetime(),
+            },
+            offset: UtcOffsetValue::new(zoned.offset().seconds())?,
+            zone_id: Some(zone_id.clone()),
         })
     }
 }
@@ -1367,12 +1428,20 @@ impl PartialEq for DurationValue {
 
 impl Eq for DurationValue {}
 
-/// Reads a named temporal component. Returns `None` for unsupported components or value types, a
-/// null value for null input, or an error on conversion overflow.
+/// Reads a named temporal component using ASCII case-insensitive matching. Returns `None` for
+/// unsupported components or value types, a null value for null input, or an error on conversion
+/// overflow.
 pub fn temporal_component(
     value: PropertyValueRef<'_>,
     key: &str,
 ) -> Result<Option<PropertyValue>, EncodeError> {
+    let lowercase;
+    let key = if key.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        lowercase = key.to_ascii_lowercase();
+        lowercase.as_str()
+    } else {
+        key
+    };
     match value {
         PropertyValueRef::Null => Ok(Some(PropertyValue::Null)),
         PropertyValueRef::Date(value) => date_component(value, key),
@@ -1399,11 +1468,11 @@ fn date_component(value: &DateValue, key: &str) -> Result<Option<PropertyValue>,
         "quarter" => integer(value.quarter() as i64),
         "month" => integer(value.month() as i64),
         "week" => integer(value.iso_week()? as i64),
-        "weekYear" => integer(value.iso_week_year()? as i64),
+        "weekyear" => integer(value.iso_week_year()? as i64),
         "day" => integer(value.day() as i64),
-        "ordinalDay" => integer(value.ordinal_day()? as i64),
-        "weekDay" => integer(value.iso_day_of_week() as i64),
-        "dayOfQuarter" => integer(value.day_of_quarter()? as i64),
+        "ordinalday" => integer(value.ordinal_day()? as i64),
+        "weekday" => integer(value.iso_day_of_week() as i64),
+        "dayofquarter" => integer(value.day_of_quarter()? as i64),
         _ => return Ok(None),
     };
     Ok(Some(component))
@@ -1435,8 +1504,8 @@ fn zoned_time_component(
     }
     let component = match key {
         "timezone" | "offset" => string(value.offset.to_string()),
-        "offsetMinutes" => integer(i64::from(value.offset.seconds_east() / 60)),
-        "offsetSeconds" => integer(i64::from(value.offset.seconds_east())),
+        "offsetminutes" => integer(i64::from(value.offset.seconds_east() / 60)),
+        "offsetseconds" => integer(i64::from(value.offset.seconds_east())),
         _ => return Ok(None),
     };
     Ok(Some(component))
@@ -1468,10 +1537,10 @@ fn zoned_datetime_component(
                 .unwrap_or_else(|| value.offset.to_string()),
         ),
         "offset" => string(value.offset.to_string()),
-        "offsetMinutes" => integer(i64::from(value.offset.seconds_east() / 60)),
-        "offsetSeconds" => integer(i64::from(value.offset.seconds_east())),
-        "epochSeconds" => integer(zoned_datetime_epoch_seconds(value)?),
-        "epochMillis" => integer(zoned_datetime_epoch_millis(value)?),
+        "offsetminutes" => integer(i64::from(value.offset.seconds_east() / 60)),
+        "offsetseconds" => integer(i64::from(value.offset.seconds_east())),
+        "epochseconds" => integer(zoned_datetime_epoch_seconds(value)?),
+        "epochmillis" => integer(zoned_datetime_epoch_millis(value)?),
         _ => return Ok(None),
     };
     Ok(Some(component))
@@ -1509,23 +1578,23 @@ fn duration_component(
         "milliseconds" => integer(checked_i64_from_i128(nanos.div_euclid(1_000_000))?),
         "microseconds" => integer(checked_i64_from_i128(nanos.div_euclid(1_000))?),
         "nanoseconds" => integer(checked_i64_from_i128(nanos)?),
-        "quartersOfYear" => integer((months % 12) / 3),
-        "monthsOfQuarter" => integer(months % 3),
-        "monthsOfYear" => integer(months % 12),
-        "daysOfWeek" => integer(days % 7),
-        "minutesOfHour" => integer(checked_i64_from_i128(
+        "quartersofyear" => integer((months % 12) / 3),
+        "monthsofquarter" => integer(months % 3),
+        "monthsofyear" => integer(months % 12),
+        "daysofweek" => integer(days % 7),
+        "minutesofhour" => integer(checked_i64_from_i128(
             nanos.div_euclid(nanos_per_minute).rem_euclid(60),
         )?),
-        "secondsOfMinute" => integer(checked_i64_from_i128(
+        "secondsofminute" => integer(checked_i64_from_i128(
             nanos.div_euclid(nanos_per_second).rem_euclid(60),
         )?),
-        "millisecondsOfSecond" => integer(checked_i64_from_i128(
+        "millisecondsofsecond" => integer(checked_i64_from_i128(
             nanos.div_euclid(1_000_000).rem_euclid(1000),
         )?),
-        "microsecondsOfSecond" => integer(checked_i64_from_i128(
+        "microsecondsofsecond" => integer(checked_i64_from_i128(
             nanos.div_euclid(1_000).rem_euclid(1_000_000),
         )?),
-        "nanosecondsOfSecond" => {
+        "nanosecondsofsecond" => {
             integer(checked_i64_from_i128(nanos.rem_euclid(nanos_per_second))?)
         }
         _ => return Ok(None),

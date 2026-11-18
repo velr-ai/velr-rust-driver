@@ -1,4 +1,8 @@
-//! Owned and borrowed values returned by the Rust driver and passed to vector embedding callbacks.
+//! Owned and borrowed property values used by shared Rust APIs and vector embedding callbacks.
+//!
+//! These typed values are distinct from the `velr` driver's `QueryValue` parameters and
+//! `CellRef` query results. Ordinary query rows expose structured values as JSON cells;
+//! they do not automatically return `PropertyValue` variants.
 
 #![warn(missing_docs)]
 

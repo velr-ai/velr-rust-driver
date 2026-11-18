@@ -4,7 +4,8 @@
 //! values, and bytes. [`PropertyValueRef`] borrows an existing value without
 //! cloning its contents. The `velr` driver reexports these types for applications
 //! such as vector embedding callbacks. Query parameters in that driver use its
-//! separate `QueryValue` type.
+//! separate `QueryValue` type. Ordinary query rows use `CellRef`, with structured
+//! values represented as JSON bytes rather than automatically converted into these types.
 //!
 //! Typed lists retain null elements and iterate in their original order:
 //!
