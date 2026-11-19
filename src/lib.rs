@@ -132,6 +132,14 @@
 //! A runtime error can be reported before a result table is returned: the phase describes the
 //! Cypher error, rather than which driver call reports it.
 //!
+//! Use [`Error::kind`] for stable classification, [`Error::is_query_error`] to
+//! handle the complete Cypher error family, and [`Error::detail`] for typed
+//! detail identifiers. [`Error::diagnostic`] supplies the raw identifiers,
+//! phase and source information. Use [`Error::application`] to return an
+//! application failure from a row callback while preserving its source.
+//! Older runtimes can omit metadata. [`Error::is_retryable`] identifies a
+//! condition that may clear; it does not guarantee safe replay of a write.
+//!
 //! # Schema migration and introspection
 //!
 //! Use [`Velr::current_schema_version`] to get the schema version supported by this runtime.
@@ -206,6 +214,7 @@ pub mod query_language {}
 
 mod api;
 mod cancellation;
+mod diagnostic;
 mod runtime;
 mod sys;
 
@@ -226,6 +235,7 @@ use std::{
 
 pub use cancellation::CancellationToken;
 use cancellation::{require_control_api, NativeQueryControl};
+pub use diagnostic::{ErrorDetail, ErrorDiagnostic, ErrorPosition};
 use serde_json::Value as JsonValue;
 use sys as ffi;
 use velr_types::{decode_property_value, StorageValueRef};
@@ -257,7 +267,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// undefined arithmetic or overflow, `EntityNotFound` for access to a deleted graph entity,
 /// `ConstraintVerificationFailed` for a graph constraint violation, and `SemanticError`
 /// for a graph semantic rule violation.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Error {
     /// Numeric API status code; distinct from the Cypher error category in the message.
     pub code: i32,
@@ -266,6 +277,8 @@ pub struct Error {
     /// Other API failures can have an empty message. Diagnostic wording can change;
     /// preserve the full message when displaying or logging a failure.
     pub message: String,
+    diagnostic: Option<ErrorDiagnostic>,
+    cause: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Machine-readable classification of a Velr operation error.
@@ -276,6 +289,34 @@ pub enum ErrorKind {
     Cancelled,
     /// The query's deadline expired before execution or result fetching finished.
     DeadlineExceeded,
+    /// Invalid Cypher syntax or static query validation.
+    Syntax,
+    /// A Cypher semantic rule was violated.
+    Semantic,
+    /// A Cypher value has an incompatible type.
+    Type,
+    /// A parameter is missing or a query argument is invalid.
+    Parameter,
+    /// A referenced procedure is unavailable.
+    ProcedureNotFound,
+    /// A referenced graph entity no longer exists.
+    EntityNotFound,
+    /// A graph constraint was violated.
+    Constraint,
+    /// Arithmetic overflowed or is undefined.
+    Arithmetic,
+    /// Another connection is temporarily preventing database access.
+    DatabaseBusy,
+    /// The operation requires a writable connection.
+    ReadOnly,
+    /// The database requires explicit migration before this operation.
+    MigrationRequired,
+    /// A handle is closed, consumed, or used in an invalid state.
+    HandleState,
+    /// A filesystem or other operating-system operation failed.
+    Io,
+    /// A classified Cypher failure without a more specific known kind.
+    Query,
     /// Another database, driver, or runtime failure.
     Other,
 }
@@ -286,15 +327,186 @@ impl Error {
         match self.code {
             code if code == ffi::velr_code::VELR_ECANCELLED as i32 => ErrorKind::Cancelled,
             code if code == ffi::velr_code::VELR_EDEADLINE as i32 => ErrorKind::DeadlineExceeded,
-            _ => ErrorKind::Other,
+            _ => match self
+                .diagnostic
+                .as_ref()
+                .and_then(|value| value.category.as_deref())
+            {
+                Some("SyntaxError") => ErrorKind::Syntax,
+                Some("SemanticError") => ErrorKind::Semantic,
+                Some("TypeError") => ErrorKind::Type,
+                Some("ParameterMissing") => ErrorKind::Parameter,
+                Some("ArgumentError")
+                    if self
+                        .diagnostic
+                        .as_ref()
+                        .and_then(|value| value.kind.as_deref())
+                        .map_or(true, |kind| kind == "query") =>
+                {
+                    ErrorKind::Parameter
+                }
+                Some("ProcedureNotFound") => ErrorKind::ProcedureNotFound,
+                Some("ProcedureError")
+                    if self
+                        .diagnostic
+                        .as_ref()
+                        .and_then(|value| value.detail.as_deref())
+                        == Some("ProcedureNotFound") =>
+                {
+                    ErrorKind::ProcedureNotFound
+                }
+                Some("EntityNotFound") => ErrorKind::EntityNotFound,
+                Some("ConstraintVerificationFailed") => ErrorKind::Constraint,
+                Some("ArithmeticError") => ErrorKind::Arithmetic,
+                Some("DatabaseBusy") => ErrorKind::DatabaseBusy,
+                Some("ReadOnly" | "ReadOnlyError") => ErrorKind::ReadOnly,
+                Some("MigrationRequired") => ErrorKind::MigrationRequired,
+                Some("DatabaseStateError")
+                    if self
+                        .diagnostic
+                        .as_ref()
+                        .and_then(|value| value.detail.as_deref())
+                        == Some("MigrationRequired") =>
+                {
+                    ErrorKind::MigrationRequired
+                }
+                Some("HandleState") => ErrorKind::HandleState,
+                Some("QueryCancelled") => ErrorKind::Cancelled,
+                Some("DeadlineExceeded") => ErrorKind::DeadlineExceeded,
+                Some("IOError") => ErrorKind::Io,
+                _ if self
+                    .diagnostic
+                    .as_ref()
+                    .and_then(|value| value.kind.as_deref())
+                    == Some("query") =>
+                {
+                    ErrorKind::Query
+                }
+                _ if self.code == ffi::velr_code::VELR_ESTATE as i32 => ErrorKind::HandleState,
+                _ => ErrorKind::Other,
+            },
         }
     }
 
-    fn new(code: i32, message: impl Into<String>) -> Self {
+    /// Whether this error belongs to the Cypher language error family.
+    ///
+    /// Includes syntax, semantic, type, parameter, procedure, entity, constraint,
+    /// arithmetic, and otherwise classified query failures. Cancellation,
+    /// deadlines, database conditions, handle-state, I/O, and application errors
+    /// are separate families and return `false`. An older runtime without typed
+    /// metadata can leave a query failure unclassified; no report text is parsed.
+    ///
+    /// This applies to errors returned during execution and result consumption.
+    pub fn is_query_error(&self) -> bool {
+        matches!(
+            self.kind(),
+            ErrorKind::Syntax
+                | ErrorKind::Semantic
+                | ErrorKind::Type
+                | ErrorKind::Parameter
+                | ErrorKind::ProcedureNotFound
+                | ErrorKind::EntityNotFound
+                | ErrorKind::Constraint
+                | ErrorKind::Arithmetic
+                | ErrorKind::Query
+        )
+    }
+
+    /// Return a typed diagnostic detail supplied by the runtime.
+    ///
+    /// Returns `None` when the runtime supplied no detail, including errors
+    /// created by application code. Unknown identifiers return
+    /// [`ErrorDetail::Other`]; the original identifier remains available in
+    /// [`ErrorDiagnostic::detail`] through [`Self::diagnostic`].
+    pub fn detail(&self) -> Option<ErrorDetail> {
+        self.diagnostic.as_ref()?.detail_kind()
+    }
+
+    /// Construct an application error from a source error or message.
+    ///
+    /// Accepts errors that own their data and are safe to share across threads,
+    /// boxed errors, [`String`], and `&str` messages. The source's display text
+    /// becomes [`Self::message`], and the original error remains available through
+    /// [`std::error::Error::source`], including after cloning this error. String
+    /// messages are stored as an error source with the same display text.
+    ///
+    /// The returned error has [`ErrorKind::Other`], no runtime diagnostic, and
+    /// the generic failure status (`-4`) in [`Self::code`]. It is not retryable.
+    /// Row callbacks return it unchanged; use `map_err(Error::application)` when
+    /// converting an application result into a Velr result.
+    ///
+    /// ```
+    /// use std::error::Error as _;
+    /// use velr::Error;
+    ///
+    /// let original = "invalid integer".parse::<i64>().unwrap_err();
+    /// let error = Error::application(original);
+    /// assert!(error.source().unwrap().is::<std::num::ParseIntError>());
+    /// assert!(!error.is_query_error());
+    ///
+    /// fn parse_count(text: &str) -> velr::Result<i64> {
+    ///     text.parse().map_err(Error::application)
+    /// }
+    /// assert_eq!(parse_count("42").unwrap(), 42);
+    /// ```
+    pub fn application(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        let source = source.into();
+        Self {
+            code: ffi::velr_code::VELR_EERR as i32,
+            message: source.to_string(),
+            diagnostic: None,
+            cause: Some(Arc::from(source)),
+        }
+    }
+
+    /// Construct an error with a numeric operation status and rendered message.
+    ///
+    /// Use [`Self::application`] for application or row-callback failures that do
+    /// not need an explicit operation status. This constructor preserves the
+    /// supplied message and has no runtime diagnostic or source attached.
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
+            diagnostic: None,
+            cause: None,
         }
+    }
+
+    /// Construct an error while preserving its underlying Rust error.
+    ///
+    /// The source is available through [`std::error::Error::source`]. It must
+    /// own its data and be safe to share across threads. The rendered message
+    /// remains the supplied `message`.
+    pub fn with_source(
+        code: i32,
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        let mut error = Self::new(code, message);
+        error.cause = Some(Arc::new(source));
+        error
+    }
+
+    /// Return structured metadata supplied by the runtime, if available.
+    ///
+    /// Older runtimes and errors constructed by application code may have no
+    /// metadata. The returned reference remains valid while this error is alive.
+    pub fn diagnostic(&self) -> Option<&ErrorDiagnostic> {
+        self.diagnostic.as_ref()
+    }
+
+    /// Whether the underlying condition may clear on a later attempt.
+    ///
+    /// This is not a guarantee that replaying a write or transaction is safe.
+    pub fn is_retryable(&self) -> bool {
+        !matches!(
+            self.kind(),
+            ErrorKind::Cancelled | ErrorKind::DeadlineExceeded
+        ) && self
+            .diagnostic
+            .as_ref()
+            .is_some_and(|details| details.retryable)
     }
 }
 
@@ -308,7 +520,13 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause
+            .as_deref()
+            .map(|source| source as &dyn std::error::Error)
+    }
+}
 
 /// A Cypher value supplied out-of-band through [`QueryParams`].
 ///
@@ -380,7 +598,7 @@ impl std::error::Error for QueryParamError {}
 
 impl From<QueryParamError> for Error {
     fn from(value: QueryParamError) -> Self {
-        Error::new(ffi::velr_code::VELR_EARG as i32, value.to_string())
+        Error::with_source(ffi::velr_code::VELR_EARG as i32, value.to_string(), value)
     }
 }
 
@@ -1889,6 +2107,39 @@ unsafe fn take_err(p: *mut c_char) -> String {
     s
 }
 
+/// Copy structured metadata before releasing its individual ABI error allocation.
+unsafe fn take_runtime_error(code: i32, pointer: *mut c_char) -> Error {
+    let diagnostic = if pointer.is_null() {
+        None
+    } else {
+        velr_api()
+            .ok()
+            .and_then(|api| api.velr_error_details_json)
+            .and_then(|get| {
+                let details = get(pointer);
+                if details.is_null() {
+                    None
+                } else {
+                    let diagnostic = ErrorDiagnostic::from_json(CStr::from_ptr(details).to_bytes());
+                    if let Ok(api) = velr_api() {
+                        (api.velr_string_free)(details);
+                    }
+                    diagnostic
+                }
+            })
+    };
+    let mut error = Error::new(code, take_err(pointer));
+    if let Some(os_code) = diagnostic
+        .as_ref()
+        .filter(|details| details.kind.as_deref() == Some("io"))
+        .and_then(|details| details.os_code)
+    {
+        error.cause = Some(Arc::new(std::io::Error::from_raw_os_error(os_code)));
+    }
+    error.diagnostic = diagnostic;
+    error
+}
+
 fn free_unexpected_err(err: *mut c_char) {
     if !err.is_null() {
         if let Ok(a) = velr_api() {
@@ -1924,8 +2175,7 @@ fn rc_to_result(rc: ffi::velr_code, err: *mut c_char) -> Result<()> {
         free_unexpected_err(err);
         Ok(())
     } else {
-        let msg = unsafe { take_err(err) };
-        Err(Error::new(code, msg))
+        Err(unsafe { take_runtime_error(code, err) })
     }
 }
 
@@ -2717,8 +2967,8 @@ impl CreateOptions {
 
 /// A connection to an in-memory or file-backed Velr database.
 ///
-/// Dropping the connection closes it. Finish result streams, transactions, and
-/// row processing before closing or moving the connection. A connection is
+/// Dropping the connection closes it. Drop result streams, tables, row cursors,
+/// and transactions before closing or moving the connection. A connection is
 /// [`Send`] but not [`Sync`]: move it between threads when idle, or open separate
 /// connections for work on different threads. Returned handles remain on the
 /// thread where they were created.
@@ -3283,7 +3533,7 @@ impl Velr {
     /// - `openCypher` contains an interior NUL (\0)
     /// - the runtime reports an execution/planning/parsing error
     /// - the execution yields zero or multiple result tables
-    pub fn exec_one(&self, cypher: &str) -> Result<TableResult> {
+    pub fn exec_one(&self, cypher: &str) -> Result<TableResult<'_>> {
         let a = velr_api()?;
 
         let cy = CString::new(cypher)
@@ -3295,7 +3545,8 @@ impl Velr {
         let rc =
             unsafe { (a.velr_exec_one)(self.db.as_ptr(), cy.as_ptr(), &mut out_table, &mut err) };
         rc_to_result(rc, err)?;
-        TableResult::from_raw(out_table, None)
+        // SAFETY: the table belongs to this connection, which the result borrows.
+        unsafe { TableResult::from_raw(out_table, None) }
     }
 
     /// Execute `openCypher` with options and return exactly one result table.
@@ -3305,6 +3556,16 @@ impl Velr {
     /// [`QueryOptions`]; use [`QueryOptions::max_result_rows`] with `0` to inspect column metadata
     /// without emitting rows.
     /// The timeout and cancellation token apply to execution and subsequent row reads.
+    ///
+    /// The returned table borrows this connection until the table is dropped:
+    ///
+    /// ```compile_fail,E0505
+    /// use velr::{QueryOptions, Velr};
+    /// let db = Velr::open(None).unwrap();
+    /// let table = db.exec_one_with_options("RETURN 1 AS x", QueryOptions::new()).unwrap();
+    /// drop(db);
+    /// drop(table);
+    /// ```
     ///
     /// # Errors
     ///
@@ -3317,7 +3578,7 @@ impl Velr {
         &self,
         cypher: &str,
         options: QueryOptions,
-    ) -> Result<TableResult> {
+    ) -> Result<TableResult<'_>> {
         let a = velr_api()?;
         let control = NativeQueryControl::prepare(a, &options)?;
 
@@ -3349,7 +3610,8 @@ impl Velr {
             }
         };
         rc_to_result(rc, err)?;
-        TableResult::from_raw(out_table, control)
+        // SAFETY: the table belongs to this connection, which the result borrows.
+        unsafe { TableResult::from_raw(out_table, control) }
     }
 
     /// Execute a query and discard all results.
@@ -3422,11 +3684,25 @@ impl Velr {
     /// This is a convenience wrapper around [`Velr::exec_one_with_options`] for the common case
     /// where only parameters are needed.
     ///
+    /// The returned table keeps the connection borrowed:
+    ///
+    /// ```compile_fail,E0505
+    /// use velr::{QueryParams, Velr};
+    /// let db = Velr::open(None).unwrap();
+    /// let table = db.exec_one_with_params("RETURN 1 AS x", QueryParams::new()).unwrap();
+    /// drop(db);
+    /// drop(table);
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns the same errors as [`Velr::exec_one_with_options`], including invalid
     /// or missing parameters and zero or multiple result tables.
-    pub fn exec_one_with_params(&self, cypher: &str, params: QueryParams) -> Result<TableResult> {
+    pub fn exec_one_with_params(
+        &self,
+        cypher: &str,
+        params: QueryParams,
+    ) -> Result<TableResult<'_>> {
         self.exec_one_with_options(cypher, QueryOptions::new().with_params(params))
     }
 
@@ -3656,10 +3932,22 @@ impl<'db> ExecTables<'db> {
     /// - `Ok(Some(table))` when a new table is available
     /// - `Ok(None)` when the stream is exhausted (and the runtime stream is closed)
     ///
+    /// Each table borrows the connection independently of this stream:
+    ///
+    /// ```compile_fail,E0505
+    /// use velr::Velr;
+    /// let db = Velr::open(None).unwrap();
+    /// let mut stream = db.exec("RETURN 1 AS x").unwrap();
+    /// let table = stream.next_table().unwrap().unwrap();
+    /// drop(stream);
+    /// drop(db);
+    /// drop(table);
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an [`Error`] if the runtime reports an error while advancing the stream.
-    pub fn next_table(&mut self) -> Result<Option<TableResult>> {
+    pub fn next_table(&mut self) -> Result<Option<TableResult<'db>>> {
         let a = velr_api()?;
 
         let Some(stream) = self.stream else {
@@ -3682,7 +3970,9 @@ impl<'db> ExecTables<'db> {
             return Ok(None);
         }
 
-        TableResult::from_raw(out_table, self.control.clone()).map(Some)
+        // SAFETY: the stream borrows its connection for 'db. Tables remain valid
+        // after closing the stream, but must not outlive that connection.
+        unsafe { TableResult::from_raw(out_table, self.control.clone()).map(Some) }
     }
 }
 
@@ -3707,25 +3997,56 @@ impl Drop for ExecTables<'_> {
 /// - column metadata (names and count)
 /// - row iteration via [`TableResult::rows`], [`TableResult::for_each_row`], or [`TableResult::collect`]
 ///
-/// Dropping the table closes its result handle. Complete row processing while the
-/// connection and any transaction that produced the table are still active.
+/// Dropping the table closes its result handle. The table borrows its connection
+/// for `'conn`, even after all rows have been read. Drop the table before closing
+/// the connection or moving it to another thread. A table produced by a
+/// transaction also borrows that transaction: drop its row cursor and the table
+/// before committing, rolling back, or dropping the transaction.
 /// Copy borrowed string/JSON cells when retaining values outside the row callback.
-pub struct TableResult {
+///
+/// Reading all rows does not release the connection borrow:
+///
+/// ```compile_fail,E0505
+/// use velr::Velr;
+/// let db = Velr::open(None).unwrap();
+/// let mut table = db.exec_one("RETURN 1 AS x").unwrap();
+/// table.for_each_row(|_| Ok(())).unwrap();
+/// drop(db);
+/// drop(table);
+/// ```
+///
+/// The connection also cannot move to another thread while its table is alive:
+///
+/// ```compile_fail,E0505
+/// use velr::Velr;
+/// let db = Velr::open(None).unwrap();
+/// let table = db.exec_one("RETURN 1 AS x").unwrap();
+/// std::thread::spawn(move || db.run("CREATE (:N)"));
+/// drop(table);
+/// ```
+pub struct TableResult<'conn> {
     table: NonNull<ffi::velr_table>,
+    _conn: PhantomData<&'conn Velr>,
     _control: Option<Arc<NativeQueryControl>>,
     col_names: Vec<String>,
     col_count: usize,
     _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
 
-impl TableResult {
+impl<'conn> TableResult<'conn> {
     /// Construct a [`TableResult`] from a raw runtime table pointer.
+    ///
+    /// # Safety
+    ///
+    /// A non-null `ptr` must be an exclusively owned runtime table whose connection
+    /// and producing transaction remain alive and on this thread for `'conn`.
+    /// Ownership transfers to this function, including when reading metadata fails.
     ///
     /// # Errors
     ///
     /// Returns an [`Error`] if `ptr` is null, if the runtime fails to retrieve column names,
     /// or if column name bytes are not valid UTF-8.
-    fn from_raw(
+    unsafe fn from_raw(
         ptr: *mut ffi::velr_table,
         control: Option<Arc<NativeQueryControl>>,
     ) -> Result<Self> {
@@ -3777,6 +4098,7 @@ impl TableResult {
         match build {
             Ok((col_names, col_count)) => Ok(Self {
                 table,
+                _conn: PhantomData,
                 _control: control,
                 col_names,
                 col_count,
@@ -3804,6 +4126,17 @@ impl TableResult {
     /// This requires `&mut self`, so only one active row iterator may exist for a table at a time.
     /// Row iteration is callback-based via [`RowIter::next`], producing a borrowed slice of
     /// [`CellRef`] for each row.
+    ///
+    /// The cursor keeps the table borrowed until the cursor is dropped:
+    ///
+    /// ```compile_fail,E0505
+    /// use velr::Velr;
+    /// let db = Velr::open(None).unwrap();
+    /// let mut table = db.exec_one("RETURN 1 AS x").unwrap();
+    /// let rows = table.rows().unwrap();
+    /// drop(table);
+    /// drop(rows);
+    /// ```
     ///
     /// # Errors
     ///
@@ -3913,7 +4246,7 @@ impl TableResult {
     }
 }
 
-impl Drop for TableResult {
+impl Drop for TableResult<'_> {
     /// Close the table handle.
     fn drop(&mut self) {
         if let Ok(a) = velr_api() {
@@ -3933,7 +4266,7 @@ impl Drop for TableResult {
 pub struct RowIter<'t> {
     rows: Option<NonNull<ffi::velr_rows>>,
     buf: Vec<ffi::velr_cell>,
-    _table: PhantomData<&'t mut TableResult>,
+    _table: PhantomData<&'t mut ()>,
     _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
 
@@ -3985,8 +4318,7 @@ impl<'t> RowIter<'t> {
             return Ok(false);
         }
         if rc < 0 {
-            let msg = unsafe { take_err(err) };
-            return Err(Error::new(rc, msg));
+            return Err(unsafe { take_runtime_error(rc, err) });
         }
 
         free_unexpected_err(err);
@@ -4074,7 +4406,8 @@ struct NamedSavepoint {
 ///
 /// If a transaction is dropped without an explicit commit/rollback, the runtime rolls it back.
 /// The handle borrows its [`Velr`] connection and is neither `Send` nor `Sync`.
-/// Finish result streams, tables, and scoped savepoints before committing or rolling back.
+/// Drop result streams, tables, row cursors, and scoped savepoints before
+/// committing or rolling back.
 /// Use this handle's query methods for work belonging to the transaction.
 pub struct VelrTx<'db> {
     tx: Option<NonNull<ffi::velr_tx>>,
@@ -4206,11 +4539,24 @@ impl<'db> VelrTx<'db> {
     /// Returns an error for zero or multiple result tables. If you expect multiple
     /// tables, use [`VelrTx::exec`].
     ///
+    /// The table borrows this transaction. Drop it before committing, even when
+    /// all rows have been read:
+    ///
+    /// ```compile_fail,E0505
+    /// use velr::Velr;
+    /// let db = Velr::open(None).unwrap();
+    /// let tx = db.begin_tx().unwrap();
+    /// let mut table = tx.exec_one("RETURN 1 AS x").unwrap();
+    /// table.for_each_row(|_| Ok(())).unwrap();
+    /// tx.commit().unwrap();
+    /// drop(table);
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns the same errors as [`VelrTx::exec`], and an [`Error`] if the query
     /// does not produce exactly one table.
-    pub fn exec_one(&self, cypher: &str) -> Result<TableResult> {
+    pub fn exec_one(&self, cypher: &str) -> Result<TableResult<'_>> {
         let mut st = self.exec(cypher)?;
         let first = match st.next_table()? {
             Some(t) => t,
@@ -4237,6 +4583,17 @@ impl<'db> VelrTx<'db> {
     /// [`QueryOptions::max_result_rows`] with `0` to inspect column metadata without emitting rows.
     /// The timeout and cancellation token apply to execution and subsequent row reads.
     ///
+    /// The table borrows this transaction until the table is dropped:
+    ///
+    /// ```compile_fail,E0505
+    /// use velr::{QueryOptions, Velr};
+    /// let db = Velr::open(None).unwrap();
+    /// let tx = db.begin_tx().unwrap();
+    /// let table = tx.exec_one_with_options("RETURN 1 AS x", QueryOptions::new()).unwrap();
+    /// tx.rollback().unwrap();
+    /// drop(table);
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an [`Error`] if:
@@ -4250,7 +4607,7 @@ impl<'db> VelrTx<'db> {
         &self,
         cypher: &str,
         options: QueryOptions,
-    ) -> Result<TableResult> {
+    ) -> Result<TableResult<'_>> {
         let mut st = self.exec_with_options(cypher, options)?;
         let first = match st.next_table()? {
             Some(t) => t,
@@ -4343,11 +4700,26 @@ impl<'db> VelrTx<'db> {
     /// This is a convenience wrapper around [`VelrTx::exec_one_with_options`] for the common case
     /// where only parameters are needed.
     ///
+    /// The returned table keeps the transaction borrowed:
+    ///
+    /// ```compile_fail,E0505
+    /// use velr::{QueryParams, Velr};
+    /// let db = Velr::open(None).unwrap();
+    /// let tx = db.begin_tx().unwrap();
+    /// let table = tx.exec_one_with_params("RETURN 1 AS x", QueryParams::new()).unwrap();
+    /// drop(tx);
+    /// drop(table);
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns the same errors as [`VelrTx::exec_one_with_options`], including invalid
     /// or missing parameters and zero or multiple result tables.
-    pub fn exec_one_with_params(&self, cypher: &str, params: QueryParams) -> Result<TableResult> {
+    pub fn exec_one_with_params(
+        &self,
+        cypher: &str,
+        params: QueryParams,
+    ) -> Result<TableResult<'_>> {
         self.exec_one_with_options(cypher, QueryOptions::new().with_params(params))
     }
 
@@ -4743,8 +5115,8 @@ impl Drop for VelrTx<'_> {
 ///
 /// This is an *in-flight* type and is **`!Send` + `!Sync`** (thread-affine).
 /// It borrows the transaction. Fully process each result table before requesting
-/// the next one, and drop the stream before finalizing the transaction. Dropping
-/// the stream closes it; it does not commit the transaction.
+/// the next one, and drop the stream and its tables before finalizing the
+/// transaction. Dropping the stream closes it; it does not commit the transaction.
 pub struct ExecTablesTx<'tx> {
     stream: Option<NonNull<ffi::velr_stream_tx>>,
     control: Option<Arc<NativeQueryControl>>,
@@ -4752,15 +5124,28 @@ pub struct ExecTablesTx<'tx> {
     _nosend: PhantomData<Rc<()>>, // !Send + !Sync
 }
 
-impl ExecTablesTx<'_> {
+impl<'tx> ExecTablesTx<'tx> {
     /// Fetch the next result table from the transaction execution stream.
     ///
     /// Returns `Ok(None)` when exhausted (and closes the underlying stream).
     ///
+    /// Each table borrows the transaction independently of the stream:
+    ///
+    /// ```compile_fail,E0505
+    /// use velr::Velr;
+    /// let db = Velr::open(None).unwrap();
+    /// let tx = db.begin_tx().unwrap();
+    /// let mut stream = tx.exec("RETURN 1 AS x").unwrap();
+    /// let table = stream.next_table().unwrap().unwrap();
+    /// drop(stream);
+    /// drop(tx);
+    /// drop(table);
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an [`Error`] if execution fails while advancing to the next table.
-    pub fn next_table(&mut self) -> Result<Option<TableResult>> {
+    pub fn next_table(&mut self) -> Result<Option<TableResult<'tx>>> {
         let a = velr_api()?;
 
         let Some(stream) = self.stream else {
@@ -4783,7 +5168,9 @@ impl ExecTablesTx<'_> {
             return Ok(None);
         }
 
-        TableResult::from_raw(out_table, self.control.clone()).map(Some)
+        // SAFETY: the stream borrows its transaction for 'tx, keeping both it
+        // and the connection alive on this thread for the table's lifetime.
+        unsafe { TableResult::from_raw(out_table, self.control.clone()).map(Some) }
     }
 }
 

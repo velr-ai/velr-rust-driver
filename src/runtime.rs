@@ -17,6 +17,8 @@
 //!
 //! The bundled runtime bytes are written to a cache path whose filename includes a content hash.
 //! This is important on platforms like Windows where loaded DLLs cannot be overwritten.
+//! The cache must be writable and support file locks. Concurrent first connections share one
+//! cached runtime copy.
 //!
 //! ## Initialization semantics
 //!
@@ -27,12 +29,7 @@ use std::{
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        OnceLock,
-    },
-    time::{SystemTime, UNIX_EPOCH},
+    sync::OnceLock,
 };
 
 use blake3::Hasher;
@@ -71,7 +68,6 @@ compile_error!("No bundled Velr runtime for this target.");
 /// Note that this stores `Result<Runtime>` rather than `Runtime`, which means a failed initialization
 /// is also cached and will be returned on subsequent calls to [`runtime()`].
 static RUNTIME: OnceLock<Result<Runtime>> = OnceLock::new();
-static MATERIALIZE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Loaded Velr runtime and resolved ABI API.
 ///
@@ -102,15 +98,13 @@ pub struct Runtime {
 /// Returns an [`Error`] if:
 /// - The runtime cannot be selected for the current target.
 /// - The runtime cannot be written to the cache directory.
+/// - The cache filesystem cannot lock the runtime cache for writing.
 /// - The dynamic library cannot be loaded.
 /// - The required ABI symbols cannot be resolved into an [`Api`].
 pub fn runtime() -> Result<&'static Runtime> {
     match RUNTIME.get_or_init(Runtime::init) {
         Ok(rt) => Ok(rt),
-        Err(e) => Err(Error {
-            code: e.code,
-            message: e.message.clone(),
-        }),
+        Err(e) => Err(e.clone()),
     }
 }
 
@@ -156,17 +150,23 @@ impl Runtime {
     /// - The library cannot be loaded.
     /// - The Velr ABI symbols cannot be resolved into an [`Api`].
     unsafe fn load_from_path(path: PathBuf) -> Result<Self> {
-        let lib = Library::new(&path).map_err(|e| Error {
-            code: -1,
-            message: format!("Failed to load Velr runtime '{}': {e}", path.display()),
+        let lib = Library::new(&path).map_err(|e| {
+            Error::with_source(
+                -1,
+                format!("Failed to load Velr runtime '{}': {e}", path.display()),
+                e,
+            )
         })?;
 
-        let api = Api::load(&lib).map_err(|e| Error {
-            code: -1,
-            message: format!(
-                "Failed to resolve Velr ABI symbols from '{}': {e}",
-                path.display()
-            ),
+        let api = Api::load(&lib).map_err(|e| {
+            Error::with_source(
+                -1,
+                format!(
+                    "Failed to resolve Velr ABI symbols from '{}': {e}",
+                    path.display()
+                ),
+                e,
+            )
         })?;
 
         Ok(Self {
@@ -197,12 +197,15 @@ fn materialize(bytes: &[u8], filename: &str) -> Result<PathBuf> {
 
 fn materialize_in_cache_dir(bytes: &[u8], filename: &str, cache_dir: &Path) -> Result<PathBuf> {
     let dir = cache_dir.join("velr").join("runtime");
-    fs::create_dir_all(&dir).map_err(|e| Error {
-        code: -1,
-        message: format!(
-            "Failed to create runtime cache dir '{}': {e}",
-            dir.display()
-        ),
+    fs::create_dir_all(&dir).map_err(|e| {
+        Error::with_source(
+            -1,
+            format!(
+                "Failed to create runtime cache dir '{}': {e}",
+                dir.display()
+            ),
+            e,
+        )
     })?;
 
     let hash = blake3_hex(bytes);
@@ -212,39 +215,81 @@ fn materialize_in_cache_dir(bytes: &[u8], filename: &str, cache_dir: &Path) -> R
         return Ok(out);
     }
 
+    // Keep this inode in place: removing a lock file while another process is
+    // waiting on it would allow a new opener to acquire a different lock.
+    let lock_path = dir.join(format!("{hash}-{filename}.lock"));
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| {
+            Error::with_source(
+                -1,
+                format!(
+                    "Failed to open runtime cache lock '{}': {e}",
+                    lock_path.display()
+                ),
+                e,
+            )
+        })?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _writer = lock.write().map_err(|e| {
+        Error::with_source(
+            -1,
+            format!(
+                "Failed to lock runtime cache '{}': {e}",
+                lock_path.display()
+            ),
+            e,
+        )
+    })?;
+
+    // Another process may have populated the cache while we waited. Only one
+    // process writes a full runtime; simultaneous cold starts reuse its result.
+    if cached_runtime_is_valid(&out, bytes.len() as u64, &hash)? {
+        return Ok(out);
+    }
     remove_invalid_cached_runtime(&out, bytes.len() as u64, &hash)?;
 
-    // Write to a unique temp file before publishing the final hash path. A deterministic temp name
-    // lets parallel cold starts clobber one another and can make dlopen see a partial library.
-    let tmp = unique_materialize_tmp_path(&dir, &out);
-
-    let write_result = (|| -> Result<()> {
+    // The stable temporary name is private to writers holding this hash's OS
+    // lock. A process that exits mid-write releases its lock automatically; the
+    // next writer can remove that interrupted copy before starting another one.
+    // Legacy writers used a different (unique) naming scheme and are untouched.
+    let tmp = dir.join(format!("{hash}-{filename}.materializing.tmp"));
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::with_source(
+                -1,
+                format!(
+                    "Failed to remove interrupted runtime copy '{}': {e}",
+                    tmp.display()
+                ),
+                e,
+            ));
+        }
+    }
+    let _temporary = MaterializeTempFile(&tmp);
+    {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)
-            .map_err(|e| Error {
-                code: -1,
-                message: format!("Failed to create '{}': {e}", tmp.display()),
+            .map_err(|e| {
+                Error::with_source(-1, format!("Failed to create '{}': {e}", tmp.display()), e)
             })?;
-        f.write_all(bytes).map_err(|e| Error {
-            code: -1,
-            message: format!("Failed to write '{}': {e}", tmp.display()),
+        f.write_all(bytes).map_err(|e| {
+            Error::with_source(-1, format!("Failed to write '{}': {e}", tmp.display()), e)
         })?;
-        f.sync_all().map_err(|e| Error {
-            code: -1,
-            message: format!("Failed to sync '{}': {e}", tmp.display()),
+        f.sync_all().map_err(|e| {
+            Error::with_source(-1, format!("Failed to sync '{}': {e}", tmp.display()), e)
         })?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
     }
 
     if cached_runtime_is_valid(&out, bytes.len() as u64, &hash)? {
-        let _ = fs::remove_file(&tmp);
         return Ok(out);
     }
 
@@ -254,6 +299,8 @@ fn materialize_in_cache_dir(bytes: &[u8], filename: &str, cache_dir: &Path) -> R
                 Ok(out)
             } else {
                 Err(Error {
+                    diagnostic: None,
+                    cause: None,
                     code: -1,
                     message: format!(
                         "Materialized Velr runtime '{}' failed content verification",
@@ -264,20 +311,27 @@ fn materialize_in_cache_dir(bytes: &[u8], filename: &str, cache_dir: &Path) -> R
         }
         Err(rename_error) => {
             if cached_runtime_is_valid(&out, bytes.len() as u64, &hash)? {
-                let _ = fs::remove_file(&tmp);
                 Ok(out)
             } else {
-                let _ = fs::remove_file(&tmp);
-                Err(Error {
-                    code: -1,
-                    message: format!(
+                Err(Error::with_source(
+                    -1,
+                    format!(
                         "Failed to rename '{}' -> '{}': {rename_error}",
                         tmp.display(),
                         out.display()
                     ),
-                })
+                    rename_error,
+                ))
             }
         }
+    }
+}
+
+struct MaterializeTempFile<'a>(&'a Path);
+
+impl Drop for MaterializeTempFile<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0);
     }
 }
 
@@ -285,25 +339,6 @@ fn blake3_hex(bytes: &[u8]) -> String {
     let mut h = Hasher::new();
     h.update(bytes);
     h.finalize().to_hex().to_string()
-}
-
-fn unique_materialize_tmp_path(dir: &Path, out: &Path) -> PathBuf {
-    let counter = MATERIALIZE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let file_name = out
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "velr-runtime".into());
-
-    dir.join(format!(
-        "{file_name}.{}.{}.{}.tmp",
-        process::id(),
-        nanos,
-        counter
-    ))
 }
 
 fn remove_invalid_cached_runtime(
@@ -318,13 +353,14 @@ fn remove_invalid_cached_runtime(
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error {
-            code: -1,
-            message: format!(
+        Err(e) => Err(Error::with_source(
+            -1,
+            format!(
                 "Failed to remove invalid cached Velr runtime '{}': {e}",
                 path.display()
             ),
-        }),
+            e,
+        )),
     }
 }
 
@@ -333,13 +369,14 @@ fn cached_runtime_is_valid(path: &Path, expected_len: u64, expected_hash: &str) 
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => {
-            return Err(Error {
-                code: -1,
-                message: format!(
+            return Err(Error::with_source(
+                -1,
+                format!(
                     "Failed to inspect cached Velr runtime '{}': {e}",
                     path.display()
                 ),
-            })
+                e,
+            ))
         }
     };
 
@@ -347,22 +384,32 @@ fn cached_runtime_is_valid(path: &Path, expected_len: u64, expected_hash: &str) 
         return Ok(false);
     }
 
-    let mut file = fs::File::open(path).map_err(|e| Error {
-        code: -1,
-        message: format!(
-            "Failed to open cached Velr runtime '{}': {e}",
-            path.display()
-        ),
-    })?;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(Error::with_source(
+                -1,
+                format!(
+                    "Failed to open cached Velr runtime '{}': {e}",
+                    path.display()
+                ),
+                e,
+            ));
+        }
+    };
     let mut hasher = Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer).map_err(|e| Error {
-            code: -1,
-            message: format!(
-                "Failed to read cached Velr runtime '{}': {e}",
-                path.display()
-            ),
+        let read = file.read(&mut buffer).map_err(|e| {
+            Error::with_source(
+                -1,
+                format!(
+                    "Failed to read cached Velr runtime '{}': {e}",
+                    path.display()
+                ),
+                e,
+            )
         })?;
         if read == 0 {
             break;
@@ -427,6 +474,11 @@ fn runtime_cache_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        process,
+        sync::{mpsc, Arc, Barrier},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     fn temp_cache_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -455,17 +507,34 @@ mod tests {
     #[test]
     fn materialize_parallel_cold_cache_publishes_valid_runtime() {
         let cache_dir = temp_cache_dir("parallel-cold-cache");
-        let bytes = vec![42_u8; 1024 * 1024];
+        let bytes = Arc::new(vec![42_u8; 8 * 1024 * 1024]);
         let filename = "libvelrc-test";
+        let start = Arc::new(Barrier::new(33));
 
         let handles = (0..32)
             .map(|_| {
                 let cache_dir = cache_dir.clone();
                 let bytes = bytes.clone();
-                std::thread::spawn(move || materialize_in_cache_dir(&bytes, filename, &cache_dir))
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    materialize_in_cache_dir(&bytes, filename, &cache_dir)
+                })
             })
             .collect::<Vec<_>>();
 
+        start.wait();
+        let runtime_dir = cache_dir.join("velr").join("runtime");
+        while handles.iter().any(|handle| !handle.is_finished()) {
+            let copies = fs::read_dir(&runtime_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "tmp"))
+                .count();
+            assert!(copies <= 1, "concurrent full-size runtime copies: {copies}");
+            std::thread::yield_now();
+        }
         let mut paths = Vec::new();
         for handle in handles {
             paths.push(
@@ -479,9 +548,8 @@ mod tests {
         for path in &paths {
             assert_eq!(path, &paths[0]);
         }
-        assert_eq!(fs::read(&paths[0]).expect("read runtime"), bytes);
+        assert_eq!(fs::read(&paths[0]).expect("read runtime"), *bytes);
 
-        let runtime_dir = cache_dir.join("velr").join("runtime");
         let tmp_files = fs::read_dir(runtime_dir)
             .expect("read runtime dir")
             .filter_map(|entry| entry.ok())
@@ -489,6 +557,70 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(tmp_files.is_empty(), "left temp files: {tmp_files:?}");
 
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn materialize_waits_for_the_existing_cache_lock() {
+        let cache_dir = temp_cache_dir("held-lock");
+        let dir = cache_dir.join("velr/runtime");
+        fs::create_dir_all(&dir).expect("create cache");
+        let bytes = b"runtime bytes";
+        let filename = "libvelrc-test";
+        let hash = blake3_hex(bytes);
+        let lock_path = dir.join(format!("{hash}-{filename}.lock"));
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open cache lock");
+        let mut lock = fd_lock::RwLock::new(lock_file);
+        let writer = lock.write().expect("hold cache lock");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let child_cache = cache_dir.clone();
+        let child = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal start");
+            finished_tx
+                .send(materialize_in_cache_dir(bytes, filename, &child_cache))
+                .expect("signal materialized runtime");
+        });
+        started_rx.recv().expect("worker starts");
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!dir.join(format!("{hash}-{filename}")).exists());
+        assert!(!dir
+            .join(format!("{hash}-{filename}.materializing.tmp"))
+            .exists());
+        drop(writer);
+        let path = finished_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker acquires released lock")
+            .expect("materialize");
+        child.join().expect("worker joins");
+        assert_eq!(fs::read(path).expect("read runtime"), bytes);
+        // Keep the lock inode stable for other processes that may be waiting.
+        assert!(lock_path.is_file());
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn materialize_reclaims_a_copy_interrupted_before_publication() {
+        let cache_dir = temp_cache_dir("interrupted-copy");
+        let dir = cache_dir.join("velr/runtime");
+        fs::create_dir_all(&dir).expect("create cache");
+        let bytes = b"runtime bytes";
+        let filename = "libvelrc-test";
+        let hash = blake3_hex(bytes);
+        let interrupted = dir.join(format!("{hash}-{filename}.materializing.tmp"));
+        fs::write(&interrupted, b"partial").expect("write interrupted copy");
+        let path = materialize_in_cache_dir(bytes, filename, &cache_dir).expect("recover cache");
+        assert_eq!(fs::read(path).expect("read recovered runtime"), bytes);
+        assert!(!interrupted.exists());
         let _ = fs::remove_dir_all(cache_dir);
     }
 }

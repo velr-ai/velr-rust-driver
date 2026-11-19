@@ -142,6 +142,7 @@ fn site_transactions_exact() -> velr::Result<()> {
         Ok(())
     })?;
 
+    drop(table);
     tx.commit()?;
     Ok(())
 }

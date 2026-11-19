@@ -128,8 +128,11 @@ fn main() -> velr::Result<()> {
 ```
 
 `collect` retains every mapped value in memory. Use `for_each_row` for large
-results. Keep the connection and any producing transaction active until tables
-and row cursors are finished; finish results before committing or rolling back.
+results. A `TableResult<'_>` borrows its connection or producing transaction
+until the table is dropped, including after all rows have been read. Drop the
+table before closing the connection or moving it to another thread. Drop
+transaction streams, tables, and row cursors before committing, rolling back,
+or dropping their transaction; Rust enforces these lifetime restrictions.
 
 ### Multiple result tables
 
@@ -243,8 +246,12 @@ snapshot while another connection writes, use `open_readonly` and `begin_tx`.
 ## Errors and concurrency
 
 Most operations return `velr::Result<T>`. `Error` exposes a numeric operation
-`code`, a diagnostic `message`, and `kind()` for cancellation/deadline handling.
-Cypher diagnostics identify the error category and phase; their wording can vary.
+`code`, a diagnostic `message`, and `kind()` for programmatic classification.
+Use `is_query_error()` for the Cypher error family and `detail()` to match
+specific reasons through `ErrorDetail`, such as `DeleteConnectedNode`.
+`Error::application(source)` converts application failures without choosing a
+native status and preserves their original source. See the
+[error-handling guide](https://docs.rs/velr/0.2.64/velr/guide/index.html#results-lifetimes-and-threads) for examples.
 Propagate errors from execution, `next_table`, and row consumption. A callback's
 returned error stops iteration and is passed back unchanged.
 
@@ -262,7 +269,7 @@ fulltext or vector index. Bind the node/relationship in the pattern, supply
 `FOR` and a required candidate `LIMIT` inside the search parentheses, and use
 `SCORE AS name` when you need scores. Order results explicitly with
 `ORDER BY name DESC`. The examples below create their indexes and bind inputs.
-The [search guide](https://docs.rs/velr/0.2.62/velr/guide/index.html#search-clause) covers filters, pagination, analyzers,
+The [search guide](https://docs.rs/velr/0.2.64/velr/guide/index.html#search-clause) covers filters, pagination, analyzers,
 relationship patterns, and correlated subqueries. Existing search `CALL`
 procedures remain supported; embedder-backed text queries use vector procedures.
 
@@ -294,7 +301,7 @@ fn main() -> velr::Result<()> {
 
 Search accepts terms, phrases, field scoping, boolean grouping, prefixes, and
 boosts. Higher scores rank higher within one query; scores are not normalized.
-Writes keep indexes up to date. See the [fulltext grammar](https://docs.rs/velr/0.2.62/velr/query_language/index.html#fulltext-search).
+Writes keep indexes up to date. See the [fulltext grammar](https://docs.rs/velr/0.2.64/velr/query_language/index.html#fulltext-search).
 
 ### Vector search and embeddings
 
@@ -323,16 +330,17 @@ fn main() -> velr::Result<()> {
 
 Every stored/query vector must match the index dimensions; a cosine query vector
 must contain a nonzero component. Index scores depend on the metric, with higher
-scores ranking higher. Vector `SEARCH` returns cosine and Euclidean scores in
-`0.0..1.0`; vector `CALL` procedures retain their original metric-specific
-scales, including raw cosine similarity. The exact scalar function
-`vector.similarity.cosine(left, right)` needs no index and returns `0.0..1.0`.
+scores ranking higher. Vector `SEARCH`, vector `CALL` procedures, and the exact
+scalar `vector.similarity.cosine(left, right)` use the same `0..1` cosine scale.
+For Euclidean indexes, `SEARCH` returns `1 / (1 + squaredDistance)` and the
+procedures return `-squaredDistance`. Convert an older raw cosine procedure
+threshold `t` to `(1 + t) / 2`.
 
 For text-to-vector indexes, register a connection-owned callback with
 `register_vector_embedder`, then name it in `CREATE VECTOR INDEX ... ON EACH [...]`.
 Return one finite `Vec<f32>` per input, with the requested dimensions and original
 input order. Register the callback on connections that write or query that index.
-The [embedding guide](https://docs.rs/velr/0.2.62/velr/guide/index.html#vector-search) covers callback registration and options.
+The [embedding guide](https://docs.rs/velr/0.2.64/velr/guide/index.html#vector-search) covers callback registration and options.
 
 ### Arrow import and export
 
@@ -362,7 +370,7 @@ fn main() -> velr::Result<()> {
 
 The IPC bytes are owned and remain usable after their table closes. Bind calls
 borrow bytes only during the call. For native arrays, add `arrow2 = "0.18"` and
-use `bind_arrow` or `bind_arrow_chunks`; see the [array example](https://docs.rs/velr/0.2.62/velr/guide/index.html#arrow-ipc).
+use `bind_arrow` or `bind_arrow_chunks`; see the [array example](https://docs.rs/velr/0.2.64/velr/guide/index.html#arrow-ipc).
 Export infers column types: structured values become JSON strings in Arrow UTF-8
 columns; numeric types may widen and incompatible mixed kinds become strings.
 Nulls remain null; empty/all-null columns use UTF-8. Inspect the exported schema.
@@ -433,14 +441,16 @@ migration from legacy schema versions 3 through 9. Reopen read-only connections
 after migrating through a writable connection.
 
 For restricted writable directories, set `VELR_CACHE_DIR` to a writable runtime
-cache location before the first connection. `VELR_RUNTIME_PATH` selects a
-compatible runtime explicitly; normally the bundled runtime is used.
+cache location before the first connection. The cache filesystem must support
+file locks. Concurrent first connections share one cached runtime copy.
+`VELR_RUNTIME_PATH` selects a compatible runtime explicitly; normally the
+bundled runtime is used.
 
 ## Reference and support
 
-- [Rust API reference](https://docs.rs/velr/0.2.62/velr/): all types, methods, errors, features, and lifetime rules.
-- [Driver guide](https://docs.rs/velr/0.2.62/velr/guide/index.html): extended search, embedding, Arrow-array, and savepoint examples.
-- [Query language reference](https://docs.rs/velr/0.2.62/velr/query_language/index.html): supported syntax, functions, search options, scoring, and restrictions.
+- [Rust API reference](https://docs.rs/velr/0.2.64/velr/): all types, methods, errors, features, and lifetime rules.
+- [Driver guide](https://docs.rs/velr/0.2.64/velr/guide/index.html): extended search, embedding, Arrow-array, and savepoint examples.
+- [Query language reference](https://docs.rs/velr/0.2.64/velr/query_language/index.html): supported syntax, functions, search options, scoring, and restrictions.
 - [Runnable Rust examples](https://github.com/velr-ai/velr-rust-examples).
 - [Questions and community](https://github.com/velr-ai/velr/discussions).
 - [Bug reports and feature requests](https://github.com/velr-ai/velr/issues).
@@ -449,4 +459,4 @@ compatible runtime explicitly; normally the bundled runtime is used.
 
 The Rust binding source is MIT licensed. Bundled runtime binaries may be used
 and redistributed unmodified under their separate runtime license. See
-[LICENSE](https://docs.rs/crate/velr/0.2.62/source/LICENSE) and [LICENSE.runtime](https://docs.rs/crate/velr/0.2.62/source/LICENSE.runtime).
+[LICENSE](https://docs.rs/crate/velr/0.2.64/source/LICENSE) and [LICENSE.runtime](https://docs.rs/crate/velr/0.2.64/source/LICENSE.runtime).

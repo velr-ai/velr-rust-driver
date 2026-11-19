@@ -31,13 +31,13 @@ driver's typed or decoded result APIs to read them.
 | Search indexed entities | `MATCH ... SEARCH ... IN (VECTOR INDEX ... FOR ... LIMIT ...)` or `FULLTEXT INDEX`, with optional `SCORE AS` |
 | Project and transform rows | `WITH`, `RETURN`, `DISTINCT`, `UNWIND` |
 | Order and paginate | `ORDER BY`, `SKIP`, `LIMIT` |
-| Write a graph | `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE` |
+| Write a graph | `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`, `FOREACH` |
 | Combine results | `UNION`, duplicate-preserving `UNION ALL` |
 | Match paths | Variable-length relationships, `shortestPath`, `allShortestPaths` |
 | Build lists | List literals, list comprehensions, pattern comprehensions, `reduce` |
 | Build maps | Map literals and map projections |
 | Branch on values | `CASE`, comparisons, arithmetic, boolean operators, null tests |
-| Test and count subqueries | `EXISTS { ... }`, `COUNT { ... }` |
+| Test, count, and collect subquery results | `EXISTS { ... }`, `COUNT { ... }`, `COLLECT { ... }` |
 | Execute subqueries | Returning and unit `CALL { ... }` subqueries |
 
 `WHERE` keeps a row only when its predicate is `true`; `false` and `null` do not
@@ -57,6 +57,17 @@ as `(n)` and use `SET` to apply labels or properties. Repeating a relationship
 variable in one `MATCH` produces no matches; use separate `MATCH` clauses to
 reuse that relationship.
 
+Use `FOREACH` to run updates for each item of a list. Each iteration completes
+its updates in order before the next begins. The iterator and variables created
+in the body are local to the loop. An empty or null list leaves the input row in
+scope for later clauses.
+
+```cypher
+MATCH (p:Person {name: 'Alice'})
+FOREACH (label IN ['graph', 'cypher'] | CREATE (p)-[:INTERESTED_IN]->(:Topic {name: label}))
+RETURN p.name
+```
+
 ### Lists, maps, and subqueries
 
 ```cypher
@@ -67,6 +78,10 @@ RETURN [x IN range(1, 5) WHERE x % 2 = 1 | x * x] AS oddSquares,
 `reduce` visits list elements in order. An empty list returns its initial
 accumulator; a null list returns null. A pattern comprehension such as
 `[(p)-[:KNOWS]->(friend) | friend.name]` returns matching values as a list.
+
+Cypher lists stored as properties require a single element type. A list of
+integers and floats is stored as floats. Lists used as intermediate query values
+or returned directly may mix element types.
 
 List access requires an integer index; map access requires a string key.
 A null index or key returns null. List slices use integer bounds, for example
@@ -83,12 +98,30 @@ WITH {name: 'Alice', age: 42} AS person
 RETURN person {.name, .age, active: true} AS person
 ```
 
-Read-only `EXISTS` and `COUNT` subqueries return a boolean and a row count:
+Read-only `EXISTS` and `COUNT` subqueries return a boolean and a row count.
 
 ```cypher
 RETURN EXISTS { MATCH (n) } AS anyNodes,
        COUNT { MATCH (n) } AS nodeCount
 ```
+
+`COLLECT` subqueries return one list per outer row and can read variables from
+the outer query. Each branch must return one explicit column. Use `ORDER BY`
+inside the subquery to order the members. Returned nulls remain in the list,
+and a subquery with no rows returns an empty list.
+
+```cypher
+MATCH (p:Person)
+RETURN p.name AS person,
+       COLLECT {
+           MATCH (p)-[:KNOWS]->(friend)
+           RETURN friend.name AS name ORDER BY name
+       } AS friends
+```
+
+`COLLECT` bodies support read pipelines built from `MATCH`, `OPTIONAL MATCH`,
+`UNWIND`, and `WITH`, with `UNION` or `UNION ALL` between branches. Use
+an explicit `MATCH` before a pattern.
 
 A correlated `CALL` body imports outer variables explicitly with `WITH`.
 Returning subqueries provide columns to an outer query; include the final outer
@@ -100,8 +133,7 @@ CALL { WITH x RETURN x * 2 AS doubled }
 RETURN x, doubled
 ```
 
-`COLLECT { ... }` subqueries are unsupported. Use `collect(expression)`
-aggregation or a pattern comprehension. APOC functions are not supplied by Velr.
+APOC functions are not supplied by Velr.
 Use numeric `id(entity)` when an entity identifier is needed; `elementId()` is
 not supported.
 
@@ -154,6 +186,7 @@ arguments raise `ArgumentError`.
 | `toInteger(value)` | Integer conversion. |
 | `toFloat(value)` | Floating-point conversion. |
 | `toBoolean(value)` | Boolean conversion. |
+| `toBooleanOrNull(value)` | Boolean conversion with null for unsupported inputs. |
 | `toString(value)` | String conversion. |
 | `toLower(text)`, `lower(text)` | Lowercase string. |
 | `toUpper(text)` | Uppercase string. |
@@ -171,9 +204,11 @@ arguments raise `ArgumentError`.
 and null. Invalid or unrepresentable numeric/string conversions return null;
 lists and maps raise `TypeError`. `toFloat` accepts numbers, strings, and null;
 invalid or non-finite string conversions return null, while booleans, lists,
-and maps raise `TypeError`. `toBoolean` accepts booleans, null, and the exact
-lowercase strings `'true'` and `'false'`. Other strings return null; numeric,
-list, and map inputs raise `TypeError`.
+and maps raise `TypeError`. `toBoolean` accepts booleans, integers, strings,
+and null. Zero returns `false` and other integers return `true`. The strings
+`'true'` and `'false'` are recognized case-insensitively after trimming
+surrounding whitespace. Other strings return null. Unsupported input types
+raise `TypeError` with `toBoolean` and return null with `toBooleanOrNull`.
 
 `text =~ pattern` matches the entire string using
 [Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax). Inline flags
@@ -184,6 +219,31 @@ A null or non-string operand returns null. Invalid patterns raise a query error.
 RETURN toFloat('1.5') AS number, toBoolean('true') AS enabled,
        toUpper('hello') AS upper, replace('hello', 'll', 'y') AS replaced,
        left('hello', 2) AS prefix, right('hello', 2) AS suffix
+```
+
+### Spatial functions
+
+| Function | Result |
+|---|---|
+| `point(coordinates)` | A Cartesian or WGS 84 point from a map or an entity's properties. |
+| `point.distance(from, to)` | Distance between points in the same coordinate reference system. |
+
+Use `x` and `y` for Cartesian coordinates or `longitude` and `latitude` for
+WGS 84. Add `z` or `height`, respectively, for a 3D point. To select a coordinate
+system explicitly, set `crs` to `cartesian`, `cartesian-3d`, `wgs-84`, or
+`wgs-84-3d`, or set `srid` to `7203`, `9157`, `4326`, or `4979`, respectively.
+Read point fields with expressions such as `p.x`, `p.srid`, and `p.crs`.
+Geographic points also expose `longitude` and `latitude`, and geographic 3D
+points expose `height`.
+
+Cartesian distance uses the coordinate units. WGS 84 distance is in meters.
+Distance returns null for null inputs or points in different coordinate systems.
+Store points as individual node or relationship properties. Lists of points are
+available as query expressions and results.
+
+```cypher
+WITH point({x: 0, y: 0}) AS origin, point({x: 3, y: 4}) AS endPoint
+RETURN point.distance(origin, endPoint) AS distance
 ```
 
 ### Numbers and aggregation
@@ -317,11 +377,11 @@ null test. An enclosing `MATCH WHERE`, placed before or after `SEARCH`, filters
 the selected candidates afterward and can leave fewer than the requested count.
 Fulltext filtering also uses the enclosing `WHERE`.
 
-Cosine `SEARCH` scores are `(1 + cosine) / 2`, clamped to `0..1`; Euclidean/L2
-scores are `1 / (1 + squaredDistance)`. Higher is better. Dot-product scores
-are raw and unbounded. Fulltext scores are query-specific and unnormalized.
-The vector `CALL` procedure retains its own score scales, described below;
-do not reuse thresholds between the two interfaces without converting them.
+Cosine `SEARCH` and vector procedure scores are `(1 + cosine) / 2`, clamped to
+`0..1`. Euclidean/L2 `SEARCH` scores are `1 / (1 + squaredDistance)`, while
+the procedures return `-squaredDistance` for Euclidean/L2. Higher is better.
+Dot-product scores are unbounded. Fulltext scores are query-specific and
+unnormalized.
 
 A null query value produces no matches. `OPTIONAL MATCH ... SEARCH` preserves
 an unmatched input row with null entity and score values. Earlier input rows can
@@ -390,12 +450,13 @@ Consult the driver reference for callback types and reentrancy restrictions.
 | `vector.hnsw.ef_search` | — | Integer in `1..3200`, default `64`. Increasing it can improve recall with slower queries. |
 
 Quote dotted option names with backticks inside `indexConfig` maps.
-Vector scores depend on the metric; higher scores are better within a result
-set. A cosine index returns raw cosine similarity.
-`vector.similarity.cosine(left, right)` computes exact similarity without an
-index and returns `(1 + cosine) / 2`, clamped to `0..1`. These scores use
-different scales; do not interchange thresholds between them. Cosine query
-vectors require a nonzero component.
+Vector scores depend on the metric. Higher scores are better within each
+result set. For cosine indexes, `SEARCH`, `db.index.vector.queryNodes`, and
+`db.index.vector.queryRelationships` return scores on the same `0..1` scale as
+`vector.similarity.cosine(left, right)`. The function computes exact similarity
+without an index. Cosine query vectors require a nonzero component. To migrate a
+threshold from a Velr version that returned raw cosine in the procedures,
+convert it with `(1 + threshold) / 2`.
 
 A neighbor count of zero returns no candidates. `WHERE` after `YIELD` filters
 the selected candidates and can return fewer rows than requested. Searches over

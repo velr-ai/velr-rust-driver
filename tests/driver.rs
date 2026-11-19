@@ -928,10 +928,7 @@ fn count_label(db: &Velr, label: &str) -> velr::Result<i64> {
             out = Some(i);
             Ok(())
         } else {
-            Err(velr::Error {
-                code: -1,
-                message: "expected integer".into(),
-            })
+            Err(velr::Error::new(-1, "expected integer"))
         }
     })?;
     Ok(out.unwrap_or(0))
@@ -1590,6 +1587,7 @@ mod explain_tests {
         })?;
         assert_eq!(got, Some(1));
 
+        drop(t);
         tx.rollback()?;
         Ok(())
     }

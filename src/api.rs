@@ -12,6 +12,9 @@ use crate::sys::*;
 use arrow2::ffi::{ArrowArray, ArrowSchema};
 pub struct Api {
     pub velr_string_free: unsafe extern "C" fn(*mut c_char),
+    pub velr_error_details_json: Option<
+        unsafe extern "C" fn(*const c_char) -> *mut c_char,
+    >,
     pub velr_query_control_new: Option<
         unsafe extern "C" fn(u64) -> *mut velr_query_control,
     >,
@@ -629,6 +632,10 @@ impl Api {
                 lib,
                 concat!(stringify!(velr_string_free), "\0").as_bytes(),
             )?,
+            velr_error_details_json: get_optional(
+                lib,
+                concat!(stringify!(velr_error_details_json), "\0").as_bytes(),
+            ),
             velr_query_control_new: get_optional(
                 lib,
                 concat!(stringify!(velr_query_control_new), "\0").as_bytes(),

@@ -183,10 +183,32 @@
 //! }
 //! ```
 //!
-//! Process each result table before requesting the next one. Finish tables and row
-//! cursors while their connection and any transaction are active. Streams, tables,
+//! Process each result table before requesting the next one. Streams, tables,
 //! cursors, transactions, savepoints, and explain traces release their resources
 //! when dropped. Dropping an active transaction rolls back its writes.
+//!
+//! A `TableResult<'_>` borrows its connection or producing transaction until the
+//! table is dropped, even after all rows have been read. Drop the table before
+//! closing the connection or moving it to another thread. Drop transaction streams,
+//! tables, and row cursors before committing, rolling back, or dropping their
+//! transaction; Rust enforces these lifetime restrictions. If code consumes a
+//! table and then commits in the same scope, add `drop(table)` before `tx.commit()`
+//! or put table processing in a nested scope.
+//!
+//! When returning a table from a helper, name the borrowed connection or transaction
+//! lifetime in the return type:
+//!
+//! ```rust,no_run
+//! use velr::{TableResult, Velr};
+//!
+//! fn person_names<'conn>(db: &'conn Velr) -> velr::Result<TableResult<'conn>> {
+//!     db.exec_one("MATCH (p:Person) RETURN p.name AS name")
+//! }
+//! ```
+//!
+//! Structs that store tables also need a lifetime parameter for their
+//! `TableResult<'conn>` fields. To retain results independently of the connection,
+//! collect owned application values instead.
 //!
 //! `Velr` is `Send` but not `Sync`: an idle connection can be moved to another
 //! thread, and separate threads can use separate connections. Result handles and
@@ -200,6 +222,83 @@
 //! explanation of the problem and guidance for correcting it. Source-aware
 //! diagnostics show the query excerpt, location, and affected expression. Where
 //! several expressions could explain an error, labels mark possible locations.
+//!
+//! Use `error.kind()` to distinguish query, constraint, busy, read-only, migration,
+//! handle-state, cancellation, and deadline failures without parsing the diagnostic.
+//! `error.is_query_error()` groups Cypher syntax, semantic, type, parameter,
+//! procedure, entity, constraint, arithmetic, and other classified query failures.
+//! Cancellation, deadlines, database, handle-state, I/O, and application errors
+//! return false. A query error from an older runtime can remain unclassified.
+//! `error.diagnostic()` returns optional category, detail, phase, explanation, hint,
+//! source position, and SQLite error-code information supplied by the runtime.
+//! The numeric `error.code` and rendered `error.message` retain their existing
+//! meaning. Older runtime libraries can omit structured metadata; unknown failures
+//! remain `ErrorKind::Other`.
+//!
+//! `error.is_retryable()` identifies a condition that may clear on a later attempt.
+//! It does not establish that replaying a write or transaction is safe. Recover the
+//! transaction as required before retrying. Source positions use one-based lines
+//! and display columns in the original submitted query, matching the rendered diagnostic.
+//!
+//! Match `error.detail()` against the non-exhaustive `ErrorDetail` enum when a
+//! specific reason needs handling. Detail identifiers do not establish the broad
+//! error category, so check `kind()` alongside the detail:
+//!
+//! ```rust
+//! use velr::{ErrorDetail, ErrorKind, Velr};
+//!
+//! fn main() -> velr::Result<()> {
+//!     let db = Velr::open(None)?;
+//!     db.run("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")?;
+//!
+//!     match db.run("MATCH (p:Person {name: 'Alice'}) DELETE p") {
+//!         Err(error) if matches!(
+//!             (error.kind(), error.detail()),
+//!             (ErrorKind::Constraint, Some(ErrorDetail::DeleteConnectedNode))
+//!         ) => println!("Remove the person's relationships before deleting them."),
+//!         Err(error) => return Err(error),
+//!         Ok(()) => {}
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! `ErrorDiagnostic::detail_kind()` exposes the same typed mapping on a diagnostic.
+//! An absent identifier returns `None`; an unrecognized identifier returns
+//! `Some(ErrorDetail::Other)`. The original identifier remains in
+//! `error.diagnostic().and_then(|diagnostic| diagnostic.detail.as_deref())`.
+//! Keep a fallback arm when matching so newer runtime identifiers remain supported.
+//!
+//! Use `Error::application(source)` to return application failures from row
+//! callbacks without choosing a native status. It accepts concrete or boxed errors,
+//! `String`, and `&str`; the source's display text becomes the error message, and
+//! `std::error::Error::source()` retains the original error. For example, convert a
+//! fallible row mapper with `map_err(Error::application)`:
+//!
+//! ```rust
+//! use velr::{CellRef, Error, Velr};
+//!
+//! fn main() -> velr::Result<()> {
+//!     let db = Velr::open(None)?;
+//!     let mut table = db.exec_one("UNWIND ['21', '34'] AS text RETURN text ORDER BY text")?;
+//!     let numbers = table.collect(|row| {
+//!         let CellRef::Text(bytes) = row[0] else {
+//!             return Err(Error::application("expected a text value"));
+//!         };
+//!         let text = std::str::from_utf8(bytes).map_err(Error::application)?;
+//!         text.parse::<u32>().map_err(Error::application)
+//!     })?;
+//!     assert_eq!(numbers, vec![21, 34]);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! An application error has `ErrorKind::Other`, no runtime diagnostic or typed
+//! detail, and is not retryable. `is_query_error()` returns false. Callback errors
+//! are returned unchanged, including their source. `Error::new(code, message)` and
+//! `Error::with_source(code, message, source)` remain available when an explicit
+//! operation status is required. `Error` is non-exhaustive, so replace error struct
+//! literals with these constructors.
 //!
 //! | Cypher error category | Meaning |
 //! |---|---|
@@ -341,9 +440,9 @@
 //! }
 //! ```
 //!
-//! Vector `SEARCH` returns cosine and Euclidean scores in `0.0..1.0`, with higher
-//! scores indicating closer matches. The vector `CALL` procedures retain their
-//! original metric-dependent scores, including raw cosine scores for cosine indexes.
+//! Vector `SEARCH` and the vector procedures use the same `0..1` cosine scale,
+//! with higher scores indicating closer matches. For Euclidean indexes, `SEARCH`
+//! returns `1 / (1 + squaredDistance)` and the procedures return `-squaredDistance`.
 //! Fulltext scores rank relevance within the same query; they are not normalized.
 //!
 //! ### Fulltext analyzers and pagination
@@ -593,12 +692,10 @@
 //! ```
 //!
 //! `ON EACH [n.title, n.abstract]` passes both property values to the callback in
-//! that order. Query text is passed as one unnamed string field. Vector `score` is
-//! metric-dependent for `CALL` procedures. Higher scores are better within a single
-//! result set. A cosine `CALL` returns raw cosine similarity; cosine and Euclidean
-//! `SEARCH` scores use `0.0..1.0`. The exact scalar `vector.similarity.cosine()` also
-//! returns `0.0..1.0`. A cosine query vector must have at least
-//! one nonzero component.
+//! that order. Query text is passed as one unnamed string field. For cosine
+//! indexes, the vector procedures, `SEARCH`, and `vector.similarity.cosine()` share
+//! the `(1 + cosine) / 2` scale. Convert an older raw cosine procedure threshold
+//! `t` to `(1 + t) / 2`. A cosine query vector must have a nonzero component.
 //!
 //! Pass `0` for the neighbor count to get no candidates. A `WHERE` after `YIELD`
 //! filters the top candidates and can return fewer rows than the requested count.

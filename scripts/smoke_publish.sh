@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+runtime_only=false
+if (( $# > 0 )); then
+  if [[ $# -ne 1 || "$1" != "--runtime-only" ]]; then
+    echo "Usage: ${BASH_SOURCE[0]} [--runtime-only]" >&2
+    exit 2
+  fi
+  runtime_only=true
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT"
 
@@ -36,7 +45,7 @@ crate_version() {
   awk -F '"' '/^version[[:space:]]*=/ { print $2; exit }' "$1"
 }
 
-if [[ -d velr-types ]]; then
+if [[ "$runtime_only" == false && -d velr-types ]]; then
   echo "Packaging velr-types crate..."
   types_name="$(crate_name velr-types/Cargo.toml)"
   types_version="$(crate_version velr-types/Cargo.toml)"
@@ -80,25 +89,27 @@ for manifest in "${manifests[@]}"; do
   fi
 done
 
-driver_version="$(crate_version Cargo.toml)"
-driver_estimate="$CARGO_TARGET_DIR/package/velr-$driver_version-local-estimate.crate"
-driver_file_list="$CARGO_TARGET_DIR/package/velr-$driver_version.files"
+if [[ "$runtime_only" == false ]]; then
+  driver_version="$(crate_version Cargo.toml)"
+  driver_estimate="$CARGO_TARGET_DIR/package/velr-$driver_version-local-estimate.crate"
+  driver_file_list="$CARGO_TARGET_DIR/package/velr-$driver_version.files"
 
-mkdir -p "$CARGO_TARGET_DIR/package"
-cargo package --manifest-path Cargo.toml --allow-dirty --list > "$driver_file_list"
+  mkdir -p "$CARGO_TARGET_DIR/package"
+  cargo package --manifest-path Cargo.toml --allow-dirty --list > "$driver_file_list"
 
-if grep -E '^(prebuilt|runtime)/' "$driver_file_list"; then
-  echo "ERROR: public velr package file list includes native runtime payloads" >&2
-  exit 1
-fi
+  if grep -E '^(prebuilt|runtime)/' "$driver_file_list"; then
+    echo "ERROR: public velr package file list includes native runtime payloads" >&2
+    exit 1
+  fi
 
-tar -czf "$driver_estimate" Cargo.toml LICENSE LICENSE.runtime README.md src
-driver_size="$(wc -c < "$driver_estimate" | tr -d ' ')"
-echo "velr-$driver_version local package estimate size=$driver_size bytes"
+  tar -czf "$driver_estimate" Cargo.toml LICENSE LICENSE.runtime README.md src
+  driver_size="$(wc -c < "$driver_estimate" | tr -d ' ')"
+  echo "velr-$driver_version local package estimate size=$driver_size bytes"
 
-if (( driver_size > MAX_CRATE_BYTES )); then
-  echo "ERROR: $driver_estimate exceeds MAX_CRATE_BYTES=$MAX_CRATE_BYTES" >&2
-  exit 1
+  if (( driver_size > MAX_CRATE_BYTES )); then
+    echo "ERROR: $driver_estimate exceeds MAX_CRATE_BYTES=$MAX_CRATE_BYTES" >&2
+    exit 1
+  fi
 fi
 
 if [[ "${VELR_SMOKE_SKIP_TESTS:-0}" == "1" ]]; then
@@ -106,7 +117,7 @@ if [[ "${VELR_SMOKE_SKIP_TESTS:-0}" == "1" ]]; then
   exit 0
 fi
 
-if [[ -d velr-types ]]; then
+if [[ "$runtime_only" == false && -d velr-types ]]; then
   echo "Testing velr-types crate..."
   cargo test --manifest-path velr-types/Cargo.toml
 fi
@@ -116,6 +127,15 @@ for manifest in "${manifests[@]}"; do
   cargo test --manifest-path "$manifest"
 done
 
+if [[ "$runtime_only" == true ]]; then
+  exit 0
+fi
+
 echo "Testing public velr crate..."
 cargo test --manifest-path Cargo.toml
 cargo test --manifest-path Cargo.toml --no-default-features
+
+echo "Checking table owner lifetimes in the public Rust API..."
+python3 -m unittest discover -s scripts -p 'test_check_table_lifetimes.py'
+python3 scripts/check_table_lifetimes.py --manifest-path Cargo.toml
+python3 scripts/check_table_lifetimes.py --manifest-path Cargo.toml --no-default-features
