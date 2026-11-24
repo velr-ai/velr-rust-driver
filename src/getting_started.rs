@@ -48,6 +48,14 @@
 //! `run` executes queries whose results you do not need. `exec_one` returns exactly
 //! one result table. Handles release their resources when dropped.
 //!
+//! ### Optional graph analytics
+//!
+//! Add `velr-gds` at the same release version as the driver with
+//! `cargo add velr-gds`. Enable it on each connection that needs GDS using
+//! `Velr::builder().with_extension(velr_gds::Gds::new()).open(path)`. Use the
+//! same `run` and `exec_one` methods for `CALL gds.*` queries. See the
+//! [GDS example in the Rust guide](crate::guide#graph-data-science).
+//!
 //! ## Queries and results
 //!
 //! ### In-memory, persistent, and read-only databases
@@ -263,6 +271,40 @@
 //!
 //! ## Features and integrations
 //!
+//! ### Quantified path patterns
+//!
+//! Use `{2}` after a parenthesized pattern to match exactly two repetitions.
+//! Variables declared inside the pattern are lists in traversal order. The
+//! example projects stop names and reads both lists as JSON cells.
+//!
+//! ```rust,no_run
+//! use velr::{CellRef, Velr};
+//!
+//! fn main() -> velr::Result<()> {
+//!     let db = Velr::open(None)?;
+//!     db.run(
+//!         "CREATE (:Stop {name: 'Central'})-[:NEXT]->(:Stop {name: 'North'})
+//!          -[:NEXT]->(:Stop {name: 'Airport'})",
+//!     )?;
+//!     let mut route = db.exec_one(
+//!         "MATCH (:Stop {name: 'Central'}) ((departure)-[:NEXT]->(arrival)){2}
+//!          RETURN [stop IN departure | stop.name] AS departures,
+//!                 [stop IN arrival | stop.name] AS arrivals",
+//!     )?;
+//!     route.for_each_row(|row| {
+//!         if let [CellRef::Json(departures), CellRef::Json(arrivals)] = row {
+//!             println!("{}", String::from_utf8_lossy(departures)); // ["Central","North"]
+//!             println!("{}", String::from_utf8_lossy(arrivals)); // ["North","Airport"]
+//!         }
+//!         Ok(())
+//!     })?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! See the [query language reference](crate::query_language#quantified-path-patterns)
+//! for repetition ranges and predicates.
+//!
 //! ### SEARCH clause
 //!
 //! In Velr 0.2.62+, use `SEARCH` with `MATCH` or `OPTIONAL MATCH` to query an existing
@@ -342,6 +384,49 @@
 //! Return one finite `Vec<f32>` per input, with the requested dimensions and original
 //! input order. Register the callback on connections that write or query that index.
 //! The [embedding guide](crate::guide#vector-search) covers callback registration and options.
+//!
+//! ### Bulk import from CSV
+//!
+//! Use the standalone `velr-import` crate to create a Velr database from local
+//! node and relationship CSV files. Add it alongside the query driver.
+//!
+//! ```sh
+//! cargo add velr-import
+//! ```
+//!
+//! Save the node data below as `people.csv`.
+//!
+//! ```csv
+//! personId:ID(people),name:string,:LABEL
+//! 1,Ada,Person
+//! ```
+//!
+//! The driver can open the resulting file after the import returns.
+//!
+//! ```rust,ignore
+//! use velr::{CellRef, Velr};
+//! use velr_import::{import_csv, CsvImport};
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let report = import_csv("people.db", CsvImport::files(["people.csv"]))?;
+//!     assert_eq!(report.nodes, 1);
+//!
+//!     let db = Velr::open_readonly("people.db")?;
+//!     let mut people = db.exec_one("MATCH (p:Person) RETURN p.name AS name")?;
+//!     people.for_each_row(|row| {
+//!         if let CellRef::Text(name) = row[0] {
+//!             println!("{}", String::from_utf8_lossy(name)); // Ada
+//!         }
+//!         Ok(())
+//!     })?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Use a new destination and an importer built for the same Velr release.
+//! `CsvImport::files` accepts plain or compressed CSV with embedded headers.
+//! Use `CsvImport::manifest("import.toml")` to group file parts or supply separate
+//! headers. The `velr-import` README covers header syntax, options, and reports.
 //!
 //! ### Arrow import and export
 //!
@@ -463,4 +548,4 @@
 //!
 //! The Rust binding source is MIT licensed. Bundled runtime binaries may be used
 //! and redistributed unmodified under their separate runtime license. See
-//! [LICENSE](https://docs.rs/crate/velr/0.2.64/source/LICENSE) and [LICENSE.runtime](https://docs.rs/crate/velr/0.2.64/source/LICENSE.runtime).
+//! [LICENSE](https://docs.rs/crate/velr/0.2.65/source/LICENSE) and [LICENSE.runtime](https://docs.rs/crate/velr/0.2.65/source/LICENSE.runtime).

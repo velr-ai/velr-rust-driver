@@ -191,7 +191,7 @@ fn bundled_runtime_bytes_and_name() -> (&'static [u8], &'static str) {
 
 /// Write runtime bytes to a stable cache path and return the path.
 /// Uses a content hash in the filename (important on Windows: loaded DLLs can’t be overwritten).
-fn materialize(bytes: &[u8], filename: &str) -> Result<PathBuf> {
+pub(crate) fn materialize(bytes: &[u8], filename: &str) -> Result<PathBuf> {
     materialize_in_cache_dir(bytes, filename, &runtime_cache_dir()?)
 }
 

@@ -30,6 +30,15 @@ pub struct Api {
         *mut *mut velr_db,
         *mut *mut c_char,
     ) -> velr_code,
+    pub velr_open_with_extensions: Option<
+        unsafe extern "C" fn(
+            *const c_char,
+            *const velr_extension_config,
+            usize,
+            *mut *mut velr_db,
+            *mut *mut c_char,
+        ) -> velr_code,
+    >,
     pub velr_create: Option<
         unsafe extern "C" fn(
             *const c_char,
@@ -653,6 +662,10 @@ impl Api {
                 concat!(stringify!(velr_query_control_free), "\0").as_bytes(),
             ),
             velr_open: get(lib, concat!(stringify!(velr_open), "\0").as_bytes())?,
+            velr_open_with_extensions: get_optional(
+                lib,
+                concat!(stringify!(velr_open_with_extensions), "\0").as_bytes(),
+            ),
             velr_create: get_optional(
                 lib,
                 concat!(stringify!(velr_create), "\0").as_bytes(),

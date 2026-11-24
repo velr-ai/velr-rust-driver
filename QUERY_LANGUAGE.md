@@ -33,7 +33,7 @@ driver's typed or decoded result APIs to read them.
 | Order and paginate | `ORDER BY`, `SKIP`, `LIMIT` |
 | Write a graph | `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`, `FOREACH` |
 | Combine results | `UNION`, duplicate-preserving `UNION ALL` |
-| Match paths | Variable-length relationships, `shortestPath`, `allShortestPaths` |
+| Match paths | Quantified path patterns, variable-length relationships, `shortestPath`, `allShortestPaths` |
 | Build lists | List literals, list comprehensions, pattern comprehensions, `reduce` |
 | Build maps | Map literals and map projections |
 | Branch on values | `CASE`, comparisons, arithmetic, boolean operators, null tests |
@@ -67,6 +67,51 @@ MATCH (p:Person {name: 'Alice'})
 FOREACH (label IN ['graph', 'cypher'] | CREATE (p)-[:INTERESTED_IN]->(:Topic {name: label}))
 RETURN p.name
 ```
+
+### Quantified path patterns
+
+In `MATCH` and `OPTIONAL MATCH`, wrap a path of one or more fixed-length
+relationships in parentheses and place the quantifier after the closing
+parenthesis. `{2}` repeats the enclosed pattern exactly twice.
+
+```cypher
+MATCH p = ((x)-[r:R]->(y)){2}
+RETURN x, y, r, length(p) AS hops
+```
+
+The end node of each repetition is the start node of the next. Outside the
+quantified pattern, each variable it declares is a list in traversal order.
+For a path through nodes `a`, `b`, and `c`, `x` is `[a, b]`, `y` is `[b, c]`,
+and `r` contains the two relationships. `{1}` also produces lists. A path
+variable such as `p` represents the full matched path.
+
+Use `{m,n}` for an inclusive range, `{m,}` for an open upper bound, or
+`{,n}` for a zero lower bound. `+` means one or more and `*` or `{,}` means
+zero or more. A specified upper bound must be positive and at least as large
+as the lower bound. For a zero lower bound, include a node pattern or another
+segment in the same path so that the path always matches at least one node.
+Zero repetitions produce empty lists. An unmatched `OPTIONAL MATCH` produces
+nulls for its new bindings.
+
+Place a per-repetition `WHERE` after the last node inside the parentheses, or
+write a predicate in a node or relationship pattern within the repeat. For
+example, `(stop WHERE stop.open = true)` filters a node and
+`-[r:NEXT WHERE r.active = true]->` filters a relationship. These predicates see
+the individual nodes and relationships for the current repetition.
+
+```cypher
+MATCH (:Station {name: 'Central'})
+      ((departure)-[:NEXT]->(stop) WHERE stop.open = true){0,3}
+      (arrival:Station)
+RETURN [node IN departure | node.name] AS departures, arrival.name AS arrival
+ORDER BY size(departures)
+```
+
+Concatenate quantified patterns to apply different quantifiers along one path.
+Place legacy variable-length relationships such as `-[:R*1..3]->` in a
+separate `MATCH` clause when the query also uses a quantified path pattern.
+Use the variable-length relationship syntax with `shortestPath` and
+`allShortestPaths`.
 
 ### Lists, maps, and subqueries
 

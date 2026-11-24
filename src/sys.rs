@@ -248,6 +248,13 @@ pub struct velr_explain_stmt_meta {
     pub note: velr_strview,
     pub sqlite_plan_count: usize,
 }
+/// Explicit configuration of one trusted in-process native extension.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct velr_extension_config {
+    pub path: *const c_char,
+    pub memory_limit_bytes: usize,
+}
 /// Chunked Arrow column descriptor.
 ///
 /// For each logical column:

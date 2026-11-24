@@ -1,7 +1,50 @@
 # Rust driver guide
 
-Detailed usage examples complement the [API reference](https://docs.rs/velr/0.2.64/velr/),
-the [getting-started guide](https://docs.rs/velr/0.2.64/velr/getting_started/index.html), and the [query language reference](https://docs.rs/velr/0.2.64/velr/query_language/index.html).
+Detailed usage examples complement the [API reference](https://docs.rs/velr/0.2.65/velr/),
+the [getting-started guide](https://docs.rs/velr/0.2.65/velr/getting_started/index.html), and the [query language reference](https://docs.rs/velr/0.2.65/velr/query_language/index.html).
+
+## Graph Data Science
+
+Install `velr-gds` alongside the same release version of `velr`. Use the
+connection builder to enable it, then project and analyze a graph with Cypher.
+Cargo selects a prebuilt native extension for the target platform.
+
+```rust,ignore
+use velr::Velr;
+use velr_gds::Gds;
+
+fn main() -> velr::Result<()> {
+    let db = Velr::builder()
+        .with_extension(Gds::new())
+        .open(None)?;
+    db.run("CREATE (:Person)-[:KNOWS]->(:Person), (:Person)")?;
+    db.run("CALL gds.graph.project('people', 'Person', 'KNOWS')")?;
+
+    {
+        let mut table = db.exec_one(
+            "CALL gds.wcc.stream('people') YIELD nodeId, componentId
+             RETURN nodeId, componentId",
+        )?;
+        table.for_each_row(|row| {
+            println!("{row:?}");
+            Ok(())
+        })?;
+    }
+
+    db.run("CALL gds.graph.drop('people')")?;
+    Ok(())
+}
+```
+
+Pass `Some("graph.db")` to open a file-backed database. The GDS catalog
+belongs to the opened connection. Keep the connection open to reuse a named
+projection. The projection stays in memory until you drop it or close the connection.
+Use `CALL gds.list()` to discover available procedures.
+
+The default GDS budget is 512 MiB per connection. It covers managed
+projection and algorithm allocations. Set a positive byte limit with
+`Gds::new().with_memory_limit_bytes(bytes)`. An operation that exceeds
+the budget returns an error.
 
 ## Query parameter binding
 
@@ -156,8 +199,8 @@ fn main() -> velr::Result<()> {
 ```
 
 Check errors from execution and from any subsequent fetch. See the API
-reference for [`QueryOptions`](https://docs.rs/velr/0.2.64/velr/struct.QueryOptions.html)
-and [`CancellationToken`](https://docs.rs/velr/0.2.64/velr/struct.CancellationToken.html).
+reference for [`QueryOptions`](https://docs.rs/velr/0.2.65/velr/struct.QueryOptions.html)
+and [`CancellationToken`](https://docs.rs/velr/0.2.65/velr/struct.CancellationToken.html).
 
 ## Results, lifetimes, and threads
 
@@ -391,6 +434,25 @@ keeps its changes pending in the outer transaction; commit the transaction to
 persist them. Drop or finalize scoped savepoints before finalizing the transaction.
 
 Dropping an active transaction without `commit()` will roll it back automatically.
+
+## Quantified path patterns
+
+Bind the starting stop name as the `origin` query parameter. The example
+follows one to three consecutive `NEXT` relationships, checking the arrival
+node at every repetition.
+
+```cypher
+MATCH (origin:Stop {name: $origin})
+OPTIONAL MATCH (origin) ((departure)-[:NEXT]->(arrival WHERE arrival.open = true)){1,3} (destination)
+RETURN [stop IN arrival | stop.name] AS stops, destination.name AS destination
+ORDER BY size(stops)
+```
+
+The `arrival` group contains the arrival nodes in traversal order.
+`OPTIONAL MATCH` returns null for the group and destination when no path
+qualifies. Use a zero lower bound such as `{0,3}` when a match at the starting
+stop should return an empty group. See [quantified path patterns](https://docs.rs/velr/0.2.65/velr/query_language/index.html#quantified-path-patterns)
+for bound and predicate syntax.
 
 ## SEARCH clause
 

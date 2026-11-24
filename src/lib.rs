@@ -215,6 +215,7 @@ pub mod query_language {}
 mod api;
 mod cancellation;
 mod diagnostic;
+mod extensions;
 mod runtime;
 mod sys;
 
@@ -236,6 +237,7 @@ use std::{
 pub use cancellation::CancellationToken;
 use cancellation::{require_control_api, NativeQueryControl};
 pub use diagnostic::{ErrorDetail, ErrorDiagnostic, ErrorPosition};
+pub use extensions::{Extension, VelrBuilder};
 use serde_json::Value as JsonValue;
 use sys as ffi;
 use velr_types::{decode_property_value, StorageValueRef};
@@ -2984,6 +2986,14 @@ pub struct Velr {
 unsafe impl Send for Velr {}
 
 impl Velr {
+    /// Configure extensions for a new connection.
+    ///
+    /// A builder with no extensions opens a connection like [`Self::open`].
+    /// Extensions are registered on the returned connection.
+    pub fn builder() -> VelrBuilder {
+        VelrBuilder::default()
+    }
+
     /// Create a new database and return a writable connection.
     ///
     /// Use `None` or `Some(":memory:")` for an in-memory database. Any other path
@@ -3073,6 +3083,13 @@ impl Velr {
     ///
     /// Returns an error if `path` contains an interior NUL byte or if the runtime fails to open.
     pub fn open(path: Option<&str>) -> Result<Self> {
+        Self::open_configured(path, &[])
+    }
+
+    fn open_configured(
+        path: Option<&str>,
+        extensions: &[ffi::velr_extension_config],
+    ) -> Result<Self> {
         let a = velr_api()?; // ensure runtime is loaded
 
         let mut out_db: *mut ffi::velr_db = std::ptr::null_mut();
@@ -3089,7 +3106,21 @@ impl Velr {
             }
         };
 
-        let rc = unsafe { (a.velr_open)(path_ptr, &mut out_db, &mut err) };
+        let rc = if extensions.is_empty() {
+            unsafe { (a.velr_open)(path_ptr, &mut out_db, &mut err) }
+        } else {
+            let open =
+                require_runtime_symbol(a.velr_open_with_extensions, "velr_open_with_extensions")?;
+            unsafe {
+                open(
+                    path_ptr,
+                    extensions.as_ptr(),
+                    extensions.len(),
+                    &mut out_db,
+                    &mut err,
+                )
+            }
+        };
         rc_to_result(rc, err)?;
 
         let nn = NonNull::new(out_db).ok_or_else(|| {
