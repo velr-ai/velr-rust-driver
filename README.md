@@ -52,8 +52,8 @@ one result table. Handles release their resources when dropped.
 Add `velr-gds` at the same release version as the driver with
 `cargo add velr-gds`. Enable it on each connection that needs GDS using
 `Velr::builder().with_extension(velr_gds::Gds::new()).open(path)`. Use the
-same `run` and `exec_one` methods for `CALL gds.*` queries. See the
-[GDS example in the Rust guide](https://docs.rs/velr/0.2.65/velr/guide/index.html#graph-data-science).
+same `run` and `exec_one` methods to project graphs and run algorithms with
+Cypher. [Velr GDS quick start and Cypher reference](https://docs.rs/crate/velr-gds/latest)
 
 ## Queries and results
 
@@ -259,7 +259,7 @@ Use `is_query_error()` for the Cypher error family and `detail()` to match
 specific reasons through `ErrorDetail`, such as `DeleteConnectedNode`.
 `Error::application(source)` converts application failures without choosing a
 native status and preserves their original source. See the
-[error-handling guide](https://docs.rs/velr/0.2.65/velr/guide/index.html#results-lifetimes-and-threads) for examples.
+[error-handling guide](https://docs.rs/velr/0.2.66/velr/guide/index.html#results-lifetimes-and-threads) for examples.
 Propagate errors from execution, `next_table`, and row consumption. A callback's
 returned error stops iteration and is passed back unchanged.
 
@@ -301,7 +301,7 @@ fn main() -> velr::Result<()> {
 }
 ```
 
-See the [query language reference](https://docs.rs/velr/0.2.65/velr/query_language/index.html#quantified-path-patterns)
+See the [query language reference](https://docs.rs/velr/0.2.66/velr/query_language/index.html#quantified-path-patterns)
 for repetition ranges and predicates.
 
 ### SEARCH clause
@@ -311,7 +311,7 @@ fulltext or vector index. Bind the node/relationship in the pattern, supply
 `FOR` and a required candidate `LIMIT` inside the search parentheses, and use
 `SCORE AS name` when you need scores. Order results explicitly with
 `ORDER BY name DESC`. The examples below create their indexes and bind inputs.
-The [search guide](https://docs.rs/velr/0.2.65/velr/guide/index.html#search-clause) covers filters, pagination, analyzers,
+The [search guide](https://docs.rs/velr/0.2.66/velr/guide/index.html#search-clause) covers filters, pagination, analyzers,
 relationship patterns, and correlated subqueries. Existing search `CALL`
 procedures remain supported; embedder-backed text queries use vector procedures.
 
@@ -343,7 +343,7 @@ fn main() -> velr::Result<()> {
 
 Search accepts terms, phrases, field scoping, boolean grouping, prefixes, and
 boosts. Higher scores rank higher within one query; scores are not normalized.
-Writes keep indexes up to date. See the [fulltext grammar](https://docs.rs/velr/0.2.65/velr/query_language/index.html#fulltext-search).
+Writes keep indexes up to date. See the [fulltext grammar](https://docs.rs/velr/0.2.66/velr/query_language/index.html#fulltext-search).
 
 ### Vector search and embeddings
 
@@ -382,7 +382,7 @@ For text-to-vector indexes, register a connection-owned callback with
 `register_vector_embedder`, then name it in `CREATE VECTOR INDEX ... ON EACH [...]`.
 Return one finite `Vec<f32>` per input, with the requested dimensions and original
 input order. Register the callback on connections that write or query that index.
-The [embedding guide](https://docs.rs/velr/0.2.65/velr/guide/index.html#vector-search) covers callback registration and options.
+The [embedding guide](https://docs.rs/velr/0.2.66/velr/guide/index.html#vector-search) covers callback registration and options.
 
 ### Bulk import from CSV
 
@@ -455,7 +455,7 @@ fn main() -> velr::Result<()> {
 
 The IPC bytes are owned and remain usable after their table closes. Bind calls
 borrow bytes only during the call. For native arrays, add `arrow2 = "0.18"` and
-use `bind_arrow` or `bind_arrow_chunks`; see the [array example](https://docs.rs/velr/0.2.65/velr/guide/index.html#arrow-ipc).
+use `bind_arrow` or `bind_arrow_chunks`; see the [array example](https://docs.rs/velr/0.2.66/velr/guide/index.html#arrow-ipc).
 Export infers column types: structured values become JSON strings in Arrow UTF-8
 columns; numeric types may widen and incompatible mixed kinds become strings.
 Nulls remain null; empty/all-null columns use UTF-8. Inspect the exported schema.
@@ -533,9 +533,9 @@ bundled runtime is used.
 
 ## Reference and support
 
-- [Rust API reference](https://docs.rs/velr/0.2.65/velr/): all types, methods, errors, features, and lifetime rules.
-- [Driver guide](https://docs.rs/velr/0.2.65/velr/guide/index.html): extended search, embedding, Arrow-array, and savepoint examples.
-- [Query language reference](https://docs.rs/velr/0.2.65/velr/query_language/index.html): supported syntax, functions, search options, scoring, and restrictions.
+- [Rust API reference](https://docs.rs/velr/0.2.66/velr/): all types, methods, errors, features, and lifetime rules.
+- [Driver guide](https://docs.rs/velr/0.2.66/velr/guide/index.html): extended search, embedding, Arrow-array, and savepoint examples.
+- [Query language reference](https://docs.rs/velr/0.2.66/velr/query_language/index.html): supported syntax, functions, search options, scoring, and restrictions.
 - [Runnable Rust examples](https://github.com/velr-ai/velr-rust-examples).
 - [Questions and community](https://github.com/velr-ai/velr/discussions).
 - [Bug reports and feature requests](https://github.com/velr-ai/velr/issues).
@@ -544,4 +544,4 @@ bundled runtime is used.
 
 The Rust binding source is MIT licensed. Bundled runtime binaries may be used
 and redistributed unmodified under their separate runtime license. See
-[LICENSE](https://docs.rs/crate/velr/0.2.65/source/LICENSE) and [LICENSE.runtime](https://docs.rs/crate/velr/0.2.65/source/LICENSE.runtime).
+[LICENSE](https://docs.rs/crate/velr/0.2.66/source/LICENSE) and [LICENSE.runtime](https://docs.rs/crate/velr/0.2.66/source/LICENSE.runtime).

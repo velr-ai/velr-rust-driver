@@ -53,8 +53,8 @@
 //! Add `velr-gds` at the same release version as the driver with
 //! `cargo add velr-gds`. Enable it on each connection that needs GDS using
 //! `Velr::builder().with_extension(velr_gds::Gds::new()).open(path)`. Use the
-//! same `run` and `exec_one` methods for `CALL gds.*` queries. See the
-//! [GDS example in the Rust guide](crate::guide#graph-data-science).
+//! same `run` and `exec_one` methods to project graphs and run algorithms with
+//! Cypher. [Velr GDS quick start and Cypher reference](https://docs.rs/crate/velr-gds/latest)
 //!
 //! ## Queries and results
 //!
@@ -548,4 +548,4 @@
 //!
 //! The Rust binding source is MIT licensed. Bundled runtime binaries may be used
 //! and redistributed unmodified under their separate runtime license. See
-//! [LICENSE](https://docs.rs/crate/velr/0.2.65/source/LICENSE) and [LICENSE.runtime](https://docs.rs/crate/velr/0.2.65/source/LICENSE.runtime).
+//! [LICENSE](https://docs.rs/crate/velr/0.2.66/source/LICENSE) and [LICENSE.runtime](https://docs.rs/crate/velr/0.2.66/source/LICENSE.runtime).

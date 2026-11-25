@@ -47,6 +47,9 @@
 //! `Gds::new().with_memory_limit_bytes(bytes)`. An operation that exceeds
 //! the budget returns an error.
 //!
+//! Find projection options, algorithm arguments, and result columns in the
+//! [Velr GDS package guide](https://docs.rs/crate/velr-gds/latest).
+//!
 //! ## Query parameter binding
 //!
 //! Use `params!`, `QueryParams`, or `QueryOptions::with_param` to bind openCypher parameters

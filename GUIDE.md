@@ -1,7 +1,7 @@
 # Rust driver guide
 
-Detailed usage examples complement the [API reference](https://docs.rs/velr/0.2.65/velr/),
-the [getting-started guide](https://docs.rs/velr/0.2.65/velr/getting_started/index.html), and the [query language reference](https://docs.rs/velr/0.2.65/velr/query_language/index.html).
+Detailed usage examples complement the [API reference](https://docs.rs/velr/0.2.66/velr/),
+the [getting-started guide](https://docs.rs/velr/0.2.66/velr/getting_started/index.html), and the [query language reference](https://docs.rs/velr/0.2.66/velr/query_language/index.html).
 
 ## Graph Data Science
 
@@ -45,6 +45,9 @@ The default GDS budget is 512 MiB per connection. It covers managed
 projection and algorithm allocations. Set a positive byte limit with
 `Gds::new().with_memory_limit_bytes(bytes)`. An operation that exceeds
 the budget returns an error.
+
+Find projection options, algorithm arguments, and result columns in the
+[Velr GDS package guide](https://docs.rs/crate/velr-gds/latest).
 
 ## Query parameter binding
 
@@ -199,8 +202,8 @@ fn main() -> velr::Result<()> {
 ```
 
 Check errors from execution and from any subsequent fetch. See the API
-reference for [`QueryOptions`](https://docs.rs/velr/0.2.65/velr/struct.QueryOptions.html)
-and [`CancellationToken`](https://docs.rs/velr/0.2.65/velr/struct.CancellationToken.html).
+reference for [`QueryOptions`](https://docs.rs/velr/0.2.66/velr/struct.QueryOptions.html)
+and [`CancellationToken`](https://docs.rs/velr/0.2.66/velr/struct.CancellationToken.html).
 
 ## Results, lifetimes, and threads
 
@@ -451,7 +454,7 @@ ORDER BY size(stops)
 The `arrival` group contains the arrival nodes in traversal order.
 `OPTIONAL MATCH` returns null for the group and destination when no path
 qualifies. Use a zero lower bound such as `{0,3}` when a match at the starting
-stop should return an empty group. See [quantified path patterns](https://docs.rs/velr/0.2.65/velr/query_language/index.html#quantified-path-patterns)
+stop should return an empty group. See [quantified path patterns](https://docs.rs/velr/0.2.66/velr/query_language/index.html#quantified-path-patterns)
 for bound and predicate syntax.
 
 ## SEARCH clause
