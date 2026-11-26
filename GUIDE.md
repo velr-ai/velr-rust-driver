@@ -1,7 +1,7 @@
 # Rust driver guide
 
-Detailed usage examples complement the [API reference](https://docs.rs/velr/0.2.66/velr/),
-the [getting-started guide](https://docs.rs/velr/0.2.66/velr/getting_started/index.html), and the [query language reference](https://docs.rs/velr/0.2.66/velr/query_language/index.html).
+Detailed usage examples complement the [API reference](https://docs.rs/velr/0.2.67/velr/),
+the [getting-started guide](https://docs.rs/velr/0.2.67/velr/getting_started/index.html), and the [query language reference](https://docs.rs/velr/0.2.67/velr/query_language/index.html).
 
 ## Graph Data Science
 
@@ -47,7 +47,7 @@ projection and algorithm allocations. Set a positive byte limit with
 the budget returns an error.
 
 Find projection options, algorithm arguments, and result columns in the
-[Velr GDS package guide](https://docs.rs/crate/velr-gds/latest).
+[GDS Cypher guide](https://docs.rs/velr-gds/latest/velr_gds/guide/index.html).
 
 ## Query parameter binding
 
@@ -202,8 +202,8 @@ fn main() -> velr::Result<()> {
 ```
 
 Check errors from execution and from any subsequent fetch. See the API
-reference for [`QueryOptions`](https://docs.rs/velr/0.2.66/velr/struct.QueryOptions.html)
-and [`CancellationToken`](https://docs.rs/velr/0.2.66/velr/struct.CancellationToken.html).
+reference for [`QueryOptions`](https://docs.rs/velr/0.2.67/velr/struct.QueryOptions.html)
+and [`CancellationToken`](https://docs.rs/velr/0.2.67/velr/struct.CancellationToken.html).
 
 ## Results, lifetimes, and threads
 
@@ -454,7 +454,7 @@ ORDER BY size(stops)
 The `arrival` group contains the arrival nodes in traversal order.
 `OPTIONAL MATCH` returns null for the group and destination when no path
 qualifies. Use a zero lower bound such as `{0,3}` when a match at the starting
-stop should return an empty group. See [quantified path patterns](https://docs.rs/velr/0.2.66/velr/query_language/index.html#quantified-path-patterns)
+stop should return an empty group. See [quantified path patterns](https://docs.rs/velr/0.2.67/velr/query_language/index.html#quantified-path-patterns)
 for bound and predicate syntax.
 
 ## SEARCH clause

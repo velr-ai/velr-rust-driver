@@ -48,7 +48,7 @@
 //! the budget returns an error.
 //!
 //! Find projection options, algorithm arguments, and result columns in the
-//! [Velr GDS package guide](https://docs.rs/crate/velr-gds/latest).
+//! [GDS Cypher guide](https://docs.rs/velr-gds/latest/velr_gds/guide/index.html).
 //!
 //! ## Query parameter binding
 //!
